@@ -64,33 +64,73 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
     (write-string out stream)))
 
 ;;; --- Eval ---
+;;;
+;;; Uses a debugger hook to prevent any condition from falling through
+;;; to the cold load stream.  The hook signals an error that our
+;;; condition-case catches, so we always return a result to the client.
+
+(defvar *mcp-eval-error* nil
+  "Bound during mcp-eval to capture the condition that invoked the debugger.")
+
+(defun mcp-debugger-hook (condition hook)
+  (declare (ignore hook))
+  (throw 'mcp-eval-bail condition))
+
+(defvar *mcp-eval-package* (find-package "COMMON-LISP-USER")
+  "Package in which MCP eval reads expressions.
+Reset to a better default after the first successful eval if needed.")
 
 (defun mcp-eval (string)
   "Evaluate STRING as a Lisp expression.
 Returns three values: result-string, stdout-string, stderr-string.
-Redirects all interactive streams and suppresses fdefine warnings."
+Redirects all interactive streams and suppresses fdefine warnings.
+Uses condition-case as the outer safety net so that errors which bypass
+*debugger-hook* (Genera-specific debugger entries, stack overflows, etc.)
+are still caught and returned to the client instead of killing the connection."
   (let ((stdout (make-string-output-stream))
         (stderr (make-string-output-stream))
         (query-out (make-string-output-stream)))
-    (let ((result
-            (condition-case (err)
-                (let ((*standard-output* stdout)
-                      (*error-output* stderr)
-                      (*trace-output* stderr)
-                      (*debug-io* (make-two-way-stream (make-string-input-stream "") query-out))
-                      (*query-io* (make-two-way-stream (make-string-input-stream "") query-out))
-                      (sys:inhibit-fdefine-warnings :just-warn))
-                  (princ-to-string (eval (read-from-string string))))
-              (error
-                (format stderr "~A" err)
-                ""))))
-      ;; Append any query/debug output to stderr
-      (let ((query-str (get-output-stream-string query-out)))
-        (when (plusp (length query-str))
-          (format stderr "~A" query-str)))
-      (values result
-              (get-output-stream-string stdout)
-              (get-output-stream-string stderr)))))
+    (flet ((flush-query ()
+             (let ((query-str (get-output-stream-string query-out)))
+               (when (plusp (length query-str))
+                 (format stderr "~A" query-str)))))
+      (let ((result
+              (condition-case (outer-err)
+                  (let ((condition
+                          (catch 'mcp-eval-bail
+                            (let* ((terminal (make-two-way-stream (make-string-input-stream "") query-out))
+                                   (*terminal-io* terminal)
+                                   (*standard-output* stdout)
+                                   (*error-output* stderr)
+                                   (*trace-output* stderr)
+                                   (*debug-io* terminal)
+                                   (*query-io* terminal)
+                                   (*debugger-hook* #'mcp-debugger-hook)
+                                   (*package* *mcp-eval-package*)
+                                   (sys:inhibit-fdefine-warnings :just-warn))
+                              (return-from mcp-eval
+                                (let ((res (princ-to-string (eval (read-from-string string)))))
+                                  (flush-query)
+                                  (values res
+                                          (get-output-stream-string stdout)
+                                          (get-output-stream-string stderr))))))))
+                    ;; We get here only if the debugger hook threw
+                    (format stderr "~A" condition)
+                    "")
+                ;; Outer safety net: catches ANY condition that escaped the
+                ;; debugger hook.  We use (error) for CL errors and also add
+                ;; a catch-all for Genera-specific conditions (reader errors,
+                ;; package errors, etc.) which may not be CL:ERROR subtypes.
+                (sys:abort
+                  (format stderr "Aborted: ~A" outer-err)
+                  "")
+                (error
+                  (format stderr "~A" outer-err)
+                  ""))))
+        (flush-query)
+        (values result
+                (get-output-stream-string stdout)
+                (get-output-stream-string stderr))))))
 
 ;;; --- Server ---
 

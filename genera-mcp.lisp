@@ -31,7 +31,7 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 
 (defvar *genera-host* (or (uiop:getenv "GENERA_HOST") "genera"))
 (defvar *genera-port* (parse-integer (or (uiop:getenv "GENERA_PORT") "8888")))
-(defvar *genera-timeout* (parse-integer (or (uiop:getenv "GENERA_TIMEOUT") "30")))
+(defvar *genera-timeout* (parse-integer (or (uiop:getenv "GENERA_TIMEOUT") "300")))
 
 ;;; --- Genera TCP client ---
 ;;; Protocol: length-prefixed fields.
