@@ -1,8 +1,0 @@
-[project]
-name = "symbolics-mcp"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = ["mcp[cli]"]
-
-[project.scripts]
-symbolics-mcp = "server:main"
