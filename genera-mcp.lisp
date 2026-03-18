@@ -87,12 +87,45 @@ version's errors='replace' strategy)."
           do (setf (aref octets i) (char-code (char string i))))
     octets))
 
+(defun strip-lisp-comments (string)
+  "Remove ;-style line comments from STRING, preserving strings and #|...|# blocks.
+Prevents comment-induced EOF errors on the Genera reader."
+  (with-output-to-string (out)
+    (loop with len = (length string)
+          with i = 0
+          while (< i len)
+          for ch = (char string i)
+          do (cond
+               ;; String literal — copy verbatim through closing quote
+               ((char= ch #\")
+                (write-char ch out)
+                (incf i)
+                (loop while (< i len)
+                      for c = (char string i)
+                      do (write-char c out)
+                         (incf i)
+                      when (char= c #\\)
+                        do (when (< i len)
+                             (write-char (char string i) out)
+                             (incf i))
+                      when (char= c #\")
+                        do (return)))
+               ;; Line comment — skip to end of line
+               ((char= ch #\;)
+                (loop while (and (< i len)
+                                 (char/= (char string i) #\Newline))
+                      do (incf i)))
+               ;; Everything else — copy
+               (t (write-char ch out)
+                  (incf i))))))
+
 (defun genera-send (expression &key (host *genera-host*) (port *genera-port*))
   "Send a Lisp expression to Genera and return (values result stdout stderr)."
   (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
     (unwind-protect
         (let* ((stream (usocket:socket-stream socket))
-               (expr-bytes (string-to-octets expression))
+               (clean-expr (strip-lisp-comments expression))
+               (expr-bytes (string-to-octets clean-expr))
                (header (string-to-octets (format nil "~D " (length expr-bytes)))))
           ;; Send: length + space + expression
           (write-sequence header stream)
@@ -165,7 +198,7 @@ version's errors='replace' strategy)."
                     "inputSchema" (jso "type" "object"
                                        "properties" (jso "expression"
                                                          (jso "type" "string"
-                                                              "description" "A Common Lisp / Zetalisp expression to evaluate."))
+                                                              "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."))
                                        "required" '("expression")))))))
 
 (defun handle-tools-call (id params)
