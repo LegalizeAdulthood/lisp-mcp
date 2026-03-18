@@ -152,6 +152,14 @@ Prevents comment-induced EOF errors on the Genera reader."
         (format nil "~{~A~^~%~%~}" parts)
         "(no output)")))
 
+;;; --- JSON-RPC 2.0 error codes ---
+
+(defconstant +parse-error+      -32700)
+(defconstant +invalid-request+  -32600)
+(defconstant +method-not-found+ -32601)
+(defconstant +invalid-params+   -32602)
+(defconstant +internal-error+   -32603)
+
 ;;; --- MCP JSON-RPC over stdio ---
 
 (defun log-message (fmt &rest args)
@@ -193,30 +201,63 @@ Prevents comment-induced EOF errors on the Genera reader."
 (defun handle-tools-list (id)
   (make-response id
     (jso "tools"
-         (list (jso "name" "eval_lisp"
+         (list (jso "name" "eval_genera"
                     "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."
                     "inputSchema" (jso "type" "object"
                                        "properties" (jso "expression"
                                                          (jso "type" "string"
                                                               "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."))
+                                       "required" '("expression")))
+               (jso "name" "eval_sbcl"
+                    "description" "Evaluate a Common Lisp expression in the running SBCL process and return the result."
+                    "inputSchema" (jso "type" "object"
+                                       "properties" (jso "expression"
+                                                         (jso "type" "string"
+                                                              "description" "A Common Lisp expression to evaluate locally in SBCL."))
                                        "required" '("expression")))))))
+
+(defun eval-genera (expression)
+  "Evaluate EXPRESSION on the remote Genera machine. Returns a formatted string."
+  (handler-case
+      (sb-ext:with-timeout *genera-timeout*
+        (multiple-value-bind (result stdout stderr)
+            (genera-send expression)
+          (format-response result stdout stderr)))
+    (sb-ext:timeout ()
+      (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*))
+    (error (e)
+      (format nil "Connection error: ~A" e))))
+
+(defun eval-sbcl (expression)
+  "Evaluate EXPRESSION locally in SBCL. Returns a formatted string."
+  (handler-case
+      (sb-ext:with-timeout *genera-timeout*
+        (let* ((*standard-output* (make-string-output-stream))
+               (*error-output*    (make-string-output-stream))
+               (*trace-output*    (make-string-output-stream))
+               (result (format nil "~{~S~^~%~}"
+                               (multiple-value-list
+                                (eval (read-from-string expression))))))
+          (format-response result
+                           (get-output-stream-string *standard-output*)
+                           (get-output-stream-string *error-output*))))
+    (sb-ext:timeout ()
+      (format nil "Timeout: evaluation did not complete within ~Ds" *genera-timeout*))
+    (error (e)
+      (format nil "Error: ~A" e))))
 
 (defun handle-tools-call (id params)
   (let* ((name (gethash "name" params))
-         (arguments (gethash "arguments" params)))
-    (if (string= name "eval_lisp")
-        (let ((text (handler-case
-                        (sb-ext:with-timeout *genera-timeout*
-                          (multiple-value-bind (result stdout stderr)
-                              (genera-send (gethash "expression" arguments))
-                            (format-response result stdout stderr)))
-                      (sb-ext:timeout ()
-                        (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*))
-                      (error (e)
-                        (format nil "Connection error: ~A" e)))))
-          (make-response id
-                         (jso "content" (list (jso "type" "text" "text" text)))))
-        (make-error-response id -32602 (format nil "Unknown tool: ~A" name)))))
+         (arguments (gethash "arguments" params))
+         (expression (gethash "expression" arguments)))
+    (let ((text (cond
+                  ((string= name "eval_genera") (eval-genera expression))
+                  ((string= name "eval_sbcl")   (eval-sbcl expression))
+                  (t (return-from handle-tools-call
+                       (make-error-response id +invalid-params+
+                                            (format nil "Unknown tool: ~A" name)))))))
+      (make-response id
+                     (jso "content" (list (jso "type" "text" "text" text)))))))
 
 ;;; --- Main loop ---
 
@@ -237,7 +278,7 @@ Prevents comment-induced EOF errors on the Genera reader."
       ((string= method "ping")
        (make-response id (jso)))
       (id
-       (make-error-response id -32601 (format nil "Method not found: ~A" method)))
+       (make-error-response id +method-not-found+ (format nil "Method not found: ~A" method)))
       (t nil))))
 
 (defun main ()
