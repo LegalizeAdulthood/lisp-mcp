@@ -1,8 +1,9 @@
 {
     "mcpServers": {
-        "symbolics-genera": {
-            "command": "./genera-mcp.sh",
+        "lisp-mcp": {
+            "command": "./lisp-mcp.sh",
             "env": {
+                "SWANK_PORT": "4005",
                 "GENERA_HOST": "192.168.11.2",
                 "GENERA_PORT": "8888"
             }

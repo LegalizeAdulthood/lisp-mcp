@@ -34,6 +34,11 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 (defvar *genera-timeout* (parse-integer (or (uiop:getenv "GENERA_TIMEOUT") "300")))
 (defvar *genera-enabled* (not (null *genera-host*)))
 
+(defvar *swank-host* (or (uiop:getenv "SWANK_HOST") "127.0.0.1"))
+(defvar *swank-port* (parse-integer (or (uiop:getenv "SWANK_PORT") "4005")))
+(defvar *swank-package* (or (uiop:getenv "SWANK_PACKAGE") "COMMON-LISP-USER"))
+(defvar *swank-enabled* (not (null (uiop:getenv "SWANK_PORT"))))
+
 ;;; --- Genera TCP client ---
 ;;; Protocol: length-prefixed fields.
 ;;; Request:  <length><space><expression bytes>
@@ -138,6 +143,88 @@ Prevents comment-induced EOF errors on the Genera reader."
                   (read-field stream)))
       (usocket:socket-close socket))))
 
+;;; --- Swank client ---
+;;; Protocol: length-prefixed S-expressions over TCP.
+;;; Each message is a 6-char hex length followed by the S-expression payload.
+;;; We send :emacs-rex with swank:eval-and-grab-output, then read messages
+;;; until we get a :return reply.
+
+(defun swank-read-message (stream)
+  "Read one Swank wire message: 6-char hex length then payload. Returns the parsed sexp."
+  (let ((header (make-string 6)))
+    (read-sequence header stream)
+    (let* ((len (parse-integer header :radix 16))
+           (payload (make-string len)))
+      (read-sequence payload stream)
+      (read-from-string payload))))
+
+(defvar *swank-counter* 0)
+
+(defun swank-send-raw (stream fmt &rest args)
+  "Format a Swank wire message and write it to STREAM."
+  (let* ((payload (apply #'format nil fmt args))
+         (header (format nil "~6,'0X" (length payload))))
+    (write-string header stream)
+    (write-string payload stream)
+    (force-output stream)))
+
+(defun swank-eval (expression &key (host *swank-host*) (port *swank-port*)
+                                   (package *swank-package*))
+  "Send EXPRESSION to a Swank server for evaluation.
+Returns (values result-string output-string)."
+  (let* ((socket (usocket:socket-connect host port :element-type 'character))
+         (stream (usocket:socket-stream socket))
+         (id (incf *swank-counter*)))
+    (unwind-protect
+        (progn
+          ;; Send eval request — format as raw string to avoid needing
+          ;; the SWANK package in the MCP server's image.
+          (swank-send-raw stream
+            "(:emacs-rex (swank:eval-and-grab-output ~S) ~S t ~D)"
+            expression package id)
+          ;; Read messages until :return for our request.
+          ;; swank:eval-and-grab-output returns (output result).
+          ;; On error, Swank enters the debugger — we extract the error
+          ;; message from :debug, abort, and wait for the :return.
+          (let ((output-parts '())
+                (error-message nil))
+            (loop
+              (let ((msg (swank-read-message stream)))
+                (case (first msg)
+                  (:return
+                   (when (eql (third msg) id)
+                     (let ((value (second msg)))
+                       (case (first value)
+                         (:ok
+                          (let ((stdout (first (second value)))
+                                (result (second (second value))))
+                            (return (values result
+                                            (apply #'concatenate 'string
+                                                   (nreverse (cons stdout output-parts)))))))
+                         (:abort
+                          (return (values "" (or error-message
+                                                 (format nil "Aborted: ~A" (second value))))))
+                         (otherwise
+                          (return (values "" (format nil "Unexpected return: ~S" value))))))))
+                  (:debug
+                   ;; (:debug thread level (desc ...) restarts ...)
+                   ;; Extract the error description (first element of 4th item).
+                   (setf error-message (first (fourth msg))))
+                  (:debug-activate
+                   ;; Abort the debugger: find the ABORT restart and invoke it.
+                   ;; Restarts are in the 5th element of the preceding :debug msg.
+                   ;; We look for one named "*ABORT" or "ABORT"; fall back to index 1.
+                   (let* ((thread (second msg))
+                          (level (third msg))
+                          (abort-id (incf *swank-counter*)))
+                     (swank-send-raw stream
+                       "(:emacs-rex (swank:invoke-nth-restart-for-emacs ~D 1) ~S ~D ~D)"
+                       level package thread abort-id)))
+                  (:write-string
+                   (push (second msg) output-parts))
+                  (otherwise nil))))))
+      (usocket:socket-close socket))))
+
 ;;; --- Response formatting ---
 
 (defun format-response (result stdout stderr)
@@ -217,8 +304,19 @@ Prevents comment-induced EOF errors on the Genera reader."
                                                  "description" "A Common Lisp expression to evaluate locally in the host Common Lisp."))
                           "required" '("expression"))))
 
+(defun make-swank-tool ()
+  (jso "name" "eval_swank"
+       "description" "Evaluate a Common Lisp expression on a running Lisp with a Swank server and return the result."
+       "inputSchema" (jso "type" "object"
+                          "properties" (jso "expression"
+                                            (jso "type" "string"
+                                                 "description" "A Common Lisp expression to evaluate on the Swank-connected Lisp."))
+                          "required" '("expression"))))
+
 (defun handle-tools-list (id)
   (let ((tools (list (make-host-cl-tool))))
+    (when *swank-enabled*
+      (push (make-swank-tool) tools))
     (when *genera-enabled*
       (push (make-genera-tool) tools))
     (make-response id (jso "tools" tools))))
@@ -232,6 +330,18 @@ Prevents comment-induced EOF errors on the Genera reader."
           (format-response result stdout stderr)))
     (sb-ext:timeout ()
       (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*))
+    (error (e)
+      (format nil "Connection error: ~A" e))))
+
+(defun eval-swank-tool (expression)
+  "Evaluate EXPRESSION via a remote Swank server. Returns a formatted string."
+  (handler-case
+      (sb-ext:with-timeout *genera-timeout*
+        (multiple-value-bind (result output)
+            (swank-eval expression)
+          (format-response result output "")))
+    (sb-ext:timeout ()
+      (format nil "Timeout: Swank did not respond within ~Ds" *genera-timeout*))
     (error (e)
       (format nil "Connection error: ~A" e))))
 
@@ -260,6 +370,7 @@ Prevents comment-induced EOF errors on the Genera reader."
     (let ((text (cond
                   ((string= name "eval_genera") (eval-genera expression))
                   ((string= name "eval_host_cl") (eval-host-cl expression))
+                  ((string= name "eval_swank")   (eval-swank-tool expression))
                   (t (return-from handle-tools-call
                        (make-error-response id +invalid-params+
                                             (format nil "Unknown tool: ~A" name)))))))
@@ -290,9 +401,11 @@ Prevents comment-induced EOF errors on the Genera reader."
 
 (defun main ()
   "MCP stdio server main loop."
-  (log-message "lisp-mcp server starting (SBCL~@[, Genera at ~A:~D~])"
+  (log-message "lisp-mcp server starting (SBCL~@[, Genera at ~A:~D~]~@[, Swank at ~A:~D~])"
                 (when *genera-enabled* *genera-host*)
-                (when *genera-enabled* *genera-port*))
+                (when *genera-enabled* *genera-port*)
+                (when *swank-enabled* *swank-host*)
+                (when *swank-enabled* *swank-port*))
   (loop for msg = (read-json-rpc)
         while msg
         do (let ((response (handle-request msg)))
