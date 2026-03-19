@@ -150,13 +150,26 @@ Prevents comment-induced EOF errors on the Genera reader."
 ;;; until we get a :return reply.
 
 (defun swank-read-message (stream)
-  "Read one Swank wire message: 6-char hex length then payload. Returns the parsed sexp."
+  "Read one Swank wire message: 6-char hex length then payload. Returns the parsed sexp.
+If the payload cannot be parsed (e.g. unknown package symbols in backtraces),
+falls back to extracting just the message keyword from the raw string."
   (let ((header (make-string 6)))
     (read-sequence header stream)
     (let* ((len (parse-integer header :radix 16))
            (payload (make-string len)))
       (read-sequence payload stream)
-      (read-from-string payload))))
+      (handler-case (read-from-string payload)
+        (error ()
+          ;; Extract the message keyword so the dispatch loop can at least
+          ;; identify the message type (e.g. :debug, :write-string, etc.)
+          (let ((start (position #\: payload)))
+            (if start
+                (let ((end (position-if
+                            (lambda (c) (member c '(#\Space #\) #\Newline)))
+                            payload :start (1+ start))))
+                  (list (intern (string-upcase (subseq payload (1+ start) end))
+                                :keyword)))
+                (list :unknown-message))))))))
 
 (defvar *swank-counter* 0)
 
@@ -187,7 +200,8 @@ Returns (values result-string output-string)."
           ;; On error, Swank enters the debugger — we extract the error
           ;; message from :debug, abort, and wait for the :return.
           (let ((output-parts '())
-                (error-message nil))
+                (error-message nil)
+                (abort-restart-index nil))
             (loop
               (let ((msg (swank-read-message stream)))
                 (case (first msg)
@@ -208,20 +222,39 @@ Returns (values result-string output-string)."
                           (return (values "" (format nil "Unexpected return: ~S" value))))))))
                   (:debug
                    ;; (:debug thread level (desc ...) restarts ...)
-                   ;; Extract the error description (first element of 4th item).
-                   (setf error-message (first (fourth msg))))
+                   ;; Extract error description and find the *ABORT restart index.
+                   (let ((desc (fourth msg))
+                         (restarts (fifth msg)))
+                     (when (and desc (listp desc))
+                       (setf error-message (first desc)))
+                     (setf abort-restart-index
+                           (or (position-if
+                                (lambda (r)
+                                  (and (listp r) (stringp (first r))
+                                       (member (first r) '("*ABORT" "ABORT")
+                                               :test #'string=)))
+                                restarts)
+                               ;; Fallback if we couldn't parse restarts
+                               nil))))
                   (:debug-activate
-                   ;; Abort the debugger: find the ABORT restart and invoke it.
-                   ;; Restarts are in the 5th element of the preceding :debug msg.
-                   ;; We look for one named "*ABORT" or "ABORT"; fall back to index 1.
+                   ;; Abort the debugger using the *ABORT restart.
                    (let* ((thread (second msg))
                           (level (third msg))
-                          (abort-id (incf *swank-counter*)))
+                          (abort-id (incf *swank-counter*))
+                          (restart-idx (or abort-restart-index 1)))
                      (swank-send-raw stream
-                       "(:emacs-rex (swank:invoke-nth-restart-for-emacs ~D 1) ~S ~D ~D)"
-                       level package thread abort-id)))
+                       "(:emacs-rex (swank:invoke-nth-restart-for-emacs ~D ~D) ~S ~D ~D)"
+                       level restart-idx package thread abort-id)))
                   (:write-string
                    (push (second msg) output-parts))
+                  (:read-string
+                   ;; Interactive prompt (e.g. y-or-n-p during compilation).
+                   ;; Send a newline to dismiss it.
+                   (let ((thread (second msg))
+                         (tag (third msg)))
+                     (swank-send-raw stream
+                       "(:emacs-return-string ~D ~D \"~A\")"
+                       thread tag (string #\Newline))))
                   (otherwise nil))))))
       (usocket:socket-close socket))))
 
