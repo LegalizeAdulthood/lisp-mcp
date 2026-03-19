@@ -1,18 +1,15 @@
 # lisp-mcp
 
-An MCP (Model Context Protocol) server that lets LLMs evaluate Common Lisp expressions. It always provides a host Common Lisp evaluator and optionally bridges to a Swank server or a Symbolics Genera machine over TCP when the corresponding environment variables are set.
+An MCP (Model Context Protocol) server that gives LLMs the ability to evaluate Common Lisp expressions. It provides up to three tools depending on configuration:
 
-The system has two parts:
-
-1. **lisp-mcp.lisp** -- an MCP stdio server that provides `eval_host_cl` and optionally `eval_swank` and `eval_genera`
-2. **eval-server.lisp** -- a TCP evaluation server that runs on the Genera machine (only needed for Genera support)
+- **eval_host_cl** -- always available; evaluates expressions in the MCP server's own SBCL process
+- **eval_swank** -- connects to a running Lisp via the Swank protocol (the backend used by SLIME and Sly)
+- **eval_genera** -- bridges to a Symbolics Genera machine over TCP
 
 ## Prerequisites
 
 - [SBCL](https://www.sbcl.org/) on the host machine
 - [Quicklisp](https://www.quicklisp.org/) installed in SBCL (the MCP server loads `usocket` and `yason` via Quicklisp)
-- (Optional) A running Lisp with a [Swank](https://github.com/slime/slime) server for the `eval_swank` tool
-- (Optional) A Symbolics Genera virtual machine for the `eval_genera` tool
 
 ## MCP configuration
 
@@ -22,47 +19,67 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client):
 {
     "mcpServers": {
         "lisp": {
-            "command": "/path/to/lisp-mcp.sh"
-        }
-    }
-}
-```
-
-This gives you the `eval_host_cl` tool. To also enable the Swank and/or Genera evaluators, add the corresponding environment variables:
-
-```json
-{
-    "mcpServers": {
-        "lisp": {
             "command": "/path/to/lisp-mcp.sh",
             "env": {
                 "SWANK_PORT": "4005",
-                "GENERA_HOST": "192.168.11.2",
-                "GENERA_PORT": "8888"
+                "GENERA_HOST": "192.168.11.2"
             }
         }
     }
 }
 ```
 
-### Environment variables
+Only `command` is required. The environment variables enable the optional tools.
+
+## Tools
+
+### eval_host_cl
+
+Evaluate a Common Lisp expression in the MCP server's own SBCL process. Always available, no configuration needed. Stdout, stderr, and the return value are captured and returned.
+
+### eval_swank
+
+Evaluate a Common Lisp expression on a running Lisp that has a Swank server. This is the most useful tool for development -- it lets the LLM interact with your live Lisp image, load systems, inspect state, and run tests.
+
+The Swank client implements the Swank wire protocol, handles debugger entry by automatically invoking the `*ABORT` restart and returning the error description, and responds to interactive prompts (e.g. `y-or-n-p` during compilation).
+
+Start a Swank server in your target Lisp:
+
+```lisp
+(swank:create-server :port 4005 :dont-close t)
+```
+
+The `:dont-close t` argument keeps the server listening after the first connection disconnects, so the MCP server can reconnect between requests.
+
+To have Swank automatically start an additional server on a fixed port whenever you launch SLIME from Emacs with `M-x slime`, add the following to your Emacs configuration:
+
+```elisp
+(add-hook 'slime-connected-hook
+          (lambda ()
+            (slime-eval-async '(swank:create-server :port 4005 :dont-close t))))
+```
+
+Then set `SWANK_PORT` in the MCP configuration to enable the tool.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SWANK_HOST` | `127.0.0.1` | Hostname or IP of the Swank server |
 | `SWANK_PORT` | *(unset)* | TCP port of the Swank server. When set, enables `eval_swank`. |
-| `SWANK_PACKAGE` | `COMMON-LISP-USER` | Package in which Swank evaluates expressions |
+| `SWANK_HOST` | `127.0.0.1` | Hostname or IP of the Swank server |
+| `SWANK_PACKAGE` | `COMMON-LISP-USER` | Package in which expressions are evaluated |
+
+### eval_genera
+
+Evaluate a Lisp expression on a Symbolics Genera machine. Requires `eval-server.lisp` running on the Genera side.
+
+Set `GENERA_HOST` in the MCP configuration to enable the tool.
+
+| Variable | Default | Description |
+|---|---|---|
 | `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
 | `GENERA_PORT` | `8888` | TCP port of the eval server |
 | `GENERA_TIMEOUT` | `300` | Timeout in seconds for each evaluation |
 
-## Exposed tools
-
-- **eval_host_cl** -- Evaluate a Common Lisp expression locally in the host Common Lisp and return the result.
-- **eval_swank** *(only when `SWANK_PORT` is set)* -- Evaluate a Common Lisp expression on a running Lisp with a Swank server and return the result.
-- **eval_genera** *(only when `GENERA_HOST` is set)* -- Evaluate a Lisp expression on a Symbolics Genera machine and return the result.
-
-## Setting up the Genera side
+#### Setting up the Genera side
 
 Copy `eval-server.lisp` to the Genera `SYS:SITE;` directory on the host filesystem:
 
