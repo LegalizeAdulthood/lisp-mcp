@@ -1,56 +1,39 @@
-# symbolics-mcp
+# lisp-mcp
 
-An MCP (Model Context Protocol) server that lets LLMs evaluate Lisp expressions on a Symbolics Genera machine over TCP.
+An MCP (Model Context Protocol) server that lets LLMs evaluate Common Lisp expressions. It always provides a host Common Lisp evaluator and optionally bridges to a Symbolics Genera machine over TCP when the Genera environment variables are set.
 
 The system has two parts:
 
-1. **eval-server.lisp** -- a TCP evaluation server that runs on the Genera machine
-2. **genera-mcp.lisp** -- an MCP stdio server that runs on the host (SBCL) and bridges JSON-RPC requests to Genera over TCP
+1. **lisp-mcp.lisp** -- an MCP stdio server that provides `eval_host_cl` and optionally `eval_genera`
+2. **eval-server.lisp** -- a TCP evaluation server that runs on the Genera machine (only needed for Genera support)
 
 ## Prerequisites
 
-- A Symbolics Genera virtual machine (e.g. via Open Genera on a Linux/Alpha host or the VLM)
-- [SBCL](https://www.sbcl.org/) on the host machine running the virtual Genera
+- [SBCL](https://www.sbcl.org/) on the host machine
 - [Quicklisp](https://www.quicklisp.org/) installed in SBCL (the MCP server loads `usocket` and `yason` via Quicklisp)
-
-## Setting up the Genera side
-
-First, copy `eval-server.lisp` to the Genera `SYS:SITE;` directory on the host filesystem:
-
-```sh
-cp eval-server.lisp /opt/symbolics/lib/sys.sct/site/eval-server.lisp
-```
-
-Then load it from the Genera Lisp Listener:
-
-```lisp
-Load File SYS:SITE;eval-server.lisp
-```
-
-The file must be loaded once per boot. It does two things:
-
-- Defines a TCP server (`:mcp-server`) that accepts connections, reads length-prefixed Lisp expressions, evaluates them, and returns the result, stdout, and stderr as length-prefixed fields.
-- Registers the server on TCP port 8888 via `tcp:add-tcp-port-for-protocol`.
-
-After loading, the server starts automatically -- there is no separate start command. It listens on port 8888 and handles each connection in its own process.
-
-To verify it is running, you can send a test expression from the host:
-
-```sh
-echo -n '11 (+ 1 2 3 4)' | nc -w 2 192.168.11.2 8888 | cat -v
-```
-
-The number before the space is the byte length of the expression (`(+ 1 2 3 4)` = 11 bytes). If the server is working, you should see a response containing `10` (the result of the expression).
+- (Optional) A Symbolics Genera virtual machine for the `eval_genera` tool
 
 ## MCP configuration
 
-Add the following to your `.mcp.json` (or the MCP configuration of your client), adjusting the path and IP address for your setup:
+Add the following to your `.mcp.json` (or the MCP configuration of your client):
 
 ```json
 {
     "mcpServers": {
-        "symbolics-genera": {
-            "command": "/path/to/genera-mcp.sh",
+        "lisp": {
+            "command": "/path/to/lisp-mcp.sh"
+        }
+    }
+}
+```
+
+This gives you the `eval_host_cl` tool. To also enable the Genera evaluator, add the environment variables:
+
+```json
+{
+    "mcpServers": {
+        "lisp": {
+            "command": "/path/to/lisp-mcp.sh",
             "env": {
                 "GENERA_HOST": "192.168.11.2",
                 "GENERA_PORT": "8888"
@@ -64,12 +47,33 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client),
 
 | Variable | Default | Description |
 |---|---|---|
-| `GENERA_HOST` | `genera` | Hostname or IP of the Genera machine |
+| `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
 | `GENERA_PORT` | `8888` | TCP port of the eval server |
-| `GENERA_TIMEOUT` | `30` | Timeout in seconds for each evaluation |
+| `GENERA_TIMEOUT` | `300` | Timeout in seconds for each evaluation |
 
-## Exposed tool
+## Exposed tools
 
-The MCP server exposes a single tool:
+- **eval_host_cl** -- Evaluate a Common Lisp expression locally in the host Common Lisp and return the result.
+- **eval_genera** *(only when `GENERA_HOST` is set)* -- Evaluate a Lisp expression on a Symbolics Genera machine and return the result.
 
-- **eval_lisp** -- Evaluate a Common Lisp / Zetalisp expression on the Genera machine and return the result. The response includes the return value, stdout, and stderr (if any).
+## Setting up the Genera side
+
+Copy `eval-server.lisp` to the Genera `SYS:SITE;` directory on the host filesystem:
+
+```sh
+cp eval-server.lisp /opt/symbolics/lib/sys.sct/site/eval-server.lisp
+```
+
+Then load it from the Genera Lisp Listener:
+
+```lisp
+Load File SYS:SITE;eval-server.lisp
+```
+
+The file must be loaded once per boot. It defines a TCP server (`:mcp-server`) on port 8888 that accepts connections, reads length-prefixed Lisp expressions, evaluates them, and returns the result, stdout, and stderr as length-prefixed fields.
+
+To verify it is running:
+
+```sh
+echo -n '11 (+ 1 2 3 4)' | nc -w 2 192.168.11.2 8888 | cat -v
+```

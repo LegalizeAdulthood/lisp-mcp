@@ -10,11 +10,11 @@
 
 (ql:quickload '(:usocket :yason) :silent t)
 
-(defpackage #:genera-mcp
+(defpackage #:lisp-mcp
   (:use #:cl)
   (:export #:main))
 
-(in-package #:genera-mcp)
+(in-package #:lisp-mcp)
 
 ;;; --- JSON object builder ---
 
@@ -29,9 +29,10 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 
 ;;; --- Configuration ---
 
-(defvar *genera-host* (or (uiop:getenv "GENERA_HOST") "genera"))
+(defvar *genera-host* (uiop:getenv "GENERA_HOST"))
 (defvar *genera-port* (parse-integer (or (uiop:getenv "GENERA_PORT") "8888")))
 (defvar *genera-timeout* (parse-integer (or (uiop:getenv "GENERA_TIMEOUT") "300")))
+(defvar *genera-enabled* (not (null *genera-host*)))
 
 ;;; --- Genera TCP client ---
 ;;; Protocol: length-prefixed fields.
@@ -196,25 +197,31 @@ Prevents comment-induced EOF errors on the Genera reader."
   (make-response id
     (jso "protocolVersion" "2024-11-05"
          "capabilities" (jso "tools" (jso "listChanged" 'yason:false))
-         "serverInfo"   (jso "name" "genera" "version" "1.0.0"))))
+         "serverInfo"   (jso "name" "lisp-mcp" "version" "1.0.0"))))
+
+(defun make-genera-tool ()
+  (jso "name" "eval_genera"
+       "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."
+       "inputSchema" (jso "type" "object"
+                          "properties" (jso "expression"
+                                            (jso "type" "string"
+                                                 "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."))
+                          "required" '("expression"))))
+
+(defun make-host-cl-tool ()
+  (jso "name" "eval_host_cl"
+       "description" "Evaluate a Common Lisp expression in the host Common Lisp process and return the result."
+       "inputSchema" (jso "type" "object"
+                          "properties" (jso "expression"
+                                            (jso "type" "string"
+                                                 "description" "A Common Lisp expression to evaluate locally in the host Common Lisp."))
+                          "required" '("expression"))))
 
 (defun handle-tools-list (id)
-  (make-response id
-    (jso "tools"
-         (list (jso "name" "eval_genera"
-                    "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."
-                    "inputSchema" (jso "type" "object"
-                                       "properties" (jso "expression"
-                                                         (jso "type" "string"
-                                                              "description" "Evaluate a Lisp expression on a Symbolics Genera machine and return the result."))
-                                       "required" '("expression")))
-               (jso "name" "eval_sbcl"
-                    "description" "Evaluate a Common Lisp expression in the running SBCL process and return the result."
-                    "inputSchema" (jso "type" "object"
-                                       "properties" (jso "expression"
-                                                         (jso "type" "string"
-                                                              "description" "A Common Lisp expression to evaluate locally in SBCL."))
-                                       "required" '("expression")))))))
+  (let ((tools (list (make-host-cl-tool))))
+    (when *genera-enabled*
+      (push (make-genera-tool) tools))
+    (make-response id (jso "tools" tools))))
 
 (defun eval-genera (expression)
   "Evaluate EXPRESSION on the remote Genera machine. Returns a formatted string."
@@ -228,8 +235,8 @@ Prevents comment-induced EOF errors on the Genera reader."
     (error (e)
       (format nil "Connection error: ~A" e))))
 
-(defun eval-sbcl (expression)
-  "Evaluate EXPRESSION locally in SBCL. Returns a formatted string."
+(defun eval-host-cl (expression)
+  "Evaluate EXPRESSION locally in the host Common Lisp. Returns a formatted string."
   (handler-case
       (sb-ext:with-timeout *genera-timeout*
         (let* ((*standard-output* (make-string-output-stream))
@@ -252,7 +259,7 @@ Prevents comment-induced EOF errors on the Genera reader."
          (expression (gethash "expression" arguments)))
     (let ((text (cond
                   ((string= name "eval_genera") (eval-genera expression))
-                  ((string= name "eval_sbcl")   (eval-sbcl expression))
+                  ((string= name "eval_host_cl") (eval-host-cl expression))
                   (t (return-from handle-tools-call
                        (make-error-response id +invalid-params+
                                             (format nil "Unknown tool: ~A" name)))))))
@@ -283,11 +290,13 @@ Prevents comment-induced EOF errors on the Genera reader."
 
 (defun main ()
   "MCP stdio server main loop."
-  (log-message "genera MCP server starting (CL/SBCL)")
+  (log-message "lisp-mcp server starting (SBCL~@[, Genera at ~A:~D~])"
+                (when *genera-enabled* *genera-host*)
+                (when *genera-enabled* *genera-port*))
   (loop for msg = (read-json-rpc)
         while msg
         do (let ((response (handle-request msg)))
              (when response
                (write-json-rpc response)))))
 
-;;; Run via: sbcl --noinform --non-interactive --load server.lisp --eval '(genera-mcp:main)'
+;;; Run via: sbcl --noinform --non-interactive --load lisp-mcp.lisp --eval '(lisp-mcp:main)'

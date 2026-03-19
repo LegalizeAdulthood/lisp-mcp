@@ -86,7 +86,10 @@ Returns three values: result-string, stdout-string, stderr-string.
 Redirects all interactive streams and suppresses fdefine warnings.
 Uses condition-case as the outer safety net so that errors which bypass
 *debugger-hook* (Genera-specific debugger entries, stack overflows, etc.)
-are still caught and returned to the client instead of killing the connection."
+are still caught and returned to the client instead of killing the connection.
+An inner ansi-common-lisp:handler-case catches ANSI CL conditions (e.g. from
+ASDF-loaded libraries using define-condition) which Genera's condition-case
+does not recognize."
   (let ((stdout (make-string-output-stream))
         (stderr (make-string-output-stream))
         (query-out (make-string-output-stream)))
@@ -109,11 +112,19 @@ are still caught and returned to the client instead of killing the connection."
                                    (*package* *mcp-eval-package*)
                                    (sys:inhibit-fdefine-warnings :just-warn))
                               (return-from mcp-eval
-                                (let ((res (princ-to-string (eval (read-from-string string)))))
-                                  (flush-query)
-                                  (values res
-                                          (get-output-stream-string stdout)
-                                          (get-output-stream-string stderr))))))))
+                                ;; Inner handler-case for ANSI CL conditions
+                                (ansi-common-lisp:handler-case
+                                    (let ((res (princ-to-string (eval (read-from-string string)))))
+                                      (flush-query)
+                                      (values res
+                                              (get-output-stream-string stdout)
+                                              (get-output-stream-string stderr)))
+                                  (ansi-common-lisp:error (e)
+                                    (format stderr "~A" e)
+                                    (flush-query)
+                                    (values ""
+                                            (get-output-stream-string stdout)
+                                            (get-output-stream-string stderr)))))))))
                     ;; We get here only if the debugger hook threw
                     (format stderr "~A" condition)
                     "")
