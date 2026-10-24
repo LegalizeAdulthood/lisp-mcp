@@ -4,23 +4,56 @@
 ;;; Protocol: length-prefixed messages over a TCP character stream.
 ;;; The stream transmits raw Genera char-codes on the wire.
 ;;; We translate to/from ASCII manually using char-to-ascii / code-char.
-;;; Lengths are decimal integers (via print/read).
+;;; Lengths are bounded ASCII decimal integers followed by one space.
 ;;;
 ;;; Request:  <length><space><expression bytes>
 ;;; Response: <newline><length><space><result bytes>
 ;;;           <newline><length><space><stdout bytes>
 ;;;           <newline><length><space><stderr bytes>
 
-;;; --- Length-delimited framing via print/read ---
-;;; print/read work because digit char-codes match ASCII.
+;;; --- Length-delimited framing ---
+;;; Digit char-codes match ASCII; no Lisp reader is used for headers.
+
+(defconstant +mcp-max-header-digits+ 10)
+(defconstant +mcp-max-frame-length+ 1048576)
+
+(defun mcp-framing-error (control &rest arguments)
+  (apply #'error (concatenate 'string "Framing error: " control) arguments))
+
+(defun mcp-read-wire-code (stream &optional eof-ok)
+  (let ((ch (send stream :tyi)))
+    (cond (ch (char-code ch))
+          (eof-ok nil)
+          (t (mcp-framing-error "Truncated header or payload")))))
 
 (defun mcp-read-length (stream)
-  "Read a length using the Lisp reader. Returns NIL on EOF."
-  (read stream nil nil))
+  "Read a bounded decimal length; return NIL only at a clean frame boundary."
+  (let ((byte (mcp-read-wire-code stream t))
+        (length 0)
+        (digits 0))
+    (when (null byte) (return-from mcp-read-length nil))
+    (cond ((= byte 10) (setf byte (mcp-read-wire-code stream)))
+          ((= byte 13)
+           (setf byte (mcp-read-wire-code stream))
+           (when (= byte 10) (setf byte (mcp-read-wire-code stream)))))
+    (loop
+      (cond ((<= 48 byte 57)
+             (when (> (incf digits) +mcp-max-header-digits+)
+               (mcp-framing-error "Length header exceeds ~D digits"
+                                  +mcp-max-header-digits+))
+             (setf length (+ (* length 10) (- byte 48)))
+             (when (> length +mcp-max-frame-length+)
+               (mcp-framing-error "Frame exceeds ~D bytes" +mcp-max-frame-length+)))
+            ((and (= byte 32) (plusp digits)) (return length))
+            (t (mcp-framing-error "Expected decimal length followed by a space")))
+      (setf byte (mcp-read-wire-code stream)))))
 
 (defun mcp-write-length (stream value)
-  "Write a length using print (outputs newline + digits + space)."
-  (print value stream))
+  "Preserve PRINT's native leading line break, decimal digits, and space."
+  (unless (and (integerp value) (<= 0 value +mcp-max-frame-length+))
+    (mcp-framing-error "Invalid output length"))
+  (let ((*print-base* 10) (*print-radix* nil))
+    (print value stream)))
 
 ;;; --- ASCII translation ---
 ;;; The TCP stream sends raw char-codes on the wire.
@@ -49,7 +82,10 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
         (dotimes (i len)
           ;; char-code of what :tyi returns = the ASCII byte from the client
           ;; ascii-to-char converts that ASCII code to the proper Genera char
-          (setf (aref str i) (ascii-to-char (char-code (send stream :tyi)))))
+          (let ((code (mcp-read-wire-code stream)))
+            (unless (or (<= 32 code 126) (member code '(9 10 13)))
+              (mcp-framing-error "Unsupported input character at offset ~D" i))
+            (setf (aref str i) (ascii-to-char code))))
         str))))
 
 ;;; --- Writing responses ---
@@ -57,7 +93,10 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
 (defun mcp-write-field (stream string)
   "Write STRING as a length-prefixed field, translated to ASCII on the wire."
   (let* ((len (length string))
-         (out (make-string len)))
+         (out (progn
+                (when (> len +mcp-max-frame-length+)
+                  (mcp-framing-error "Frame exceeds ~D bytes" +mcp-max-frame-length+))
+                (make-string len))))
     (dotimes (i len)
       (setf (aref out i) (mcp-genera-to-wire (aref string i))))
     (mcp-write-length stream len)
@@ -148,14 +187,18 @@ does not recognize."
 (defun mcp-handle-client (stream)
   "Service loop: read eval requests, send back results."
   (unwind-protect
-      (loop for request = (mcp-read-request stream)
-            while request
-            do (multiple-value-bind (result stdout stderr)
-                   (mcp-eval request)
-                 (mcp-write-field stream result)
-                 (mcp-write-field stream stdout)
-                 (mcp-write-field stream stderr)
-                 (send stream :force-output)))
+      (condition-case (frame-error)
+          (ansi-common-lisp:handler-case
+              (loop for request = (mcp-read-request stream)
+                    while request
+                    do (multiple-value-bind (result stdout stderr)
+                           (mcp-eval request)
+                         (mcp-write-field stream result)
+                         (mcp-write-field stream stdout)
+                         (mcp-write-field stream stderr)
+                         (send stream :force-output)))
+            (ansi-common-lisp:error () nil))
+        (error (format *error-output* "MCP connection closed: ~A~%" frame-error)))
     (close stream :abort t)))
 
 (net:define-server :mcp-server (:medium :byte-stream :stream stream)

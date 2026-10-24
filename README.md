@@ -34,10 +34,6 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client):
 
 Only `command` is required. The environment variables enable the optional tools.
 
-For the local Genera deployment, run the bridge inside WSL, alongside the
-VLM. The source directory is `/path/to/lisp-mcp`; the existing
-entry point is `lisp-mcp.sh`. The endpoint is `genera.example:8888`.
-
 ### Startup validation
 
 The bridge validates configuration before reading MCP requests or opening
@@ -59,12 +55,10 @@ on stderr, leave stdout empty, and exit with status 2.
 | `LISP_MCP_PROFILE` | `generic` | `generic`, with the existing host and optional Swank/Genera tools |
 | `GENERA_PROTOCOL` | `legacy` | `legacy`, using expression requests and three response fields |
 
-The Genera profile and version-1 protocol are not implemented yet.
-Selecting them fails at startup; the bridge never falls back to legacy
-after an unsupported selection. Initialization and discovery do not
-contact Genera. This build does not start a VLM or consume VLM runtime
-paths. Runtime paths and additional deadlines will be configured and
-validated when launch/session support uses them.
+Unsupported profile or protocol selections fail at startup; the bridge
+never falls back to legacy after an unsupported selection. Initialization
+and discovery do not contact Genera. Run the target Lisp before
+evaluating expressions; the bridge does not start a VLM.
 
 ## Tools
 
@@ -116,7 +110,8 @@ Set `GENERA_HOST` in the MCP configuration to enable the tool.
 
 #### Setting up the Genera side
 
-Copy `eval-server.lisp` to the Genera `SYS:SITE;` directory on the host filesystem:
+If `SYS:SITE;` is shared with the host filesystem, copy
+`eval-server.lisp` into its backing directory. For example:
 
 ```sh
 cp eval-server.lisp /opt/symbolics/lib/sys.sct/site/eval-server.lisp
@@ -136,6 +131,29 @@ To verify it is running:
 echo -n '11 (+ 1 2 3 4)' | nc -w 2 genera.example 8888 | cat -v
 ```
 
+### Framing limits
+
+Genera requests and each result/stdout/stderr field are limited to
+1,048,576 bytes. Length headers contain at most 10 decimal digits and
+exactly one trailing space. A reader accepts at most one leading LF,
+CR, or CRLF; the host also accepts the native Genera Return byte (141)
+emitted by the existing length printer. Empty fields are valid.
+
+Both endpoints reject malformed or oversized headers before allocating a
+payload. Payload reads require exactly the declared length. A truncated
+frame closes the connection; the bridge reports a protocol error. Invalid
+headers fail without scanning for another digit or waiting for peer EOF.
+The Genera listener closes a malformed client connection before eval.
+
+Input supports ASCII tab, LF, CR, and printable bytes 32 through 126.
+The host checks the original expression before comment removal or TCP
+connection. Genera checks incoming bytes before character translation.
+Existing diagnostic replacement and newline conversion are preserved.
+
+Swank uses a six-digit hexadecimal header. Header reads require all six
+digits; payload reads require exactly the declared length. Malformed
+headers and payloads exceeding 1,048,576 characters fail before allocation.
+
 ## Host acceptance checks
 
 Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
@@ -147,10 +165,34 @@ cd /path/to/lisp-mcp
 sbcl --noinform --non-interactive --load "$HOME/quicklisp/setup.lisp" \
   --eval "(ql:quickload '(:usocket :yason))"
 python3 tests/configuration.py
+python3 tests/framing.py
 ```
+
+If Quicklisp is installed outside the usual home directory, set
+`LISP_MCP_TEST_QUICKLISP` to its `setup.lisp` path for the test runners.
+This optional test setting does not change production startup.
 
 The checks launch the same SBCL load/main invocation as `lisp-mcp.sh`.
 They cover startup rejection before dispatch, port boundaries, timeout
 enforcement, explicit profile/protocol selection, optional tool discovery,
 host evaluation, and Genera/Swank requests to loopback TCP fixtures. No
 Genera world, Swank installation, or VLM launch is needed.
+
+The framing runner checks the actual host functions and the listener's
+portable framing definitions, using explicit stream/character fixtures
+for Genera APIs. It includes forced short reads, fragmented TCP fields,
+invalid delimiters and prefixes, early EOF, header/frame limits, and
+unsupported input rejection before connection. Malformed fake peers stay
+open to verify prompt failure independently of the evaluation timeout.
+
+After loading the updated listener in Genera, run:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/framing.py --live-genera
+```
+
+The live check sends fragmented ASCII requests, verifies stdout and
+literal newlines, reuses a connection, checks malformed-client closure,
+and finishes with an evaluation through the host bridge. Host fixtures
+do not establish compatibility with Genera streams or condition handling.

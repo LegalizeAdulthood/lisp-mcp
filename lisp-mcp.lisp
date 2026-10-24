@@ -119,27 +119,53 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 ;;;           <newline><length><space><stdout>
 ;;;           <newline><length><space><stderr>
 
+(defconstant +max-header-digits+ 10)
+(defconstant +max-frame-length+ 1048576)
+
+(define-condition framing-error (simple-error) ())
+
+(defun framing-error (control &rest arguments)
+  (error 'framing-error :format-control control :format-arguments arguments))
+
+(defun read-exactly (stream sequence)
+  "Fill SEQUENCE, continuing short reads and rejecting premature EOF."
+  (loop with start = 0
+        while (< start (length sequence))
+        do (let ((end (read-sequence sequence stream :start start)))
+             (when (= start end)
+               (framing-error "Truncated frame: expected ~D elements, received ~D"
+                              (length sequence) start))
+             (setf start end)))
+  sequence)
+
+(defun read-frame-length (stream)
+  "Read decimal digits and one space, with at most one leading line break."
+  (let ((byte (read-byte stream nil nil))
+        (length 0)
+        (digits 0))
+    (cond ((member byte '(10 141)) (setf byte (read-byte stream nil nil)))
+          ((eql byte 13)
+           (setf byte (read-byte stream nil nil))
+           (when (eql byte 10) (setf byte (read-byte stream nil nil)))))
+    (loop
+      (cond ((null byte) (framing-error "Truncated length header"))
+            ((<= 48 byte 57)
+             (when (> (incf digits) +max-header-digits+)
+               (framing-error "Length header exceeds ~D digits" +max-header-digits+))
+             (setf length (+ (* length 10) (- byte 48)))
+             (when (> length +max-frame-length+)
+               (framing-error "Frame exceeds ~D bytes" +max-frame-length+)))
+            ((and (= byte 32) (plusp digits)) (return length))
+            (t (framing-error "Expected decimal length followed by a space")))
+      (setf byte (read-byte stream nil nil)))))
+
 (defun read-field (stream)
   "Read a length-prefixed field from Genera's response (binary stream).
-Skips whitespace/newlines until a digit, reads the decimal length, then reads
-that many bytes.  Non-ASCII octets are replaced with '?' (mirroring the Python
-version's errors='replace' strategy)."
-  (let ((buf (make-array 16 :element-type 'character :fill-pointer 0)))
-    ;; Skip whitespace until first digit
-    (loop for byte = (read-byte stream)
-          for ch = (code-char byte)
-          when (digit-char-p ch)
-            do (vector-push-extend ch buf)
-               (return))
-    ;; Read remaining digits until space
-    (loop for byte = (read-byte stream)
-          for ch = (code-char byte)
-          while (digit-char-p ch)
-          do (vector-push-extend ch buf))
-    (let* ((length (parse-integer (coerce buf 'string)))
-           (data (make-array length :element-type '(unsigned-byte 8))))
-      (when (plusp length)
-        (read-sequence data stream))
+Reject malformed, truncated, and oversized frames. Retain diagnostic byte
+replacement and newline normalization."
+  (let* ((length (read-frame-length stream))
+         (data (read-exactly stream
+                             (make-array length :element-type '(unsigned-byte 8)))))
       ;; Convert bytes to string, replacing non-ASCII with '?', normalizing line endings
       (with-output-to-string (out)
         (loop with i = 0
@@ -157,10 +183,23 @@ version's errors='replace' strategy)."
                         (incf i))
                        (t
                         (write-char ch out)
-                        (incf i))))))))
+                        (incf i)))))))
+
+(defun check-wire-string (string)
+  "Accept bounded ASCII text: tab, LF, CR, and printable characters."
+  (when (> (length string) +max-frame-length+)
+    (framing-error "Frame exceeds ~D bytes" +max-frame-length+))
+  (loop for ch across string
+        for code = (char-code ch)
+        for index from 0
+        unless (or (<= 32 code 126) (member code '(9 10 13)))
+          do (framing-error "Unsupported input character at offset ~D (code ~D)"
+                            index code))
+  string)
 
 (defun string-to-octets (string)
-  "Convert an ASCII string to a byte vector."
+  "Convert bounded, supported ASCII text to a byte vector."
+  (check-wire-string string)
   (let ((octets (make-array (length string) :element-type '(unsigned-byte 8))))
     (loop for i below (length string)
           do (setf (aref octets i) (char-code (char string i))))
@@ -200,12 +239,12 @@ Prevents comment-induced EOF errors on the Genera reader."
 
 (defun genera-send (expression &key (host *genera-host*) (port *genera-port*))
   "Send a Lisp expression to Genera and return (values result stdout stderr)."
-  (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
+  (let* ((clean-expr (strip-lisp-comments (check-wire-string expression)))
+         (expr-bytes (string-to-octets clean-expr))
+         (header (string-to-octets (format nil "~D " (length expr-bytes))))
+         (socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
     (unwind-protect
-        (let* ((stream (usocket:socket-stream socket))
-               (clean-expr (strip-lisp-comments expression))
-               (expr-bytes (string-to-octets clean-expr))
-               (header (string-to-octets (format nil "~D " (length expr-bytes)))))
+        (let ((stream (usocket:socket-stream socket)))
           ;; Send: length + space + expression
           (write-sequence header stream)
           (write-sequence expr-bytes stream)
@@ -227,10 +266,16 @@ Prevents comment-induced EOF errors on the Genera reader."
 If the payload cannot be parsed (e.g. unknown package symbols in backtraces),
 falls back to extracting just the message keyword from the raw string."
   (let ((header (make-string 6)))
-    (read-sequence header stream)
+    (read-exactly stream header)
+    (unless (every (lambda (ch) (digit-char-p ch 16)) header)
+      (framing-error "Expected six hexadecimal Swank length digits"))
     (let* ((len (parse-integer header :radix 16))
-           (payload (make-string len)))
-      (read-sequence payload stream)
+           (payload (progn
+                      (when (> len +max-frame-length+)
+                        (framing-error "Swank frame exceeds ~D characters"
+                                       +max-frame-length+))
+                      (make-string len))))
+      (read-exactly stream payload)
       (handler-case (read-from-string payload)
         (error ()
           ;; Extract the message keyword so the dispatch loop can at least
@@ -436,6 +481,8 @@ Returns (values result-string output-string)."
           (format-response result stdout stderr)))
     (sb-ext:timeout ()
       (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*))
+    (framing-error (e)
+      (format nil "Protocol error: ~A" e))
     (error (e)
       (format nil "Connection error: ~A" e))))
 
@@ -448,6 +495,8 @@ Returns (values result-string output-string)."
           (format-response result output "")))
     (sb-ext:timeout ()
       (format nil "Timeout: Swank did not respond within ~Ds" *genera-timeout*))
+    (framing-error (e)
+      (format nil "Protocol error: ~A" e))
     (error (e)
       (format nil "Connection error: ~A" e))))
 

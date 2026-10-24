@@ -26,12 +26,20 @@ def call(name, expression, request_id=1):
                    arguments=dict(expression=expression))
 
 
+def sbcl_command():
+    command = ["sbcl", "--noinform", "--non-interactive"]
+    setup = os.environ.get("LISP_MCP_TEST_QUICKLISP")
+    if setup:
+        command += ["--load", setup]
+    return command
+
+
 def run_bridge(settings, messages):
     env = {key: value for key, value in os.environ.items()
            if key not in SETTINGS}
     env.update(settings)
     return subprocess.run(
-        ["sbcl", "--noinform", "--non-interactive", "--load",
+        sbcl_command() + ["--load",
          str(ROOT / "lisp-mcp.lisp"), "--eval", "(lisp-mcp:main)"],
         input="".join(json.dumps(message) + "\n" for message in messages),
         text=True, capture_output=True, env=env, cwd=ROOT, timeout=15,
