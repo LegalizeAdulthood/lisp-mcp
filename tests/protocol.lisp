@@ -2,29 +2,7 @@
 
 (load (merge-pathnames "../lisp-mcp.lisp" *load-truename*))
 
-(defpackage #:genera-protocol-fixture (:use #:cl))
-(in-package #:genera-protocol-fixture)
-(load (merge-pathnames "../genera-protocol.lisp" *load-truename*))
-
-(defun send (stream operation)
-  (ecase operation (:tyi (read-char stream nil nil))))
-(defun ascii-to-char (code)
-  (code-char (case code (10 138) (13 141) (9 137) (otherwise code))))
-(defun char-to-ascii (character)
-  (case (char-code character)
-    (138 10) (141 13) (137 9) (otherwise (char-code character))))
-
-;; Read only portable definitions; never read or load Genera-only eval code.
-(with-open-file (source (merge-pathnames "../eval-server.lisp" *load-truename*))
-  (loop for form = (read source nil nil)
-        while (and form (not (eq (first form) 'defvar)))
-        do (eval form)))
-(with-open-file (source (merge-pathnames "../eval-server.lisp" *load-truename*))
-  (loop for line = (read-line source nil nil)
-        until (or (null line)
-                  (string= (string-right-trim '(#\Return) line)
-                           ";;; --- Server ---")))
-  (dotimes (i 3) (eval (read source))))
+(load (merge-pathnames "service-fixture.lisp" *load-truename*))
 
 (defpackage #:protocol-tests (:use #:cl))
 (in-package #:protocol-tests)
@@ -129,9 +107,13 @@
 
 (let* ((request '(:version 1 :id "no-eval" :op :eval :boot-id "b" :service-id "s"
                  :form "(setq *mcp-v1-test-sentinel* t)"))
-       (response (genera-protocol-fixture::mcp-v1-dispatch request)))
-  (check :unsupported-operation (getf (getf response :error) :code))
-  (check "no-eval" (getf response :id))
-  (check nil *mcp-v1-test-sentinel*))
+       (service '(:running t :boot-id "b" :service-id "s" :world "fixture.vlod"))
+       (session (genera-protocol-fixture::mcp-v1-new-session)))
+  (genera-protocol-fixture::mcp-v1-dispatch
+   '(:version 1 :id "hello" :op :hello) session service)
+  (let ((response (genera-protocol-fixture::mcp-v1-dispatch request session service)))
+    (check :unsupported-operation (getf (getf response :error) :code))
+    (check "no-eval" (getf response :id))
+    (check nil *mcp-v1-test-sentinel*)))
 
 (format t "~&Protocol unit checks: ~D passed.~%" *checks*)

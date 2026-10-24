@@ -10,7 +10,9 @@
 
 (defparameter *mcp-v1-operations* '(:hello :status :eval :request-status))
 (defparameter *mcp-v1-error-codes*
-  '(:unsupported-operation :invalid-request :unsupported-version))
+  '(:unsupported-operation :invalid-request :unsupported-version
+    :authentication-failed :world-mismatch :handshake-required
+    :stale-generation :service-unavailable))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -18,7 +20,8 @@
     :elapsed-ms :truncated :error :code :message :target-id
     :hello :status :eval :request-status :running :completed :failed
     :interrupted :unknown :unsupported-operation :invalid-request
-    :unsupported-version))
+    :unsupported-version :expected-world :authentication-failed
+    :world-mismatch :handshake-required :stale-generation :service-unavailable))
 
 (defun mcp-v1-error (message)
   (error "Envelope error: ~A" message))
@@ -156,6 +159,7 @@
 (defun mcp-v1-type-p (value type)
   (case type
     (:text (stringp value))
+    (:nonempty-text (and (stringp value) (plusp (length value))))
     (:id (and (stringp value) (<= 1 (length value) 128)))
     (:boolean (or (null value) (eq value t)))
     (:nonnegative (and (mcp-v1-integer-p value) (>= value 0)))
@@ -184,7 +188,7 @@
     (mcp-v1-error "Expected an even property list"))
   (let* ((request-keys
            (case (getf object :op)
-             (:hello '(:client :token))
+             (:hello '(:client :token :expected-world))
              (:status '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
@@ -233,7 +237,8 @@
       (mcp-v1-error "Unsupported version"))
     (mcp-v1-properties
      object '((:id . :id) (:client . :text) (:token . :text)
-              (:boot-id . :id) (:service-id . :id) (:world . :text)
+              (:boot-id . :id) (:service-id . :id) (:world . :nonempty-text)
+              (:expected-world . :nonempty-text)
               (:package . :text) (:busy . :boolean) (:features . :features)
               (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
               (:print-level . :print-limit) (:print-length . :print-limit)
@@ -245,6 +250,22 @@
 
 (defun mcp-v1-decode (text direction)
   (mcp-v1-validate (mcp-v1-parse text) direction))
+
+(defun mcp-v1-check-hello-response (request response)
+  "Validate a hello reply before trusting its identity or capabilities."
+  (mcp-v1-validate request :request)
+  (mcp-v1-validate response :response)
+  (unless (and (eq (getf request :op) :hello)
+               (string= (getf request :id) (getf response :id)))
+    (mcp-v1-error "Hello response identity mismatch"))
+  (when (getf response :ok)
+    (dolist (key '(:boot-id :service-id :world :package :busy :features))
+      (unless (mcp-v1-present-p response key)
+        (mcp-v1-error "Incomplete hello response")))
+    (when (and (getf request :expected-world)
+               (not (string= (getf request :expected-world) (getf response :world))))
+      (mcp-v1-error "Hello world mismatch")))
+  response)
 
 (defun mcp-v1-encode (object direction)
   "Write validated data without inheriting Lisp printer or reader settings."

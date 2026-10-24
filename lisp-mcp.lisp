@@ -270,7 +270,10 @@ Prevents comment-induced EOF errors on the Genera reader."
           (write-sequence header stream)
           (write-sequence payload stream)
           (force-output stream)
-          (mcp-v1-decode (read-field stream :strict t) :response))
+          (let ((response (mcp-v1-decode (read-field stream :strict t) :response)))
+            (if (eq (getf request :op) :hello)
+                (mcp-v1-check-hello-response request response)
+                response)))
       (usocket:socket-close socket))))
 
 ;;; --- Swank client ---

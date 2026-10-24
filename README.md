@@ -172,6 +172,44 @@ properties, reader syntax, and trailing objects are rejected. The codec
 does not invoke the Lisp reader or evaluator. Literal tab, LF, and CR
 bytes in strings survive encoding and decoding unchanged.
 
+### Versioned service control
+
+The Genera listener provides these local lifecycle entry points:
+
+```lisp
+(mcp-start-service)
+(mcp-stop-service)
+(mcp-start-service :protocol :v1 :token "shared-secret" :replace t)
+```
+
+Starting with the same configuration preserves the service identity.
+Configuration changes require `:replace t`. Stopping disables only the
+MCP service and closes its clients. A restart creates a new service ID
+while preserving the boot ID. Source reloads preserve both IDs.
+
+The listener detects the VLM world basename. Supply `:world "world.vlod"`
+when that information is unavailable. `mcp-initialize-boot` stops the
+service and regenerates boot identity; it does not reboot Genera. Start
+the service after initializing a new boot identity.
+
+Versioned connections begin with `:hello`. For example:
+
+```lisp
+(:version 1 :id "hello-1" :op :hello
+ :token "shared-secret" :expected-world "world.vlod")
+```
+
+A successful hello returns boot/service IDs, world, package, busy state,
+and implemented capabilities. `:status` requests carry both returned
+generation IDs. Stale IDs are rejected before dispatch. Authentication
+and expected-world failures expose no service metadata; a failed repeat
+hello revokes that connection's authorization.
+
+Tokens require version-1 mode; legacy mode cannot be combined with a
+token. Tokens contain 1 through 4,096 printable ASCII characters. Keep
+versioned envelope clients and legacy eval clients on their explicitly
+selected listener mode.
+
 ## Host acceptance checks
 
 Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
@@ -185,6 +223,7 @@ sbcl --noinform --non-interactive --load "$HOME/quicklisp/setup.lisp" \
 python3 tests/configuration.py
 python3 tests/framing.py
 python3 tests/protocol.py
+python3 tests/handshake.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -231,3 +270,16 @@ This live check reloads both Lisp files, compares the shared fixtures in
 Genera, and temporarily selects envelope mode to check one framed reply
 per request and rejection without eval. It retains a legacy control
 connection and restores legacy mode when finished.
+
+To check authenticated hello/status and native service lifecycle:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/handshake.py --live-genera
+```
+
+This check requires a running legacy listener on a VLM. It reloads both
+sources, temporarily configures a versioned service with a test token,
+and checks identity, client closure, and bootstrap-loader replacement.
+It simulates boot-identity initialization without rebooting the world,
+then restores legacy mode and removes the test token.

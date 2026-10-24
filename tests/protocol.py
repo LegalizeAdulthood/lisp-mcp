@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -19,6 +20,9 @@ from framing import frame, peer, read_live_field
 
 FIXTURES = json.loads((Path(__file__).with_name("protocol-fixtures.json"))
                      .read_text(encoding="ascii"))
+CODEC_REQUEST = next(f["wire"] for f in FIXTURES
+                     if f["valid"] and f["direction"] == "request"
+                     and ":op :eval" in f["wire"])
 
 
 def lisp_string(text):
@@ -51,6 +55,33 @@ def legacy(stream, expression):
     return result
 
 
+def reload_sources(stream):
+    source = "(progn\n" + "\n".join(
+        (ROOT / name).read_text(encoding="ascii")
+        for name in ("genera-protocol.lisp", "eval-server.lisp")
+    ) + '\n"codec loaded")'
+    # Genera's source reader ends line comments at native Return (ASCII CR).
+    return legacy(stream, source.replace("\n", "\r"))
+
+
+def wire_string(reply, key):
+    match = re.search(r':' + re.escape(key) + r' "((?:\\["\\]|[^"\\])*)"', reply)
+    if not match:
+        raise AssertionError(f"Missing string {key}: {reply}")
+    return re.sub(r'\\(["\\])', r'\1', match.group(1))
+
+
+def wire_exchange(stream, request):
+    stream.sendall(frame(request.encode("ascii"), b""))
+    return read_live_field(stream)
+
+
+def status_request(hello, request_id="status", boot=None, service=None):
+    return (f'(:version 1 :id {lisp_string(request_id)} :op :status '
+            f':boot-id {lisp_string(boot or wire_string(hello, "boot-id"))} '
+            f':service-id {lisp_string(service or wire_string(hello, "service-id"))})')
+
+
 class ProtocolChecks(unittest.TestCase):
     def test_portable_codec_definitions(self):
         result = subprocess.run(
@@ -65,7 +96,7 @@ class ProtocolChecks(unittest.TestCase):
                         if f["valid"] and f["direction"] == "response"
                         and ':stdout "a' in f["wire"])
         with peer(frame(response.encode("ascii")), fragment=True) as (host, port):
-            result = exchange(host, port, FIXTURES[0]["wire"], binary=True)
+            result = exchange(host, port, CODEC_REQUEST, binary=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, response.encode("ascii"))
 
@@ -75,7 +106,7 @@ class ProtocolChecks(unittest.TestCase):
                         b'(:version 1 :id "x" :ok t) nil']:
             with self.subTest(payload=payload):
                 with peer(frame(payload)) as (host, port):
-                    result = exchange(host, port, FIXTURES[0]["wire"])
+                    result = exchange(host, port, CODEC_REQUEST)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "rejected")
 
@@ -84,7 +115,7 @@ class ProtocolChecks(unittest.TestCase):
             payload = b'(:version 1 :id "x" :ok t :stdout "' + bytes([byte]) + b'")'
             with self.subTest(byte=byte):
                 with peer(frame(payload)) as (host, port):
-                    result = exchange(host, port, FIXTURES[0]["wire"])
+                    result = exchange(host, port, CODEC_REQUEST)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "rejected")
 
@@ -111,12 +142,7 @@ class ProtocolChecks(unittest.TestCase):
         port = int(os.environ.get("GENERA_PORT", "8888"))
         with socket.create_connection((host, port), timeout=5) as control:
             control.settimeout(30)
-            sources = [ROOT / "genera-protocol.lisp", ROOT / "eval-server.lisp"]
-            source = "(progn\n" + "\n".join(
-                path.read_text(encoding="ascii") for path in sources
-            ) + '\n"codec loaded")'
-            # Genera's source reader ends line comments at native Return (ASCII CR).
-            self.assertEqual(legacy(control, source.replace("\n", "\r")), "codec loaded")
+            self.assertEqual(reload_sources(control), "codec loaded")
             legacy(control, "(setq *mcp-v1-test-sentinel* nil)")
             # Keep this legacy connection open to restore the selected mode.
             # New connections explicitly select :v1; there is no wire autodetection.
@@ -135,29 +161,37 @@ class ProtocolChecks(unittest.TestCase):
                         expected = (",".join(str(ord(c)) for c in fixture["wire"])
                                     if fixture["valid"] else "rejected")
                         self.assertEqual(legacy(control, expression), expected)
-                legacy(control, "(setq *mcp-protocol* :v1)")
+                # Keep this test's trusted legacy control connection in the same
+                # service; the lifecycle suite tests replacement through the API.
+                legacy(control, '(setf (getf *mcp-service* :protocol) :v1 '
+                                '*mcp-protocol* :v1)')
                 requests = [f["wire"] for f in FIXTURES
                             if f["valid"] and f["direction"] == "request"]
-                requests.append('(:version 1 :id "no-eval" :op :eval :boot-id "b" '
-                                ':service-id "s" :form "(setq *mcp-v1-test-sentinel* t)")')
+                requests.append('(:version 1 :id "no-eval" :op :eval :boot-id "boot" '
+                                ':service-id "service" '
+                                ':form "(setq *mcp-v1-test-sentinel* t)")')
                 for request in requests:
                     with socket.create_connection((host, port), timeout=5) as stream:
                         stream.settimeout(3)
+                        hello = wire_exchange(stream, '(:version 1 :id "probe" :op :hello)')
+                        request = request.replace(':boot-id "boot"',
+                            ':boot-id ' + lisp_string(wire_string(hello, "boot-id")))
+                        request = request.replace(':service-id "service"',
+                            ':service-id ' + lisp_string(wire_string(hello, "service-id")))
                         # Reuse the connection. Each request produces exactly one field.
-                        stream.sendall(frame(request.encode("ascii"), b""))
-                        reply = read_live_field(stream)
-                        self.assertIn(":unsupported-operation", reply)
-                        stream.sendall(frame(request.encode("ascii"), b""))
-                        self.assertEqual(read_live_field(stream), reply)
+                        reply = wire_exchange(stream, request)
+                        if ":op :hello" in request or ":op :status" in request:
+                            self.assertIn(":ok t", reply)
+                        else:
+                            self.assertIn(":unsupported-operation", reply)
+                        self.assertEqual(wire_exchange(stream, request), reply)
                         stream.settimeout(0.1)
                         with self.assertRaises(socket.timeout):
                             stream.recv(1)
                 result = exchange(host, port, FIXTURES[0]["wire"])
                 self.assertEqual(result.returncode, 0, result.stderr)
-                expected = next(f["wire"] for f in FIXTURES if f["valid"]
-                                and f["direction"] == "response"
-                                and ":unsupported-operation" in f["wire"])
-                self.assertEqual(result.stdout, expected)
+                self.assertIn(":ok t", result.stdout)
+                self.assertIn(":features (:status)", result.stdout)
                 bad_requests = [f["wire"] for f in FIXTURES
                                 if not f["valid"] and f["direction"] == "request"]
                 bad_requests.append("(setq *mcp-v1-test-sentinel* t)")
@@ -171,7 +205,8 @@ class ProtocolChecks(unittest.TestCase):
                             pass
                 self.assertEqual(legacy(control, "*mcp-v1-test-sentinel*"), "NIL")
             finally:
-                legacy(control, "(setq *mcp-protocol* :legacy)")
+                legacy(control, '(setf (getf *mcp-service* :protocol) :legacy '
+                                '*mcp-protocol* :legacy)')
             self.assertEqual(legacy(control, "(+ 20 22)"), "42")
         print(f"Live codec fixtures: {len(FIXTURES)} matched; legacy mode restored.")
 

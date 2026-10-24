@@ -187,14 +187,17 @@ does not recognize."
 
 ;;; --- Server ---
 
+;;; --- Portable service state ---
+
 (defvar *mcp-protocol* :legacy
   "Explicit listener mode: :LEGACY eval or :V1 data envelopes.")
 
-(defun mcp-v1-dispatch (request)
-  "Return data for known operations without reading or evaluating form text."
-  (list :version 1 :id (getf request :id) :ok nil
-        :error (list :code :unsupported-operation
-                     :message "Operation is not available")))
+(defvar *mcp-service* nil)
+(defvar *mcp-boot-id* nil)
+(defvar *mcp-generation-counter* 0)
+(defvar *mcp-current-client* nil)
+(defvar *mcp-worker-busy* nil)
+(defvar *mcp-listener-installed* nil)
 
 (defun mcp-write-envelope (stream response)
   "Write one raw-ASCII data envelope, without diagnostic replacement."
@@ -202,33 +205,187 @@ does not recognize."
     (mcp-write-length stream (length text))
     (write-string text stream)))
 
-(defun mcp-handle-client (stream &optional (protocol *mcp-protocol*))
+(defun mcp-new-generation-id (kind)
+  (format nil "~A-~D-~D-~D-~D" kind (get-universal-time)
+          (get-internal-real-time) (incf *mcp-generation-counter*)
+          (random 268435456)))
+
+(defun mcp-v1-new-session ()
+  (list :authorized nil :boot-id nil :service-id nil))
+
+(defun mcp-v1-generation (service)
+  (list :boot-id (getf service :boot-id) :service-id (getf service :service-id)))
+
+(defun mcp-v1-failure (request code message &optional service)
+  (append (list :version 1 :id (getf request :id) :ok nil)
+          (when service (mcp-v1-generation service))
+          (list :error (list :code code :message message))))
+
+(defun mcp-v1-service-response (request service)
+  (append (list :version 1 :id (getf request :id) :ok t)
+          (mcp-v1-generation service)
+          (list :world (getf service :world)
+                :package (package-name *mcp-eval-package*)
+                :busy (not (null *mcp-worker-busy*)) :features '(:status))))
+
+(defun mcp-v1-dispatch (request &optional (session (mcp-v1-new-session))
+                                        (service *mcp-service*))
+  "Authenticate hello before exposing state; never evaluate request form text."
+  (mcp-v1-validate request :request)
+  (unless (and service (getf service :running))
+    (return-from mcp-v1-dispatch
+      (mcp-v1-failure request :service-unavailable "Service is unavailable")))
+  (cond
+    ((eq (getf request :op) :hello)
+     ;; A failed repeated hello revokes the connection's previous authorization.
+     (setf (getf session :authorized) nil)
+     (unless (or (null (getf service :token))
+                 (equal (getf service :token) (getf request :token)))
+       (return-from mcp-v1-dispatch
+         (mcp-v1-failure request :authentication-failed "Authentication failed")))
+     (when (and (getf request :expected-world)
+                (not (string= (getf request :expected-world) (getf service :world))))
+       (return-from mcp-v1-dispatch
+         (mcp-v1-failure request :world-mismatch "Expected world does not match")))
+     (setf (getf session :authorized) t
+           (getf session :boot-id) (getf service :boot-id)
+           (getf session :service-id) (getf service :service-id))
+     (mcp-v1-service-response request service))
+    ((not (getf session :authorized))
+     (mcp-v1-failure request :handshake-required "Hello is required"))
+    ((not (and (equal (getf request :boot-id) (getf service :boot-id))
+               (equal (getf request :service-id) (getf service :service-id))
+               (equal (getf session :boot-id) (getf service :boot-id))
+               (equal (getf session :service-id) (getf service :service-id))))
+     (mcp-v1-failure request :stale-generation "Generation identity does not match"
+                     service))
+    ((eq (getf request :op) :status) (mcp-v1-service-response request service))
+    (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
+                       service))))
+
+(defun mcp-stop-service ()
+  "Disable only this service and close its clients; preserve world state."
+  (when *mcp-worker-busy* (error "Cannot stop an active execution worker"))
+  (when (and *mcp-service* (getf *mcp-service* :running))
+    (let ((service *mcp-service*))
+      (setf (getf service :running) nil)
+      (unwind-protect (mcp-disable-listener)
+        (dolist (stream (getf service :clients))
+          ;; A management form may finish its reply, then its old loop exits.
+          (unless (eq stream *mcp-current-client*) (mcp-close-client stream)))
+        (setf (getf service :clients) nil))))
+  nil)
+
+(defun mcp-initialize-boot ()
+  "Regenerate identity for a boot hook; calling this does not boot the world."
+  (mcp-stop-service)
+  (setf *mcp-listener-installed* nil
+        *mcp-boot-id* (mcp-new-generation-id "boot")))
+
+(defun mcp-start-service (&key (protocol *mcp-protocol*)
+                             (token nil token-supplied-p)
+                             (world nil world-supplied-p) replace)
+  "Start once, or explicitly replace an idle service. Return only its ID."
+  (let* ((previous *mcp-service*)
+         (selected-token (if token-supplied-p token (getf previous :token)))
+         (selected-world (if world-supplied-p world
+                             (or (getf previous :world) (mcp-detect-world)))))
+    (unless (member protocol '(:legacy :v1)) (error "Unknown MCP protocol mode"))
+    (when selected-token
+      (unless (and (stringp selected-token) (<= 1 (length selected-token) 4096)
+                   (every (lambda (ch) (<= 32 (char-code ch) 126)) selected-token))
+        (error "Token must be nonempty printable ASCII text"))
+      (unless (eq protocol :v1) (error "Authentication requires version-1 mode")))
+    (when selected-world
+      (mcp-v1-check-text selected-world)
+      (when (zerop (length selected-world)) (error "World name must be nonempty")))
+    (when (and (eq protocol :v1) (null selected-world))
+      (error "Configure a world name when it cannot be detected"))
+    (when (and previous (getf previous :running) (not replace))
+      (unless (and (eq protocol (getf previous :protocol))
+                   (equal selected-token (getf previous :token))
+                   (equal selected-world (getf previous :world)))
+        (error "Service configuration changes require explicit replacement"))
+      (return-from mcp-start-service (getf previous :service-id)))
+    (when *mcp-worker-busy* (error "Cannot replace an active execution worker"))
+    (mcp-stop-service)
+    (unless *mcp-boot-id* (setf *mcp-boot-id* (mcp-new-generation-id "boot")))
+    (let ((service (list :running t :protocol protocol :token selected-token
+                         :world selected-world :boot-id *mcp-boot-id*
+                         :service-id (mcp-new-generation-id "service") :clients nil)))
+      (mcp-enable-listener)
+      (setf *mcp-service* service *mcp-protocol* protocol)
+      (getf service :service-id))))
+
+;;; --- Genera service adapters ---
+
+(defun mcp-detect-world ()
+  ;; VLM-WORLD-PATHNAME is a native accessor macro, not a FUNCALL target.
+  ;; Internal symbol syntax permits reading source without these symbols.
+  (when (and (fboundp 'sys::vlm-world-pathname) (fboundp 'sys::copy-emb-string))
+    (let* ((path (sys::copy-emb-string (sys::vlm-world-pathname)))
+           (separator (position-if (lambda (ch) (find ch "/\\:")) path :from-end t)))
+      (subseq path (if separator (1+ separator) 0)))))
+
+(defun mcp-enable-listener ()
+  (let ((port (tcp:protocol-name-tcp-port :mcp-server nil)))
+    (when (and port (/= port 8888)) (error "MCP protocol uses a different port"))
+    ;; An existing function may be the temporary bootstrap loader. Install our
+    ;; wrapper once per boot, clearing only our own old enabled-service entries.
+    (unless *mcp-listener-installed*
+      (sys:disable-services '(:mcp-server))
+      (let ((sys:inhibit-fdefine-warnings :just-warn))
+        (net:define-server :mcp-server (:medium :byte-stream :stream stream)
+          (mcp-handle-client stream)))
+      (setf *mcp-listener-installed* t))
+    (unless port (tcp:add-tcp-port-for-protocol :mcp-server 8888)))
+  (unless (member :mcp-server net:*services-enabled*)
+    (sys:enable-services '(:mcp-server))))
+
+(defun mcp-disable-listener ()
+  (sys:disable-services '(:mcp-server)))
+
+(defun mcp-close-client (stream)
+  (condition-case ()
+      (ansi-common-lisp:handler-case (close stream :abort t)
+        (ansi-common-lisp:error () nil))
+    (error nil)))
+
+(defun mcp-handle-client (stream)
   "Service one explicitly selected protocol for the life of a connection."
-  (unwind-protect
-      (condition-case (frame-error)
-          (ansi-common-lisp:handler-case
-              (progn
-                (unless (member protocol '(:legacy :v1))
-                  (error "Unknown MCP protocol mode"))
-                (loop for request = (mcp-read-request stream (eq protocol :legacy))
-                      while request
-                      do (case protocol
-                           (:legacy
-                            (multiple-value-bind (result stdout stderr)
-                                (mcp-eval request)
-                              (mcp-write-field stream result)
-                              (mcp-write-field stream stdout)
-                              (mcp-write-field stream stderr)))
-                           (:v1
-                            (mcp-write-envelope
-                             stream (mcp-v1-dispatch
-                                     (mcp-v1-decode request :request)))))
-                         (send stream :force-output)))
-            (ansi-common-lisp:error () nil))
-        (error (format *error-output* "MCP connection closed: ~A~%" frame-error)))
-    (close stream :abort t)))
+  (let* ((service *mcp-service*)
+         (protocol (getf service :protocol))
+         (session (mcp-v1-new-session))
+         (*mcp-current-client* stream))
+    (unless (and service (getf service :running))
+      (mcp-close-client stream)
+      (return-from mcp-handle-client nil))
+    (push stream (getf service :clients))
+    (unwind-protect
+        (condition-case (frame-error)
+            (ansi-common-lisp:handler-case
+                (progn
+                  (unless (member protocol '(:legacy :v1))
+                    (error "Unknown MCP protocol mode"))
+                  (loop while (getf service :running)
+                        for request = (mcp-read-request stream (eq protocol :legacy))
+                        while (and request (getf service :running))
+                        do (case protocol
+                             (:legacy
+                              (multiple-value-bind (result stdout stderr)
+                                  (mcp-eval request)
+                                (mcp-write-field stream result)
+                                (mcp-write-field stream stdout)
+                                (mcp-write-field stream stderr)))
+                             (:v1
+                              (mcp-write-envelope
+                               stream (mcp-v1-dispatch
+                                       (mcp-v1-decode request :request)
+                                       session service))))
+                           (send stream :force-output)))
+              (ansi-common-lisp:error () nil))
+          (error (format *error-output* "MCP connection closed: ~A~%" frame-error)))
+      (setf (getf service :clients) (delete stream (getf service :clients)))
+      (mcp-close-client stream))))
 
-(net:define-server :mcp-server (:medium :byte-stream :stream stream)
-  (mcp-handle-client stream))
-
-(tcp:add-tcp-port-for-protocol :mcp-server 8888)
+(mcp-start-service)
