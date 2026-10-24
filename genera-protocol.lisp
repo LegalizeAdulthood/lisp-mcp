@@ -13,13 +13,15 @@
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
     :stale-generation :service-unavailable :package-not-found :reader-error
-    :evaluation-error :busy :worker-unavailable))
+    :evaluation-error :busy :worker-unavailable :request-id-conflict))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
     :request-state :values :value-count :stdout :stderr :warnings
     :elapsed-ms :truncated :replaced :error :code :message :condition-type :target-id
     :active-request-id :worker-unavailable
+    :result :history-limit :history-count :history-byte-limit :history-bytes
+    :history-evictions :request-id-conflict
     :hello :status :eval :request-status :running :completed :failed
     :interrupted :unknown :unsupported-operation :invalid-request
     :unsupported-version :expected-world :authentication-failed
@@ -199,7 +201,9 @@
          (response-keys
            '(:boot-id :service-id :world :package :busy :active-request-id :features :ok
              :request-state :values :value-count :stdout :stderr :warnings
-             :elapsed-ms :truncated :replaced :error)))
+             :elapsed-ms :truncated :replaced :error :target-id :result
+             :history-limit :history-count :history-byte-limit :history-bytes
+             :history-evictions)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -217,6 +221,21 @@
       (:response
        (mcp-v1-plist object (append '(:version :id) response-keys)
                      '(:version :id :ok))
+       (when (mcp-v1-present-p object :result)
+         (let ((result (getf object :result)))
+           (mcp-v1-validate result :response)
+           (unless (and (getf object :ok) (getf object :target-id)
+                        (not (mcp-v1-present-p result :result))
+                        (member (getf object :request-state) '(:completed :failed))
+                        (eq (getf object :request-state) (getf result :request-state))
+                        (every (lambda (key) (equal (getf object key) (getf result key)))
+                               '(:boot-id :service-id))
+                        (equal (getf object :target-id) (getf result :id)))
+             (mcp-v1-error "Invalid retained result"))
+           (mcp-v1-check-eval-response
+            (append (list :version 1 :op :eval :form "" :id (getf result :id))
+                    (list :boot-id (getf object :boot-id)
+                          :service-id (getf object :service-id))) result)))
        (if (getf object :ok)
            (when (getf object :error) (mcp-v1-error "Success cannot contain an error"))
            (let ((failure (getf object :error)))
@@ -251,6 +270,9 @@
               (:target-id . :id) (:request-state . :state) (:values . :strings)
               (:value-count . :nonnegative) (:stdout . :text) (:stderr . :text)
               (:warnings . :strings) (:elapsed-ms . :nonnegative)
+              (:history-limit . :nonnegative) (:history-count . :nonnegative)
+              (:history-byte-limit . :nonnegative) (:history-bytes . :nonnegative)
+              (:history-evictions . :nonnegative)
               (:truncated . :boolean) (:replaced . :boolean))))
   object)
 

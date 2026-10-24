@@ -186,10 +186,9 @@ class ProtocolChecks(unittest.TestCase):
                             ':service-id ' + lisp_string(wire_string(hello, "service-id")))
                         # Reuse the connection. Each request produces exactly one field.
                         reply = wire_exchange(stream, request)
-                        if ":op :hello" in request or ":op :status" in request:
-                            self.assertIn(":ok t", reply)
-                        else:
-                            self.assertIn(":unsupported-operation", reply)
+                        self.assertIn(":ok t", reply)
+                        if ":op :request-status" in request:
+                            self.assertIn(":request-state :unknown", reply)
                         self.assertEqual(wire_exchange(stream, request), reply)
                         stream.settimeout(0.1)
                         with self.assertRaises(socket.timeout):
@@ -197,7 +196,7 @@ class ProtocolChecks(unittest.TestCase):
                 result = exchange(host, port, FIXTURES[0]["wire"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(":ok t", result.stdout)
-                self.assertIn(":features (:status :eval)", result.stdout)
+                self.assertIn(":features (:status :request-status :eval)", result.stdout)
                 bad_requests = [f["wire"] for f in FIXTURES
                                 if not f["valid"] and f["direction"] == "request"]
                 bad_requests.append("(setq *mcp-v1-test-sentinel* t)")

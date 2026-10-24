@@ -141,7 +141,7 @@ class HandshakeChecks(unittest.TestCase):
                 hello_request = '(:version 1 :id "hello" :op :hello :token "test-secret")'
                 hello = wire_exchange(keeper, hello_request)
                 self.assertIn(":ok t", hello)
-                self.assertIn(":features (:status :eval)", hello)
+                self.assertIn(":features (:status :request-status :eval)", hello)
                 # This suite's long legacy management form owns the worker.
                 self.assertIn(":busy t", hello)
                 self.assertTrue(wire_string(hello, "world"))

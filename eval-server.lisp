@@ -356,6 +356,8 @@ does not recognize."
 (defvar *mcp-current-connection* nil)
 (defconstant +mcp-client-limit+ 16)
 (defconstant +mcp-control-limit+ 16)
+(defconstant +mcp-history-limit+ 32)
+(defconstant +mcp-history-byte-limit+ 4194304)
 
 (defmacro mcp-with-state-lock (&body body)
   `(mcp-call-with-state-lock (lambda () ,@body)))
@@ -384,9 +386,78 @@ does not recognize."
     (setf (getf client :queue)
           (nconc (getf client :queue) (list (list :response response :job job))))))
 
+(defun mcp-request-identity (request)
+  ;; Property order is irrelevant; omission and an explicit default differ.
+  (loop for key in '(:op :form :package :timeout-ms :print-level :print-length)
+        collect (list key (mcp-v1-present-p request key) (getf request key))))
+
+(defun mcp-ensure-ledger (service)
+  ;; Extend an older live service in place; readers retain this same plist.
+  (mcp-with-state-lock
+    (dolist (property (list (list :active nil) (list :history nil)
+                            (list :history-bytes 0) (list :history-evictions 0)
+                            (list :history-limit +mcp-history-limit+)
+                            (list :history-byte-limit +mcp-history-byte-limit+)))
+      (unless (mcp-v1-present-p service (first property))
+        (nconc service property))))
+  service)
+
+(defun mcp-find-request (service id)
+  ;; The service owns one generation; retired generations are never searched.
+  (find id (cons (getf service :active) (getf service :history))
+        :key (lambda (entry) (getf entry :id)) :test #'equal))
+
+(defun mcp-request-response (request service entry &optional lookup)
+  (let ((result (getf entry :result)))
+    (if (and result (not lookup)) result
+        (append (list :version 1 :id (getf request :id) :ok t)
+                (mcp-v1-generation service)
+                (list :target-id (if lookup (getf request :target-id)
+                                    (getf request :id))
+                      :request-state (if entry (getf entry :state) :unknown))
+                (when result (list :result result))))))
+
+(defun mcp-finish-job (job result)
+  "Commit a terminal outcome before delivery, retaining no client in history."
+  (let* ((service (getf job :service)) (entry (getf job :entry))
+         (bytes (when entry (+ (getf entry :bytes)
+                              (length (mcp-v1-encode result :response))))))
+    (mcp-with-state-lock
+      (when entry
+        (setf (getf entry :result) result
+              (getf entry :state) (getf result :request-state)
+              (getf entry :bytes) bytes
+              (getf service :active) nil)
+        (push entry (getf service :history))
+        (setf (getf service :history-bytes) (+ (getf service :history-bytes 0) bytes))
+        (loop while (or (> (length (getf service :history))
+                           (getf service :history-limit +mcp-history-limit+))
+                        (> (getf service :history-bytes)
+                           (getf service :history-byte-limit +mcp-history-byte-limit+)))
+              do (let ((oldest (car (last (getf service :history)))))
+                   (decf (getf service :history-bytes) (getf oldest :bytes))
+                   (setf (getf service :history) (butlast (getf service :history)))
+                   (setf (getf service :history-evictions)
+                         (1+ (getf service :history-evictions 0))))))
+      (setf (getf job :result) result (getf job :state) :done)
+      (mcp-queue-response (getf job :client) result job)
+      (setf *mcp-worker-busy* nil))))
+
 (defun mcp-submit-eval (request service client &optional legacy)
   "Reserve one world-wide execution slot before making work runnable."
   (mcp-with-state-lock
+    (unless legacy
+      (let ((entry (mcp-find-request service (getf request :id))))
+        (when entry
+          (return-from mcp-submit-eval
+            (if (equal (mcp-request-identity request) (getf entry :identity))
+                (mcp-request-response request service entry)
+                (mcp-v1-failure request :request-id-conflict
+                                "Request ID has a different payload" service)))))
+      (when (mcp-v1-present-p request :timeout-ms)
+        (return-from mcp-submit-eval
+          (mcp-v1-failure request :unsupported-operation
+                          "Remote execution deadlines are not available" service))))
     (let ((active (or (mcp-active-request-id)
                       (getf (getf (getf client :execution) :request) :id)))
           (code (cond ((or *mcp-worker-failed* (not (mcp-worker-live-p)))
@@ -403,6 +474,13 @@ does not recognize."
                       (when active (list :active-request-id active))))))
       (let ((job (list :request request :service service :client client
                        :legacy legacy :state :pending :result nil)))
+        (unless legacy
+          (let ((entry (list :id (getf request :id)
+                             :identity (mcp-request-identity request)
+                             :bytes (length (mcp-v1-encode request :request))
+                             :state :running :result nil)))
+            ;; Publish identity before the execution slot becomes runnable.
+            (setf (getf job :entry) entry (getf service :active) entry)))
         (setf (getf client :execution) job *mcp-worker-busy* job)
         nil))))
 
@@ -433,7 +511,13 @@ does not recognize."
           (mcp-v1-generation service)
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
-                :busy (not (null (mcp-execution-busy-p))) :features '(:status :eval))
+                :busy (not (null (mcp-execution-busy-p)))
+                :features '(:status :request-status :eval)
+                :history-limit (getf service :history-limit +mcp-history-limit+)
+                :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
+                :history-count (length (getf service :history))
+                :history-bytes (getf service :history-bytes 0)
+                :history-evictions (getf service :history-evictions 0))
           (when (mcp-active-request-id)
             (list :active-request-id (mcp-active-request-id)))))
 
@@ -469,6 +553,9 @@ does not recognize."
      (mcp-v1-failure request :stale-generation "Generation identity does not match"
                      service))
     ((eq (getf request :op) :status) (mcp-v1-service-response request service))
+    ((eq (getf request :op) :request-status)
+     (mcp-request-response request service
+                           (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :eval)
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
@@ -527,6 +614,7 @@ does not recognize."
                       (equal selected-token (getf previous :token))
                       (equal selected-world (getf previous :world)))
            (error "Service configuration changes require explicit replacement"))
+         (mcp-ensure-ledger previous)
          (mcp-ensure-worker)
          (mcp-enable-listener)
          (return-from mcp-start-service (getf previous :service-id)))
@@ -539,6 +627,7 @@ does not recognize."
                             :world selected-world :boot-id *mcp-boot-id*
                             :service-id (mcp-new-generation-id "service") :clients nil
                             :asynchronous t)))
+         (mcp-ensure-ledger service)
          (mcp-ensure-worker)
          (mcp-enable-listener)
          (mcp-with-state-lock
@@ -602,11 +691,7 @@ does not recognize."
         (setf result (mcp-worker-failure job result))
         (unless (getf job :legacy)
           (setf (getf (getf result :error) :condition-type) "MCP-WORKER-ERROR")))
-      (mcp-with-state-lock
-        ;; Retain the result before attempting delivery.
-        (setf (getf job :result) result (getf job :state) :done)
-        (mcp-queue-response client result job)
-        (setf *mcp-worker-busy* nil)))))
+      (mcp-finish-job job result))))
 
 (defun mcp-run-job (job)
   ;; Keep this boundary outside argument setup and completion bookkeeping,
@@ -777,7 +862,7 @@ does not recognize."
 ;; them. Native process/lock machinery must not depend on interpreter frames.
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
-        mcp-admit-client mcp-submit-eval mcp-v1-dispatch
+        mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-stop-service mcp-initialize-boot mcp-start-service
         mcp-ensure-worker mcp-execute-job mcp-run-job mcp-worker-loop
         mcp-close-connection mcp-client-writer mcp-handle-client))

@@ -252,6 +252,43 @@ accepts `:host`, `:port`, `:token`, `:expected-world`, `:package`,
 terminal fields and never retries execution or falls back to legacy.
 The MCP environment configuration above selects the legacy tool path.
 
+### Request history
+
+Versioned eval records its request ID and payload before execution. The
+service retains the active request plus at most 32 completed outcomes,
+bounded by 4,194,304 serialized ASCII bytes for requests and results.
+Hello/status reports `:history-limit`, `:history-byte-limit`,
+`:history-count`, `:history-bytes`, and `:history-evictions`. Completed
+entries are evicted in completion order; lookup does not refresh them.
+An entry larger than the byte budget is evicted after completion.
+
+After hello, query a request using the original generation IDs:
+
+```lisp
+(:version 1 :id "lookup-1" :op :request-status
+ :boot-id "returned-boot-id" :service-id "returned-service-id"
+ :target-id "eval-1")
+```
+
+The response uses the lookup ID, echoes `:target-id`, and returns
+`:request-state` as `:running`, `:completed`, `:failed`, or `:unknown`.
+A terminal lookup includes the original eval response under `:result`,
+including its original ID, success/failure, and captured output. Lookup
+itself succeeds even when that retained execution failed.
+
+Resending a retained eval ID with the same payload returns running status
+or the original terminal response without executing again. Reusing that
+ID with different form, package, deadline, or print fields fails with
+`:request-id-conflict`. Property order is ignored; omitted fields and
+explicit defaults count as different payloads. A terminal result is
+retained before writing its reply, including after client disconnection.
+
+Source reload and repeated start preserve history. Service replacement
+creates a new service ID and empty history; stale generation lookups fail.
+Unknown or evicted history does not establish whether work was delivered.
+This bounded cache is not a durable execution guarantee: do not replay an
+uncertain request because its lookup returned unknown.
+
 ### Concurrent requests
 
 Legacy and versioned evaluation share one persistent execution process.
@@ -259,9 +296,9 @@ A competing eval receives `:busy` before acceptance, with an
 `:active-request-id` when available. Legacy callers receive a busy error
 in the existing stderr field. An accepted eval continues if its client
 disconnects. A connection retains its execution slot until its result
-has been written; additional evals on that connection are rejected.
+has been written; additional new evals on that connection are rejected.
 
-Versioned hello/status requests remain responsive during evaluation,
+Versioned hello/status/request-status remain responsive during evaluation,
 including on the evaluating socket. Responses may arrive in a different
 order from requests; match their IDs. One writer owns each connection,
 so frames cannot interleave. Legacy replies retain request order.
@@ -299,6 +336,7 @@ python3 tests/protocol.py
 python3 tests/handshake.py
 python3 tests/evaluation.py
 python3 tests/concurrency.py
+python3 tests/ledger.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -382,3 +420,17 @@ GENERA_HOST=genera.example GENERA_PORT=8888 \
 The check exercises simultaneous submissions, status during eval,
 disconnects, listener reload, client limits, and blocked/fragmented
 response writers. It restores legacy mode and leaves Genera running.
+
+To check retained outcomes and request lookup:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/ledger.py --live-genera
+```
+
+The check disconnects after acceptance, retrieves the result from a new
+connection, and verifies that retained duplicates do not repeat side
+effects. It checks failure retention, payload conflicts, source reload,
+count/byte eviction, and generation changes. Fixture limits are reduced
+temporarily to exercise eviction. It restores default limits and legacy
+mode, preserving the execution worker and leaving Genera running.
