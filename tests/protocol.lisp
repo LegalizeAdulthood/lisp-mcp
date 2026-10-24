@@ -109,10 +109,8 @@
                  :form "(setq *mcp-v1-test-sentinel* t)"))
        (service '(:running t :boot-id "b" :service-id "s" :world "fixture.vlod"))
        (session (genera-protocol-fixture::mcp-v1-new-session)))
-  (genera-protocol-fixture::mcp-v1-dispatch
-   '(:version 1 :id "hello" :op :hello) session service)
   (let ((response (genera-protocol-fixture::mcp-v1-dispatch request session service)))
-    (check :unsupported-operation (getf (getf response :error) :code))
+    (check :handshake-required (getf (getf response :error) :code))
     (check "no-eval" (getf response :id))
     (check nil *mcp-v1-test-sentinel*)))
 

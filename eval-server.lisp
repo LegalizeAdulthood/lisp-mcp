@@ -185,6 +185,157 @@ does not recognize."
                 (get-output-stream-string stdout)
                 (get-output-stream-string stderr))))))
 
+;;; --- Portable evaluation support ---
+
+;; One shared character budget bounds retained output, warnings, and values.
+;; Even with every character escaped, the result fits inside one wire frame.
+(defconstant +mcp-output-limit+ 65536)
+(defconstant +mcp-warning-limit+ 32)
+(defstruct mcp-budget (remaining +mcp-output-limit+) truncated replaced)
+(defstruct (mcp-capture (:constructor mcp-new-capture (budget &optional stop-p)))
+  budget stop-p (data (make-array 64 :element-type 'character
+                                 :adjustable t :fill-pointer 0)))
+
+(defun mcp-capture-character (capture character)
+  (let ((budget (mcp-capture-budget capture)))
+    (if (plusp (mcp-budget-remaining budget))
+        (let ((code (and (<= 0 (char-code character) 255)
+                         (char-to-ascii character))))
+          (unless (and code (or (<= 32 code 126) (member code '(9 10 13))))
+            (setf code 63 (mcp-budget-replaced budget) t))
+          (decf (mcp-budget-remaining budget))
+          (vector-push-extend (code-char code) (mcp-capture-data capture)))
+        (progn
+          (setf (mcp-budget-truncated budget) t)
+          (when (mcp-capture-stop-p capture) (throw 'mcp-output-limit nil)))))
+  character)
+
+(defun mcp-capture-text (capture)
+  (coerce (mcp-capture-data capture) 'simple-string))
+
+;;; --- Native evaluation adapters ---
+
+(defflavor mcp-output-stream (capture) (si:output-stream)
+  (:initable-instance-variables capture))
+
+(defmethod (:tyo mcp-output-stream) (character)
+  (mcp-capture-character capture character))
+
+(defun mcp-capture-stream (capture)
+  (make-instance 'mcp-output-stream :capture capture))
+
+(defun mcp-call-contained (function)
+  "Return success/value or NIL/condition without entering an interactive debugger."
+  (condition-case (outer)
+      (let ((condition
+              (catch 'mcp-eval-bail
+                (let ((*debugger-hook* #'mcp-debugger-hook))
+                  (ansi-common-lisp:handler-case
+                      (return-from mcp-call-contained (values t (funcall function)))
+                    (ansi-common-lisp:error (inner)
+                      (return-from mcp-call-contained (values nil inner))))))))
+        (values nil condition))
+    (sys:abort (values nil outer))
+    (error (values nil outer))))
+
+(defun mcp-render (value budget &optional (escape t))
+  "Bound printing as it happens; contain a broken user printer separately."
+  (let* ((capture (mcp-new-capture budget t))
+         (stream (mcp-capture-stream capture))
+         (success t))
+    (catch 'mcp-output-limit
+      (setf success
+            (mcp-call-contained
+             (lambda () (write value :stream stream :escape escape) t))))
+    (if success (mcp-capture-text capture) "#<printing failed>")))
+
+(defun mcp-read-line-comment (stream character)
+  (declare (ignore character))
+  ;; Keep LF and CR distinct inside strings and character literals. Only the
+  ;; line-comment reader needs both native line endings; no source is deleted.
+  (loop for ch = (read-char stream nil nil)
+        while (and ch (not (member (char-code ch) '(138 141)))))
+  (values))
+
+(defun mcp-read-eval-form (text)
+  (let ((native (map 'string (lambda (ch) (ascii-to-char (char-code ch))) text))
+        (*readtable* (copy-readtable nil))
+        (ansi-common-lisp:*read-eval* nil)
+        (*read-base* 10)
+        (eof (list nil)))
+    (set-macro-character #\; #'mcp-read-line-comment)
+    (set-syntax-from-char (ascii-to-char 10) #\Space)
+    (with-input-from-string (stream native)
+      (let ((form (read stream t nil)))
+        (unless (eq (read stream nil eof) eof) (error "Expected exactly one form"))
+        form))))
+
+(defun mcp-v1-eval (request service)
+  "Read, evaluate, and print one authorized form with bounded retained output."
+  (when (mcp-v1-present-p request :timeout-ms)
+    (return-from mcp-v1-eval
+      (mcp-v1-failure request :unsupported-operation
+                      "Remote execution deadlines are not available" service)))
+  (let* ((budget (make-mcp-budget))
+         (stdout (mcp-new-capture budget))
+         (stderr (mcp-new-capture budget))
+         (out (mcp-capture-stream stdout))
+         (err (mcp-capture-stream stderr))
+         (terminal (make-two-way-stream (make-string-input-stream "") err))
+         (package-name (or (getf request :package)
+                           (package-name *mcp-eval-package*)))
+         (start (get-internal-real-time))
+         (phase :package-not-found)
+         (warnings nil)
+         (printed nil)
+         (*standard-input* (make-string-input-stream ""))
+         (*standard-output* out) (*error-output* err) (*trace-output* err)
+         (*terminal-io* terminal) (*debug-io* terminal) (*query-io* terminal)
+         (*print-level* (getf request :print-level 6))
+         (*print-length* (getf request :print-length 100))
+         (*print-circle* t) (*print-pretty* nil)
+         (*print-base* 10) (*print-radix* nil)
+         (sys:inhibit-fdefine-warnings :just-warn))
+    (multiple-value-bind (success outcome)
+        (mcp-call-contained
+         (lambda ()
+           (let ((*package* (or (find-package package-name)
+                               (error "No package named ~A" package-name))))
+             (setf package-name (package-name *package*) phase :reader-error)
+             (let ((form (mcp-read-eval-form (getf request :form))))
+               (setf phase :evaluation-error)
+               (ansi-common-lisp:handler-bind
+                   ((ansi-common-lisp:warning
+                      (lambda (condition)
+                        (if (< (length warnings) +mcp-warning-limit+)
+                            (push (mcp-render condition budget nil) warnings)
+                            (setf (mcp-budget-truncated budget) t))
+                        (ansi-common-lisp:muffle-warning condition))))
+                 (setf printed
+                       (mapcar (lambda (value) (mcp-render value budget))
+                               (multiple-value-list (eval form)))))))))
+      (let* ((diagnostics (make-mcp-budget :remaining 4096))
+             (result-package (mcp-render package-name diagnostics nil))
+             (failure (unless success
+                        (list :code phase
+                              :condition-type (mcp-render (type-of outcome) diagnostics)
+                              :message (mcp-render outcome diagnostics nil)))))
+        (append (list :version 1 :id (getf request :id) :ok success)
+                (mcp-v1-generation service)
+                (list :request-state (if success :completed :failed)
+                      :values printed :value-count (length printed)
+                      :stdout (mcp-capture-text stdout)
+                      :stderr (mcp-capture-text stderr)
+                      :warnings (nreverse warnings)
+                      :package result-package
+                      :elapsed-ms (max 0 (floor (* 1000 (- (get-internal-real-time) start))
+                                               internal-time-units-per-second))
+                      :truncated (or (mcp-budget-truncated budget)
+                                     (mcp-budget-truncated diagnostics))
+                      :replaced (or (mcp-budget-replaced budget)
+                                    (mcp-budget-replaced diagnostics)))
+                (when failure (list :error failure)))))))
+
 ;;; --- Server ---
 
 ;;; --- Portable service state ---
@@ -226,11 +377,11 @@ does not recognize."
           (mcp-v1-generation service)
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
-                :busy (not (null *mcp-worker-busy*)) :features '(:status))))
+                :busy (not (null *mcp-worker-busy*)) :features '(:status :eval))))
 
 (defun mcp-v1-dispatch (request &optional (session (mcp-v1-new-session))
                                         (service *mcp-service*))
-  "Authenticate hello before exposing state; never evaluate request form text."
+  "Authenticate and check generation before dispatching a user form."
   (mcp-v1-validate request :request)
   (unless (and service (getf service :running))
     (return-from mcp-v1-dispatch
@@ -260,6 +411,7 @@ does not recognize."
      (mcp-v1-failure request :stale-generation "Generation identity does not match"
                      service))
     ((eq (getf request :op) :status) (mcp-v1-service-response request service))
+    ((eq (getf request :op) :eval) (mcp-v1-eval request service))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
 

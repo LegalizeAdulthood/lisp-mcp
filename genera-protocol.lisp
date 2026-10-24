@@ -12,16 +12,18 @@
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
-    :stale-generation :service-unavailable))
+    :stale-generation :service-unavailable :package-not-found :reader-error
+    :evaluation-error))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
     :request-state :values :value-count :stdout :stderr :warnings
-    :elapsed-ms :truncated :error :code :message :target-id
+    :elapsed-ms :truncated :replaced :error :code :message :condition-type :target-id
     :hello :status :eval :request-status :running :completed :failed
     :interrupted :unknown :unsupported-operation :invalid-request
     :unsupported-version :expected-world :authentication-failed
-    :world-mismatch :handshake-required :stale-generation :service-unavailable))
+    :world-mismatch :handshake-required :stale-generation :service-unavailable
+    :package-not-found :reader-error :evaluation-error))
 
 (defun mcp-v1-error (message)
   (error "Envelope error: ~A" message))
@@ -196,7 +198,7 @@
          (response-keys
            '(:boot-id :service-id :world :package :busy :features :ok
              :request-state :values :value-count :stdout :stderr :warnings
-             :elapsed-ms :truncated :error)))
+             :elapsed-ms :truncated :replaced :error)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -217,9 +219,11 @@
        (if (getf object :ok)
            (when (getf object :error) (mcp-v1-error "Success cannot contain an error"))
            (let ((failure (getf object :error)))
-             (mcp-v1-plist failure '(:code :message) '(:code :message))
+             (mcp-v1-plist failure '(:code :message :condition-type) '(:code :message))
              (unless (and (member (getf failure :code) *mcp-v1-error-codes*)
-                          (stringp (getf failure :message)))
+                          (stringp (getf failure :message))
+                          (or (not (mcp-v1-present-p failure :condition-type))
+                              (stringp (getf failure :condition-type))))
                (mcp-v1-error "Invalid error data"))))
        (when (not (eq (not (null (getf object :boot-id)))
                       (not (null (getf object :service-id)))))
@@ -245,7 +249,7 @@
               (:target-id . :id) (:request-state . :state) (:values . :strings)
               (:value-count . :nonnegative) (:stdout . :text) (:stderr . :text)
               (:warnings . :strings) (:elapsed-ms . :nonnegative)
-              (:truncated . :boolean))))
+              (:truncated . :boolean) (:replaced . :boolean))))
   object)
 
 (defun mcp-v1-decode (text direction)
@@ -265,6 +269,27 @@
     (when (and (getf request :expected-world)
                (not (string= (getf request :expected-world) (getf response :world))))
       (mcp-v1-error "Hello world mismatch")))
+  response)
+
+(defun mcp-v1-check-eval-response (request response)
+  "Check execution identity and the complete terminal result contract."
+  (mcp-v1-validate request :request)
+  (mcp-v1-validate response :response)
+  (unless (and (eq (getf request :op) :eval)
+               (every (lambda (key) (equal (getf request key) (getf response key)))
+                      '(:id :boot-id :service-id)))
+    (mcp-v1-error "Eval response identity mismatch"))
+  (when (or (getf response :ok) (getf response :request-state))
+    (dolist (key '(:request-state :values :value-count :stdout :stderr :warnings
+                   :package :elapsed-ms :truncated :replaced))
+      (unless (mcp-v1-present-p response key)
+        (mcp-v1-error "Incomplete eval response")))
+    (unless (eq (getf response :request-state)
+                (if (getf response :ok) :completed :failed))
+      (mcp-v1-error "Invalid terminal eval state"))
+    (when (and (not (getf response :ok))
+               (not (mcp-v1-present-p (getf response :error) :condition-type)))
+      (mcp-v1-error "Missing execution condition type")))
   response)
 
 (defun mcp-v1-encode (object direction)

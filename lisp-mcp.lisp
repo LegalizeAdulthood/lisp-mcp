@@ -260,21 +260,57 @@ Prevents comment-induced EOF errors on the Genera reader."
                   (read-field stream)))
       (usocket:socket-close socket))))
 
+(defun genera-exchange-envelope (stream request)
+  "Exchange data on an already selected version-1 connection."
+  (let* ((payload (string-to-octets (mcp-v1-encode request :request)))
+         (header (string-to-octets (format nil "~D " (length payload)))))
+    (write-sequence header stream)
+    (write-sequence payload stream)
+    (force-output stream)
+    (let ((response (mcp-v1-decode (read-field stream :strict t) :response)))
+      (if (eq (getf request :op) :hello)
+          (mcp-v1-check-hello-response request response)
+          response))))
+
 (defun genera-send-envelope (request &key (host *genera-host*) (port *genera-port*))
   "Exchange one explicitly selected version-1 envelope; never fall back to eval."
-  (let* ((payload (string-to-octets (mcp-v1-encode request :request)))
-         (header (string-to-octets (format nil "~D " (length payload))))
-         (socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
+  (mcp-v1-encode request :request)
+  (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
     (unwind-protect
-        (let ((stream (usocket:socket-stream socket)))
-          (write-sequence header stream)
-          (write-sequence payload stream)
-          (force-output stream)
-          (let ((response (mcp-v1-decode (read-field stream :strict t) :response)))
-            (if (eq (getf request :op) :hello)
-                (mcp-v1-check-hello-response request response)
-                response)))
+        (genera-exchange-envelope (usocket:socket-stream socket) request)
       (usocket:socket-close socket))))
+
+(defvar *genera-request-nonce*
+  (format nil "~D-~D" (get-universal-time) (random (expt 2 64) (make-random-state t))))
+(defvar *genera-request-counter* 0)
+
+(defun genera-eval-envelope (form &key (host *genera-host*) (port *genera-port*)
+                                     token expected-world package
+                                     (print-level 6) (print-length 100))
+  "Hello then eval on one socket. Send FORM unchanged; never retry execution."
+  (let* ((id (format nil "~A-~D" *genera-request-nonce* (incf *genera-request-counter*)))
+         (hello (append (list :version 1 :id (concatenate 'string id "-hello")
+                              :op :hello :client "lisp-mcp")
+                        (when token (list :token token))
+                        (when expected-world (list :expected-world expected-world))))
+         (request (append (list :version 1 :id id :op :eval
+                                :boot-id "pending" :service-id "pending" :form form
+                                :print-level print-level :print-length print-length)
+                          (when package (list :package package)))))
+    ;; Validate all caller data before connecting or sending hello.
+    (mcp-v1-encode hello :request)
+    (mcp-v1-encode request :request)
+    (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
+      (unwind-protect
+          (let* ((stream (usocket:socket-stream socket))
+                 (greeting (genera-exchange-envelope stream hello)))
+            (unless (getf greeting :ok) (return-from genera-eval-envelope greeting))
+            (unless (member :eval (getf greeting :features))
+              (mcp-v1-error "Listener does not advertise eval"))
+            (setf (getf request :boot-id) (getf greeting :boot-id)
+                  (getf request :service-id) (getf greeting :service-id))
+            (mcp-v1-check-eval-response request (genera-exchange-envelope stream request)))
+        (usocket:socket-close socket)))))
 
 ;;; --- Swank client ---
 ;;; Protocol: length-prefixed S-expressions over TCP.

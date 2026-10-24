@@ -165,11 +165,11 @@ class ProtocolChecks(unittest.TestCase):
                 # service; the lifecycle suite tests replacement through the API.
                 legacy(control, '(setf (getf *mcp-service* :protocol) :v1 '
                                 '*mcp-protocol* :v1)')
+                # Eval semantics have a dedicated suite. Keep the reader-macro
+                # form fixture confined to codec parity, where it is only data.
                 requests = [f["wire"] for f in FIXTURES
-                            if f["valid"] and f["direction"] == "request"]
-                requests.append('(:version 1 :id "no-eval" :op :eval :boot-id "boot" '
-                                ':service-id "service" '
-                                ':form "(setq *mcp-v1-test-sentinel* t)")')
+                            if f["valid"] and f["direction"] == "request"
+                            and ":op :eval" not in f["wire"]]
                 for request in requests:
                     with socket.create_connection((host, port), timeout=5) as stream:
                         stream.settimeout(3)
@@ -191,7 +191,7 @@ class ProtocolChecks(unittest.TestCase):
                 result = exchange(host, port, FIXTURES[0]["wire"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(":ok t", result.stdout)
-                self.assertIn(":features (:status)", result.stdout)
+                self.assertIn(":features (:status :eval)", result.stdout)
                 bad_requests = [f["wire"] for f in FIXTURES
                                 if not f["valid"] and f["direction"] == "request"]
                 bad_requests.append("(setq *mcp-v1-test-sentinel* t)")

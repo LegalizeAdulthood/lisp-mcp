@@ -29,7 +29,7 @@
            (hello (hrequest :hello :token "test-secret" :expected-world "fixture.vlod"))
            (reply (mcp-v1-dispatch hello session)))
       (hcheck t (getf reply :ok))
-      (hcheck '(:status) (getf reply :features))
+      (hcheck '(:status :eval) (getf reply :features))
       (hcheck "fixture.vlod" (getf reply :world))
       (hcheck nil (getf reply :busy))
       (hcheck reply (mcp-v1-dispatch hello session))
@@ -49,7 +49,8 @@
             (hcheck :stale-generation (hcode failure))
             (hcheck (mcp-v1-generation reply) (mcp-v1-generation failure)))))
       (hcheck :unsupported-operation
-              (hcode (mcp-v1-dispatch (hrequest :eval :form "(error \"never\")") session)))
+              (hcode (mcp-v1-dispatch (hrequest :request-status :target-id "unknown")
+                                     session)))
       (dolist (bad (list (hrequest :hello) (hrequest :hello :token "wrong")))
         (let ((failure (mcp-v1-dispatch bad session)))
           (hcheck :authentication-failed (hcode failure))

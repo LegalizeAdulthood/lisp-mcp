@@ -151,7 +151,7 @@ headers fail without scanning for another digit or waiting for peer EOF.
 The Genera listener closes a malformed client connection before eval.
 
 Input supports ASCII tab, LF, CR, and printable bytes 32 through 126.
-The host checks the original expression before comment removal or TCP
+The legacy host checks the original expression before comment removal or TCP
 connection. Genera checks incoming bytes before character translation.
 Existing diagnostic replacement and newline conversion are preserved.
 
@@ -210,6 +210,48 @@ token. Tokens contain 1 through 4,096 printable ASCII characters. Keep
 versioned envelope clients and legacy eval clients on their explicitly
 selected listener mode.
 
+### Versioned evaluation
+
+On the authenticated connection, send one form with the generation IDs
+returned by hello:
+
+```lisp
+(:version 1 :id "eval-1" :op :eval
+ :boot-id "returned-boot-id" :service-id "returned-service-id"
+ :package "COMMON-LISP-USER" :form "(values (+ 1 2) :done)"
+ :print-level 6 :print-length 100)
+```
+
+The result includes the matching request and generation IDs, terminal
+`:request-state`, printed `:values`, `:value-count`, `:stdout`, `:stderr`,
+`:warnings`, `:package`, and `:elapsed-ms`. Zero values produce an empty
+value list. Execution failures have `:ok nil`, state `:failed`, and an
+`:error` containing `:code`, `:condition-type`, and `:message`; captured
+output survives the failure. Interactive streams use empty input and
+captured error output. A failed request leaves the connection usable.
+
+Package selection defaults to the bridge's evaluation package. Printing
+defaults to level 6 and length 100, with circular printing enabled. An explicit NIL
+print limit removes that printer limit. Output, warnings, and printed
+values share a 65,536-character collection budget. At most 32 warnings
+are retained; condition and package diagnostics share another 4,096
+characters. `:truncated` reports collection limits; `:replaced` reports
+unsupported diagnostic characters replaced with `?`. A failed value
+printer returns `#<printing failed>` for that value.
+
+Form text is sent unchanged. The reader accepts LF, CR, and CRLF line
+comments while preserving literal newlines in strings. It requires one
+form and disables read-time evaluation. `:timeout-ms` is rejected before
+execution with `:unsupported-operation`; it does not impose a remote
+execution deadline.
+
+The host Lisp helper `lisp-mcp::genera-eval-envelope` performs hello and
+one eval on the same socket, returning the result property list. It
+accepts `:host`, `:port`, `:token`, `:expected-world`, `:package`,
+`:print-level`, and `:print-length`. It validates response identity and
+terminal fields and never retries execution or falls back to legacy.
+The MCP environment configuration above selects the legacy tool path.
+
 ## Host acceptance checks
 
 Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
@@ -224,6 +266,7 @@ python3 tests/configuration.py
 python3 tests/framing.py
 python3 tests/protocol.py
 python3 tests/handshake.py
+python3 tests/evaluation.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -283,3 +326,16 @@ sources, temporarily configures a versioned service with a test token,
 and checks identity, client closure, and bootstrap-loader replacement.
 It simulates boot-identity initialization without rebooting the world,
 then restores legacy mode and removes the test token.
+
+To check structured evaluation and recovery on a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/evaluation.py --live-genera
+```
+
+The check reloads both sources, temporarily selects versioned mode, and
+exercises values, packages, printing, warnings, stream redirection,
+reader/condition failures, output bounds, and persistent state through
+the host helper. It retains a legacy control connection and restores
+legacy mode when finished.

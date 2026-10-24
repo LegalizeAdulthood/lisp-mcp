@@ -139,7 +139,7 @@ class HandshakeChecks(unittest.TestCase):
                 hello_request = '(:version 1 :id "hello" :op :hello :token "test-secret")'
                 hello = wire_exchange(keeper, hello_request)
                 self.assertIn(":ok t", hello)
-                self.assertIn(":features (:status)", hello)
+                self.assertIn(":features (:status :eval)", hello)
                 self.assertIn(":busy nil", hello)
                 self.assertTrue(wire_string(hello, "world"))
                 self.assertTrue(wire_string(hello, "package"))
@@ -166,9 +166,14 @@ class HandshakeChecks(unittest.TestCase):
                 self.assertFailure(wire_exchange(keeper, status_request(hello)),
                                    ":handshake-required")
                 self.assertEqual(wire_exchange(keeper, hello_request), hello)
-                evaluation = (status_request(hello).replace(":op :status", ":op :eval")[:-1]
+                evaluation = (status_request(hello, boot="old").replace(
+                              ":op :status", ":op :eval")[:-1]
                               + ' :form "(setq *mcp-v1-test-sentinel* t)")')
-                self.assertIn(":unsupported-operation", wire_exchange(keeper, evaluation))
+                self.assertIn(":stale-generation", wire_exchange(keeper, evaluation))
+                with socket.create_connection((host, port), timeout=5) as client:
+                    client.settimeout(5)
+                    self.assertFailure(wire_exchange(client, evaluation),
+                                       ":handshake-required")
                 for bad in ['(:version 2 :id "bad" :op :hello :token "test-secret")',
                             '(setq *mcp-v1-test-sentinel* t)']:
                     with socket.create_connection((host, port), timeout=5) as client:

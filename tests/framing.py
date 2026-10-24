@@ -76,7 +76,7 @@ def bridge_peer(response, protocol="genera", **kwargs):
         return text_result(run_bridge(settings, [call(tool, "(+ 1 2)")]))
 
 
-def read_live_field(stream):
+def read_live_field(stream, normalize=True):
     byte = receive_exact(stream, 1)
     if byte == b"\r":
         byte = receive_exact(stream, 1)
@@ -93,7 +93,8 @@ def read_live_field(stream):
     length = int(header)
     if length > 1048576:
         raise AssertionError("Oversized live response")
-    return receive_exact(stream, length).decode("ascii").replace("\r\n", "\n").replace("\r", "\n")
+    text = receive_exact(stream, length).decode("ascii")
+    return text.replace("\r\n", "\n").replace("\r", "\n") if normalize else text
 
 
 class FramingChecks(unittest.TestCase):
