@@ -29,15 +29,88 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 
 ;;; --- Configuration ---
 
-(defvar *genera-host* (uiop:getenv "GENERA_HOST"))
-(defvar *genera-port* (parse-integer (or (uiop:getenv "GENERA_PORT") "8888")))
-(defvar *genera-timeout* (parse-integer (or (uiop:getenv "GENERA_TIMEOUT") "300")))
-(defvar *genera-enabled* (not (null *genera-host*)))
+(defvar *profile* "generic")
+(defvar *genera-protocol* "legacy")
+(defvar *genera-host* nil)
+(defvar *genera-port* 8888)
+(defvar *genera-timeout* 300)
+(defvar *genera-enabled* nil)
 
-(defvar *swank-host* (or (uiop:getenv "SWANK_HOST") "127.0.0.1"))
-(defvar *swank-port* (parse-integer (or (uiop:getenv "SWANK_PORT") "4005")))
-(defvar *swank-package* (or (uiop:getenv "SWANK_PACKAGE") "COMMON-LISP-USER"))
-(defvar *swank-enabled* (not (null (uiop:getenv "SWANK_PORT"))))
+(defvar *swank-host* "127.0.0.1")
+(defvar *swank-port* 4005)
+(defvar *swank-package* "COMMON-LISP-USER")
+(defvar *swank-enabled* nil)
+
+(define-condition configuration-error (simple-error) ())
+
+(defun configuration-error (name requirement)
+  (error 'configuration-error
+         :format-control "Invalid configuration: ~A ~A."
+         :format-arguments (list name requirement)))
+
+(defun configuration-text (name &optional default)
+  (let ((value (uiop:getenv name)))
+    (when (and value
+               (or (zerop (length value))
+                   (not (string= value (string-trim '(#\Space) value)))
+                   (some (lambda (ch)
+                           (or (< (char-code ch) 32) (= (char-code ch) 127)))
+                         value)))
+      (configuration-error name
+                           "must be nonempty text without surrounding whitespace or control characters; unset it if unused"))
+    (or value default)))
+
+(defun configuration-host (name &optional default)
+  (let ((value (configuration-text name default)))
+    (when (and value (find #\Space value))
+      (configuration-error name "must be a hostname or IP address without spaces"))
+    value))
+
+(defun configuration-integer (name default minimum &optional maximum)
+  (let ((value (uiop:getenv name)))
+    (if (null value)
+        default
+        (let ((number (and (plusp (length value))
+                           (every (lambda (ch) (char<= #\0 ch #\9)) value)
+                           (parse-integer value))))
+          (unless (and number (<= minimum number)
+                       (or (null maximum) (<= number maximum)))
+            (configuration-error
+             name (if maximum
+                      (format nil "must be a decimal integer from ~D to ~D"
+                              minimum maximum)
+                      (format nil "must be a decimal integer of at least ~D seconds"
+                              minimum))))
+          number))))
+
+(defun configuration-choice (name default supported)
+  (let ((value (configuration-text name default)))
+    (unless (member value supported :test #'string=)
+      (configuration-error name
+                           (format nil "supports only ~{~S~^, ~} in this build"
+                                   supported)))
+    value))
+
+(defun configure ()
+  "Validate all consumed settings before entering the MCP loop or doing I/O."
+  (let ((profile (configuration-choice "LISP_MCP_PROFILE" "generic" '("generic")))
+        (protocol (configuration-choice "GENERA_PROTOCOL" "legacy" '("legacy")))
+        (genera-host (configuration-host "GENERA_HOST"))
+        (genera-port (configuration-integer "GENERA_PORT" 8888 1 65535))
+        (timeout (configuration-integer "GENERA_TIMEOUT" 300 1))
+        (swank-host (configuration-host "SWANK_HOST" "127.0.0.1"))
+        (swank-port (configuration-integer "SWANK_PORT" 4005 1 65535))
+        (swank-package (configuration-text "SWANK_PACKAGE" "COMMON-LISP-USER")))
+    (setf *profile* profile
+          *genera-protocol* protocol
+          *genera-host* genera-host
+          *genera-port* genera-port
+          *genera-timeout* timeout
+          *genera-enabled* (not (null genera-host))
+          *swank-host* swank-host
+          *swank-port* swank-port
+          *swank-package* swank-package
+          *swank-enabled* (not (null (uiop:getenv "SWANK_PORT"))))))
 
 ;;; --- Genera TCP client ---
 ;;; Protocol: length-prefixed fields.
@@ -434,6 +507,10 @@ Returns (values result-string output-string)."
 
 (defun main ()
   "MCP stdio server main loop."
+  (handler-case (configure)
+    (configuration-error (e)
+      (log-message "~A" e)
+      (uiop:quit 2)))
   (log-message "lisp-mcp server starting (SBCL~@[, Genera at ~A:~D~]~@[, Swank at ~A:~D~])"
                 (when *genera-enabled* *genera-host*)
                 (when *genera-enabled* *genera-port*)

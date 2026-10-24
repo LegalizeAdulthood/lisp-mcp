@@ -21,8 +21,11 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client):
         "lisp": {
             "command": "/path/to/lisp-mcp.sh",
             "env": {
+                "LISP_MCP_PROFILE": "generic",
+                "GENERA_PROTOCOL": "legacy",
                 "SWANK_PORT": "4005",
-                "GENERA_HOST": "192.168.11.2"
+                "GENERA_HOST": "genera.example",
+                "GENERA_PORT": "8888"
             }
         }
     }
@@ -30,6 +33,38 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client):
 ```
 
 Only `command` is required. The environment variables enable the optional tools.
+
+For the local Genera deployment, run the bridge inside WSL, alongside the
+VLM. The source directory is `/path/to/lisp-mcp`; the existing
+entry point is `lisp-mcp.sh`. The endpoint is `genera.example:8888`.
+
+### Startup validation
+
+The bridge validates configuration before reading MCP requests or opening
+connections. Invalid settings produce a diagnostic naming the variable
+on stderr, leave stdout empty, and exit with status 2.
+
+- Ports must contain decimal digits only and be in `1..65535`.
+- `GENERA_TIMEOUT` must contain a positive whole number of seconds. It
+  retains its existing use for Genera, host, and Swank evaluations.
+- Hostnames and IP addresses must be nonempty and contain no whitespace
+  or control characters. `SWANK_PACKAGE` must be nonempty text without
+  surrounding whitespace or control characters.
+- Unset `GENERA_HOST` to disable Genera; unset `SWANK_PORT` to disable
+  Swank. Empty values are errors. Supplied settings are validated even
+  when their optional tool is disabled.
+
+| Variable | Default | Supported values |
+|---|---|---|
+| `LISP_MCP_PROFILE` | `generic` | `generic`, with the existing host and optional Swank/Genera tools |
+| `GENERA_PROTOCOL` | `legacy` | `legacy`, using expression requests and three response fields |
+
+The Genera profile and version-1 protocol are not implemented yet.
+Selecting them fails at startup; the bridge never falls back to legacy
+after an unsupported selection. Initialization and discovery do not
+contact Genera. This build does not start a VLM or consume VLM runtime
+paths. Runtime paths and additional deadlines will be configured and
+validated when launch/session support uses them.
 
 ## Tools
 
@@ -98,5 +133,24 @@ The file must be loaded once per boot. It defines a TCP server (`:mcp-server`) o
 To verify it is running:
 
 ```sh
-echo -n '11 (+ 1 2 3 4)' | nc -w 2 192.168.11.2 8888 | cat -v
+echo -n '11 (+ 1 2 3 4)' | nc -w 2 genera.example 8888 | cat -v
 ```
+
+## Host acceptance checks
+
+Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
+dependencies once before starting MCP so first-use compilation output
+cannot enter its stdout:
+
+```sh
+cd /path/to/lisp-mcp
+sbcl --noinform --non-interactive --load "$HOME/quicklisp/setup.lisp" \
+  --eval "(ql:quickload '(:usocket :yason))"
+python3 tests/configuration.py
+```
+
+The checks launch the same SBCL load/main invocation as `lisp-mcp.sh`.
+They cover startup rejection before dispatch, port boundaries, timeout
+enforcement, explicit profile/protocol selection, optional tool discovery,
+host evaluation, and Genera/Swank requests to loopback TCP fixtures. No
+Genera world, Swank installation, or VLM launch is needed.

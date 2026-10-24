@@ -3,8 +3,10 @@
         "lisp-mcp": {
             "command": "./lisp-mcp.sh",
             "env": {
+                "LISP_MCP_PROFILE": "generic",
+                "GENERA_PROTOCOL": "legacy",
                 "SWANK_PORT": "4005",
-                "GENERA_HOST": "192.168.11.2",
+                "GENERA_HOST": "genera.example",
                 "GENERA_PORT": "8888"
             }
         }
