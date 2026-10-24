@@ -111,19 +111,24 @@ Set `GENERA_HOST` in the MCP configuration to enable the tool.
 #### Setting up the Genera side
 
 If `SYS:SITE;` is shared with the host filesystem, copy
-`eval-server.lisp` into its backing directory. For example:
+`genera-protocol.lisp` and `eval-server.lisp` into its backing directory.
+For example:
 
 ```sh
-cp eval-server.lisp /opt/symbolics/lib/sys.sct/site/eval-server.lisp
+cp genera-protocol.lisp eval-server.lisp /opt/symbolics/lib/sys.sct/site/
 ```
 
-Then load it from the Genera Lisp Listener:
+Load both files in `COMMON-LISP-USER` from the Genera Lisp Listener:
 
 ```lisp
-Load File SYS:SITE;eval-server.lisp
+(let ((*package* (find-package "COMMON-LISP-USER")))
+  (load "SYS:SITE;genera-protocol.lisp")
+  (load "SYS:SITE;eval-server.lisp"))
 ```
 
-The file must be loaded once per boot. It defines a TCP server (`:mcp-server`) on port 8888 that accepts connections, reads length-prefixed Lisp expressions, evaluates them, and returns the result, stdout, and stderr as length-prefixed fields.
+Load the files once per boot. The listener defines a TCP server
+(`:mcp-server`) on port 8888 that accepts length-prefixed Lisp expressions
+and returns result, stdout, and stderr as three length-prefixed fields.
 
 To verify it is running:
 
@@ -154,6 +159,19 @@ Swank uses a six-digit hexadecimal header. Header reads require all six
 digits; payload reads require exactly the declared length. Malformed
 headers and payloads exceeding 1,048,576 characters fail before allocation.
 
+### Data codec
+
+`genera-protocol.lisp` contains the portable version-1 envelope codec.
+It accepts known keywords, ASCII strings, signed 64-bit integers,
+booleans, and proper lists. It limits nesting to 16 list levels, data
+nodes to 4,096, and each encoded envelope to the frame limit above.
+
+Request schemas require `:version`, `:id`, and `:op`; response schemas
+require `:version`, `:id`, and `:ok`. Unknown keys or symbols, duplicate
+properties, reader syntax, and trailing objects are rejected. The codec
+does not invoke the Lisp reader or evaluator. Literal tab, LF, and CR
+bytes in strings survive encoding and decoding unchanged.
+
 ## Host acceptance checks
 
 Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
@@ -166,6 +184,7 @@ sbcl --noinform --non-interactive --load "$HOME/quicklisp/setup.lisp" \
   --eval "(ql:quickload '(:usocket :yason))"
 python3 tests/configuration.py
 python3 tests/framing.py
+python3 tests/protocol.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -185,6 +204,10 @@ invalid delimiters and prefixes, early EOF, header/frame limits, and
 unsupported input rejection before connection. Malformed fake peers stay
 open to verify prompt failure independently of the evaluation timeout.
 
+The protocol runner checks shared fixtures in separate host and listener
+packages, schema and resource limits, reader-syntax rejection, literal
+newlines, and explicit envelope transport without legacy fallback.
+
 After loading the updated listener in Genera, run:
 
 ```sh
@@ -196,3 +219,15 @@ The live check sends fragmented ASCII requests, verifies stdout and
 literal newlines, reuses a connection, checks malformed-client closure,
 and finishes with an evaluation through the host bridge. Host fixtures
 do not establish compatibility with Genera streams or condition handling.
+
+To check the paired codec sources against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/protocol.py --live-genera
+```
+
+This live check reloads both Lisp files, compares the shared fixtures in
+Genera, and temporarily selects envelope mode to check one framed reply
+per request and rejection without eval. It retains a legacy control
+connection and restores legacy mode when finished.

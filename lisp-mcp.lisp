@@ -16,6 +16,8 @@
 
 (in-package #:lisp-mcp)
 
+(load (merge-pathnames "genera-protocol.lisp" *load-truename*))
+
 ;;; --- JSON object builder ---
 
 (defmacro jso (&rest pairs)
@@ -159,13 +161,16 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
             (t (framing-error "Expected decimal length followed by a space")))
       (setf byte (read-byte stream nil nil)))))
 
-(defun read-field (stream)
+(defun read-field (stream &key strict)
   "Read a length-prefixed field from Genera's response (binary stream).
 Reject malformed, truncated, and oversized frames. Retain diagnostic byte
 replacement and newline normalization."
   (let* ((length (read-frame-length stream))
          (data (read-exactly stream
                              (make-array length :element-type '(unsigned-byte 8)))))
+      (when strict
+        (return-from read-field
+          (mcp-v1-check-text (map 'string #'code-char data))))
       ;; Convert bytes to string, replacing non-ASCII with '?', normalizing line endings
       (with-output-to-string (out)
         (loop with i = 0
@@ -253,6 +258,19 @@ Prevents comment-induced EOF errors on the Genera reader."
           (values (read-field stream)
                   (read-field stream)
                   (read-field stream)))
+      (usocket:socket-close socket))))
+
+(defun genera-send-envelope (request &key (host *genera-host*) (port *genera-port*))
+  "Exchange one explicitly selected version-1 envelope; never fall back to eval."
+  (let* ((payload (string-to-octets (mcp-v1-encode request :request)))
+         (header (string-to-octets (format nil "~D " (length payload))))
+         (socket (usocket:socket-connect host port :element-type '(unsigned-byte 8))))
+    (unwind-protect
+        (let ((stream (usocket:socket-stream socket)))
+          (write-sequence header stream)
+          (write-sequence payload stream)
+          (force-output stream)
+          (mcp-v1-decode (read-field stream :strict t) :response))
       (usocket:socket-close socket))))
 
 ;;; --- Swank client ---

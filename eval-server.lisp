@@ -10,6 +10,8 @@
 ;;; Response: <newline><length><space><result bytes>
 ;;;           <newline><length><space><stdout bytes>
 ;;;           <newline><length><space><stderr bytes>
+;;; With *MCP-PROTOCOL* = :V1, each frame is one restricted data envelope.
+;;; Load genera-protocol.lisp in COMMON-LISP-USER before this file.
 
 ;;; --- Length-delimited framing ---
 ;;; Digit char-codes match ASCII; no Lisp reader is used for headers.
@@ -74,7 +76,7 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
 ;;; The client sends ASCII bytes.  The stream gives us chars whose
 ;;; char-codes ARE the ASCII byte values (no translation on input).
 
-(defun mcp-read-request (stream)
+(defun mcp-read-request (stream &optional (translate t))
   "Read a length-prefixed ASCII string from STREAM. Returns NIL on EOF."
   (let ((len (mcp-read-length stream)))
     (when len
@@ -85,7 +87,8 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
           (let ((code (mcp-read-wire-code stream)))
             (unless (or (<= 32 code 126) (member code '(9 10 13)))
               (mcp-framing-error "Unsupported input character at offset ~D" i))
-            (setf (aref str i) (ascii-to-char code))))
+            (setf (aref str i)
+                  (if translate (ascii-to-char code) (code-char code)))))
         str))))
 
 ;;; --- Writing responses ---
@@ -184,18 +187,42 @@ does not recognize."
 
 ;;; --- Server ---
 
-(defun mcp-handle-client (stream)
-  "Service loop: read eval requests, send back results."
+(defvar *mcp-protocol* :legacy
+  "Explicit listener mode: :LEGACY eval or :V1 data envelopes.")
+
+(defun mcp-v1-dispatch (request)
+  "Return data for known operations without reading or evaluating form text."
+  (list :version 1 :id (getf request :id) :ok nil
+        :error (list :code :unsupported-operation
+                     :message "Operation is not available")))
+
+(defun mcp-write-envelope (stream response)
+  "Write one raw-ASCII data envelope, without diagnostic replacement."
+  (let ((text (mcp-v1-encode response :response)))
+    (mcp-write-length stream (length text))
+    (write-string text stream)))
+
+(defun mcp-handle-client (stream &optional (protocol *mcp-protocol*))
+  "Service one explicitly selected protocol for the life of a connection."
   (unwind-protect
       (condition-case (frame-error)
           (ansi-common-lisp:handler-case
-              (loop for request = (mcp-read-request stream)
-                    while request
-                    do (multiple-value-bind (result stdout stderr)
-                           (mcp-eval request)
-                         (mcp-write-field stream result)
-                         (mcp-write-field stream stdout)
-                         (mcp-write-field stream stderr)
+              (progn
+                (unless (member protocol '(:legacy :v1))
+                  (error "Unknown MCP protocol mode"))
+                (loop for request = (mcp-read-request stream (eq protocol :legacy))
+                      while request
+                      do (case protocol
+                           (:legacy
+                            (multiple-value-bind (result stdout stderr)
+                                (mcp-eval request)
+                              (mcp-write-field stream result)
+                              (mcp-write-field stream stdout)
+                              (mcp-write-field stream stderr)))
+                           (:v1
+                            (mcp-write-envelope
+                             stream (mcp-v1-dispatch
+                                     (mcp-v1-decode request :request)))))
                          (send stream :force-output)))
             (ansi-common-lisp:error () nil))
         (error (format *error-output* "MCP connection closed: ~A~%" frame-error)))
