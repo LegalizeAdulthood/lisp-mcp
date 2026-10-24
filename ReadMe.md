@@ -245,12 +245,59 @@ form and disables read-time evaluation. `:timeout-ms` is rejected before
 execution with `:unsupported-operation`; it does not impose a remote
 execution deadline.
 
-The host Lisp helper `lisp-mcp::genera-eval-envelope` performs hello and
-one eval on the same socket, returning the result property list. It
+The host Lisp helper `lisp-mcp::genera-eval-envelope` returns the result
+property list. Without `:session`, it owns a temporary session for hello
+and one eval. Supply `:session` to reuse an open session. It
 accepts `:host`, `:port`, `:token`, `:expected-world`, `:package`,
 `:print-level`, and `:print-length`. It validates response identity and
 terminal fields and never retries execution or falls back to legacy.
+When borrowing a session, connection/authentication options belong to
+that session; combining `:session` with `:host`, `:port`, `:token`, or
+`:expected-world` is rejected before submission.
 The MCP environment configuration above selects the legacy tool path.
+
+### Persistent host sessions
+
+The SBCL session API authenticates once per connection. One I/O thread
+owns the socket, all frame reads/writes, and response matching:
+
+```lisp
+(let ((session (lisp-mcp::genera-open-session
+                 :host "genera.example" :port 8888
+                 :token "shared-secret" :expected-world "world.vlod")))
+  (unwind-protect
+      (progn
+        (lisp-mcp::genera-eval-envelope "(+ 20 22)" :session session)
+        (lisp-mcp::genera-eval-envelope "(values :ready)" :session session)
+        (lisp-mcp::genera-call session :status))
+    (lisp-mcp::genera-close-session session)))
+```
+
+`genera-submit-request` accepts a session, operation, and request fields,
+returning a handle immediately. `genera-await-request` waits for that
+handle; `genera-call` submits and waits. Operations are `:eval`, `:status`,
+and `:request-status`, subject to the listener's advertised features.
+For example, submit `:eval :form "(sleep 2)"`, then call `:status` while
+another thread awaits the eval handle. Responses are matched by ID and
+generation before any waiter completes. Partial frames do not block
+outgoing controls. The session admits one execution and up to 16 pending
+controls; excess requests fail locally with a `:busy` session error.
+
+Malformed, unmatched, repeated, or mismatched responses close the socket
+and signal `genera-session-error` with kind `:protocol`. Transport loss
+also closes the socket. Failed pending handles retain their original
+envelopes, IDs, and generation: queued work becomes `:not-submitted`;
+work whose send began becomes `:unresolved`. The condition's
+`genera-session-error-session` accessor retains the failed session even
+for a temporary helper call. A failed session accepts no new requests.
+There is no automatic reconnect or execution replay.
+
+`genera-close-session` stops its owner without waiting for remote eval.
+The optional `:io-timeout` on open defaults to 5 seconds and bounds
+connect, hello, and frame writes; it does not limit remote execution.
+Cached status is the last validated snapshot, not live evidence after a
+session fails. The API requires explicit ownership and closure; the MCP
+environment configuration above continues to use the legacy tool path.
 
 ### Request history
 
@@ -337,6 +384,7 @@ python3 tests/handshake.py
 python3 tests/evaluation.py
 python3 tests/concurrency.py
 python3 tests/ledger.py
+python3 tests/session.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -434,3 +482,16 @@ effects. It checks failure retention, payload conflicts, source reload,
 count/byte eviction, and generation changes. Fixture limits are reduced
 temporarily to exercise eviction. It restores default limits and legacy
 mode, preserving the execution worker and leaving Genera running.
+
+To check persistent host sessions against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/session.py --live-genera
+```
+
+The fake peers check one connection/hello, out-of-order response matching,
+control requests during a pending eval, partial frames, admission limits,
+protocol faults, disconnect identity retention, and prompt close. The
+native check reuses one session for eval/status/request lookup while an
+eval sleeps. It restores legacy mode and leaves Genera running.
