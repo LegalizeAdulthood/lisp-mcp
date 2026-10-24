@@ -252,6 +252,37 @@ accepts `:host`, `:port`, `:token`, `:expected-world`, `:package`,
 terminal fields and never retries execution or falls back to legacy.
 The MCP environment configuration above selects the legacy tool path.
 
+### Concurrent requests
+
+Legacy and versioned evaluation share one persistent execution process.
+A competing eval receives `:busy` before acceptance, with an
+`:active-request-id` when available. Legacy callers receive a busy error
+in the existing stderr field. An accepted eval continues if its client
+disconnects. A connection retains its execution slot until its result
+has been written; additional evals on that connection are rejected.
+
+Versioned hello/status requests remain responsive during evaluation,
+including on the evaluating socket. Responses may arrive in a different
+order from requests; match their IDs. One writer owns each connection,
+so frames cannot interleave. Legacy replies retain request order.
+
+The listener admits at most 16 clients, each with at most 16 outstanding
+control replies and one reserved execution result. A full control
+backlog pauses request reading. Additional clients are closed. An
+unavailable execution worker produces `:worker-unavailable`; the bridge
+does not silently start a second worker.
+
+Source reload and listener replacement preserve the execution process.
+External stop/replacement is refused during active work. A legacy
+management form may replace its own listener while retaining the worker
+and its occupied execution slot until the form finishes.
+
+When upgrading a listener without an execution worker, close other
+clients before loading the sources. The loading connection drains and
+closes after its reply; reconnect afterward. Generation IDs survive
+this transition; new evaluations receive busy until that handler finishes.
+Worker entry points and lock continuations are compiled during loading.
+
 ## Host acceptance checks
 
 Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
@@ -267,6 +298,7 @@ python3 tests/framing.py
 python3 tests/protocol.py
 python3 tests/handshake.py
 python3 tests/evaluation.py
+python3 tests/concurrency.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -339,3 +371,14 @@ exercises values, packages, printing, warnings, stream redirection,
 reader/condition failures, output bounds, and persistent state through
 the host helper. It retains a legacy control connection and restores
 legacy mode when finished.
+
+To check concurrent native execution and response handling:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/concurrency.py --live-genera
+```
+
+The check exercises simultaneous submissions, status during eval,
+disconnects, listener reload, client limits, and blocked/fragmented
+response writers. It restores legacy mode and leaves Genera running.

@@ -24,7 +24,8 @@
 (fresh-service
   (let ((first (mcp-start-service :token "test-secret")))
     (hcheck first (mcp-start-service))
-    (hcheck 1 *fixture-enables*)
+    ;; Idempotent start rechecks native registration without replacing it.
+    (hcheck 2 *fixture-enables*)
     (let* ((session (mcp-v1-new-session))
            (hello (hrequest :hello :token "test-secret" :expected-world "fixture.vlod"))
            (reply (mcp-v1-dispatch hello session)))

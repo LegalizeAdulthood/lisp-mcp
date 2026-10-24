@@ -56,12 +56,18 @@ def legacy(stream, expression):
 
 
 def reload_sources(stream):
-    source = "(progn\n" + "\n".join(
+    source = "\n".join(
         (ROOT / name).read_text(encoding="ascii")
         for name in ("genera-protocol.lisp", "eval-server.lisp")
-    ) + '\n"codec loaded")'
+    )
     # Genera's source reader ends line comments at native Return (ASCII CR).
-    return legacy(stream, source.replace("\n", "\r"))
+    # Read every trusted source form before evaluating any of them. The old
+    # legacy evaluator otherwise ignores trailing forms after the first one.
+    program = ('(progn (mapcar #\'eval (with-input-from-string (source '
+               + lisp_string(source.replace("\n", "\r"))
+               + ') (loop for form = (read source nil :eof) '
+               'until (eq form :eof) collect form))) "codec loaded")')
+    return legacy(stream, program)
 
 
 def wire_string(reply, key):

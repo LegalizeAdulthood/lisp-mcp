@@ -349,6 +349,62 @@ does not recognize."
 (defvar *mcp-current-client* nil)
 (defvar *mcp-worker-busy* nil)
 (defvar *mcp-listener-installed* nil)
+(defvar *mcp-worker* nil)
+(defvar *mcp-worker-failed* nil)
+(defvar *mcp-bootstrap-service* nil)
+(defvar *mcp-connections* nil)
+(defvar *mcp-current-connection* nil)
+(defconstant +mcp-client-limit+ 16)
+(defconstant +mcp-control-limit+ 16)
+
+(defmacro mcp-with-state-lock (&body body)
+  `(mcp-call-with-state-lock (lambda () ,@body)))
+
+(defun mcp-execution-busy-p ()
+  (or *mcp-worker-busy* *mcp-bootstrap-service* *mcp-worker-failed*))
+
+(defun mcp-active-request-id ()
+  (when (consp *mcp-worker-busy*)
+    (getf (getf *mcp-worker-busy* :request) :id)))
+
+(defun mcp-admit-client (stream service protocol)
+  (mcp-with-state-lock
+    (when (and (getf service :running)
+               (< (length *mcp-connections*) +mcp-client-limit+))
+      (let ((client (list :stream stream :service service :protocol protocol
+                          :queue nil :controls 0 :execution nil :closed nil)))
+        (push client *mcp-connections*)
+        (push stream (getf service :clients))
+        client))))
+
+(defun mcp-queue-response (client response &optional job)
+  ;; Caller holds the state lock. Execution owns a separate reserved slot.
+  (unless (getf client :closed)
+    (unless job (incf (getf client :controls)))
+    (setf (getf client :queue)
+          (nconc (getf client :queue) (list (list :response response :job job))))))
+
+(defun mcp-submit-eval (request service client &optional legacy)
+  "Reserve one world-wide execution slot before making work runnable."
+  (mcp-with-state-lock
+    (let ((active (or (mcp-active-request-id)
+                      (getf (getf (getf client :execution) :request) :id)))
+          (code (cond ((or *mcp-worker-failed* (not (mcp-worker-live-p)))
+                       :worker-unavailable)
+                      ((or (mcp-execution-busy-p) (getf client :execution)) :busy)
+                      ((or (null client) (getf client :closed)
+                           (not (getf service :running))) :service-unavailable))))
+      (when code
+        (return-from mcp-submit-eval
+          (if legacy
+              (list "" "" (if (eq code :busy) "MCP worker is busy"
+                              "MCP worker is unavailable"))
+              (append (mcp-v1-failure request code "Execution was not accepted" service)
+                      (when active (list :active-request-id active))))))
+      (let ((job (list :request request :service service :client client
+                       :legacy legacy :state :pending :result nil)))
+        (setf (getf client :execution) job *mcp-worker-busy* job)
+        nil))))
 
 (defun mcp-write-envelope (stream response)
   "Write one raw-ASCII data envelope, without diagnostic replacement."
@@ -377,7 +433,9 @@ does not recognize."
           (mcp-v1-generation service)
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
-                :busy (not (null *mcp-worker-busy*)) :features '(:status :eval))))
+                :busy (not (null (mcp-execution-busy-p))) :features '(:status :eval))
+          (when (mcp-active-request-id)
+            (list :active-request-id (mcp-active-request-id)))))
 
 (defun mcp-v1-dispatch (request &optional (session (mcp-v1-new-session))
                                         (service *mcp-service*))
@@ -411,65 +469,223 @@ does not recognize."
      (mcp-v1-failure request :stale-generation "Generation identity does not match"
                      service))
     ((eq (getf request :op) :status) (mcp-v1-service-response request service))
-    ((eq (getf request :op) :eval) (mcp-v1-eval request service))
+    ((eq (getf request :op) :eval)
+     (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
 
 (defun mcp-stop-service ()
   "Disable only this service and close its clients; preserve world state."
-  (when *mcp-worker-busy* (error "Cannot stop an active execution worker"))
-  (when (and *mcp-service* (getf *mcp-service* :running))
-    (let ((service *mcp-service*))
-      (setf (getf service :running) nil)
-      (unwind-protect (mcp-disable-listener)
-        (dolist (stream (getf service :clients))
-          ;; A management form may finish its reply, then its old loop exits.
-          (unless (eq stream *mcp-current-client*) (mcp-close-client stream)))
-        (setf (getf service :clients) nil))))
-  nil)
+  (mcp-call-with-lifecycle-lock
+   (lambda ()
+     (let ((service nil) (streams nil))
+       (mcp-with-state-lock
+         (when (and (mcp-execution-busy-p) (not (mcp-legacy-worker-owner-p)))
+           (error "Cannot stop an active execution worker"))
+         (when (and *mcp-service* (getf *mcp-service* :running))
+           (setf service *mcp-service* streams (getf service :clients)
+                 (getf service :running) nil (getf service :clients) nil)))
+       (when service
+         (unwind-protect (mcp-disable-listener)
+           (dolist (stream streams)
+             ;; The current legacy management job may finish its response.
+             (unless (eq stream *mcp-current-client*) (mcp-close-client stream)))))
+       nil))))
 
 (defun mcp-initialize-boot ()
   "Regenerate identity for a boot hook; calling this does not boot the world."
-  (mcp-stop-service)
-  (setf *mcp-listener-installed* nil
-        *mcp-boot-id* (mcp-new-generation-id "boot")))
+  (mcp-call-with-lifecycle-lock
+   (lambda ()
+     (mcp-stop-service)
+     (mcp-with-state-lock
+       (setf *mcp-listener-installed* nil
+             *mcp-boot-id* (mcp-new-generation-id "boot"))))))
 
 (defun mcp-start-service (&key (protocol *mcp-protocol*)
                              (token nil token-supplied-p)
                              (world nil world-supplied-p) replace)
-  "Start once, or explicitly replace an idle service. Return only its ID."
-  (let* ((previous *mcp-service*)
-         (selected-token (if token-supplied-p token (getf previous :token)))
-         (selected-world (if world-supplied-p world
-                             (or (getf previous :world) (mcp-detect-world)))))
-    (unless (member protocol '(:legacy :v1)) (error "Unknown MCP protocol mode"))
-    (when selected-token
-      (unless (and (stringp selected-token) (<= 1 (length selected-token) 4096)
-                   (every (lambda (ch) (<= 32 (char-code ch) 126)) selected-token))
-        (error "Token must be nonempty printable ASCII text"))
-      (unless (eq protocol :v1) (error "Authentication requires version-1 mode")))
-    (when selected-world
-      (mcp-v1-check-text selected-world)
-      (when (zerop (length selected-world)) (error "World name must be nonempty")))
-    (when (and (eq protocol :v1) (null selected-world))
-      (error "Configure a world name when it cannot be detected"))
-    (when (and previous (getf previous :running) (not replace))
-      (unless (and (eq protocol (getf previous :protocol))
-                   (equal selected-token (getf previous :token))
-                   (equal selected-world (getf previous :world)))
-        (error "Service configuration changes require explicit replacement"))
-      (return-from mcp-start-service (getf previous :service-id)))
-    (when *mcp-worker-busy* (error "Cannot replace an active execution worker"))
-    (mcp-stop-service)
-    (unless *mcp-boot-id* (setf *mcp-boot-id* (mcp-new-generation-id "boot")))
-    (let ((service (list :running t :protocol protocol :token selected-token
-                         :world selected-world :boot-id *mcp-boot-id*
-                         :service-id (mcp-new-generation-id "service") :clients nil)))
-      (mcp-enable-listener)
-      (setf *mcp-service* service *mcp-protocol* protocol)
-      (getf service :service-id))))
+  "Start or replace the listener, retaining its worker. Return only its ID."
+  (mcp-call-with-lifecycle-lock
+   (lambda ()
+     (let* ((previous *mcp-service*)
+            (selected-token (if token-supplied-p token (getf previous :token)))
+            (selected-world (if world-supplied-p world
+                                (or (getf previous :world) (mcp-detect-world)))))
+       (unless (member protocol '(:legacy :v1)) (error "Unknown MCP protocol mode"))
+       (when selected-token
+         (unless (and (stringp selected-token) (<= 1 (length selected-token) 4096)
+                      (every (lambda (ch) (<= 32 (char-code ch) 126)) selected-token))
+           (error "Token must be nonempty printable ASCII text"))
+         (unless (eq protocol :v1) (error "Authentication requires version-1 mode")))
+       (when selected-world
+         (mcp-v1-check-text selected-world)
+         (when (zerop (length selected-world)) (error "World name must be nonempty")))
+       (when (and (eq protocol :v1) (null selected-world))
+         (error "Configure a world name when it cannot be detected"))
+       (when (and previous (getf previous :running) (not replace))
+         (unless (and (eq protocol (getf previous :protocol))
+                      (equal selected-token (getf previous :token))
+                      (equal selected-world (getf previous :world)))
+           (error "Service configuration changes require explicit replacement"))
+         (mcp-ensure-worker)
+         (mcp-enable-listener)
+         (return-from mcp-start-service (getf previous :service-id)))
+       (mcp-with-state-lock
+         (when (and (mcp-execution-busy-p) (not (mcp-legacy-worker-owner-p)))
+           (error "Cannot replace an active execution worker")))
+       (mcp-stop-service)
+       (unless *mcp-boot-id* (setf *mcp-boot-id* (mcp-new-generation-id "boot")))
+       (let ((service (list :running t :protocol protocol :token selected-token
+                            :world selected-world :boot-id *mcp-boot-id*
+                            :service-id (mcp-new-generation-id "service") :clients nil
+                            :asynchronous t)))
+         (mcp-ensure-worker)
+         (mcp-enable-listener)
+         (mcp-with-state-lock
+           (setf *mcp-service* service *mcp-protocol* protocol))
+         (getf service :service-id))))))
 
 ;;; --- Genera service adapters ---
+
+(defvar *mcp-state-lock* (process:make-lock "MCP state" :recursive t))
+(defvar *mcp-lifecycle-lock* (process:make-lock "MCP lifecycle" :recursive t))
+
+(defun mcp-call-with-state-lock (function)
+  (process:with-lock (*mcp-state-lock*) (funcall function)))
+
+(defun mcp-call-with-lifecycle-lock (function)
+  (process:with-lock (*mcp-lifecycle-lock*) (funcall function)))
+
+(defun mcp-worker-live-p ()
+  (and *mcp-worker* (scl:process-active-p *mcp-worker*)))
+
+(defun mcp-legacy-worker-owner-p ()
+  ;; A legacy management form may replace its own listener. Its worker and
+  ;; admission slot survive until that form returns; other evals remain busy.
+  (and (eq scl:*current-process* *mcp-worker*)
+       (consp *mcp-worker-busy*) (getf *mcp-worker-busy* :legacy)))
+
+(defun mcp-ensure-worker ()
+  (mcp-with-state-lock
+    (when (and *mcp-service* (not (getf *mcp-service* :asynchronous)))
+      (error "Complete the listener upgrade before starting an execution worker"))
+    (cond (*mcp-worker*
+           (unless (and (mcp-worker-live-p) (not *mcp-worker-failed*))
+             (error "MCP execution worker is unavailable; it was not replaced")))
+          (t
+           (setf *mcp-worker*
+                 (scl:process-run-function "MCP execution" #'mcp-worker-loop))))))
+
+(defun mcp-worker-failure (job condition)
+  (if (getf job :legacy)
+      (list "" "" "MCP execution failed")
+      (let* ((request (getf job :request))
+             (budget (make-mcp-budget :remaining 4096)))
+        (append (mcp-v1-failure request :evaluation-error
+                                (mcp-render condition budget nil) (getf job :service))
+                (list :request-state :failed :values nil :value-count 0
+                      :stdout "" :stderr "" :warnings nil :package ""
+                      :elapsed-ms 0 :truncated (mcp-budget-truncated budget)
+                      :replaced (mcp-budget-replaced budget))))))
+
+(defun mcp-execute-job (job)
+  (let* ((client (getf job :client))
+         (*mcp-current-client* (getf client :stream))
+         (*mcp-current-connection* client))
+    (multiple-value-bind (success result)
+        (mcp-call-contained
+         (lambda ()
+           (if (getf job :legacy)
+               (multiple-value-list (mcp-eval (getf (getf job :request) :form)))
+               (mcp-v1-eval (getf job :request) (getf job :service)))))
+      (unless success
+        (setf result (mcp-worker-failure job result))
+        (unless (getf job :legacy)
+          (setf (getf (getf result :error) :condition-type) "MCP-WORKER-ERROR")))
+      (mcp-with-state-lock
+        ;; Retain the result before attempting delivery.
+        (setf (getf job :result) result (getf job :state) :done)
+        (mcp-queue-response client result job)
+        (setf *mcp-worker-busy* nil)))))
+
+(defun mcp-run-job (job)
+  ;; Keep this boundary outside argument setup and completion bookkeeping,
+  ;; including for a worker already running an older loop after source reload.
+  (let ((success (mcp-call-contained (lambda () (mcp-execute-job job)))))
+    (unless success (mcp-with-state-lock (setf *mcp-worker-failed* t)))
+    success))
+
+(defun mcp-worker-loop ()
+  (unwind-protect
+      (mcp-call-contained
+       (lambda ()
+         (progn
+           ;; A pre-worker source-loading handler must finish before any new eval.
+           (when *mcp-bootstrap-service*
+             (scl:process-wait "MCP upgrade drain"
+                               (lambda () (null (getf *mcp-bootstrap-service* :clients))))
+             (mcp-with-state-lock (setf *mcp-bootstrap-service* nil)))
+           (loop
+             (scl:process-wait "MCP execution"
+                               (lambda () (and (consp *mcp-worker-busy*)
+                                               (eq (getf *mcp-worker-busy* :state) :pending))))
+             (let ((job (mcp-with-state-lock
+                          (setf (getf *mcp-worker-busy* :state) :running)
+                          *mcp-worker-busy*)))
+               (unless (mcp-run-job job) (return)))))))
+    ;; Preserve an unresolved slot; never create another worker beside it.
+    (mcp-with-state-lock (setf *mcp-worker-failed* t))))
+
+(defun mcp-close-connection (client)
+  (let ((stream nil))
+    (mcp-with-state-lock
+      (unless (getf client :closed)
+        (setf stream (getf client :stream) (getf client :closed) t
+              (getf client :queue) nil)
+        (setf *mcp-connections* (delete client *mcp-connections*)
+              (getf (getf client :service) :clients)
+              (delete stream (getf (getf client :service) :clients)))))
+    (when stream (mcp-close-stream stream))))
+
+(defun mcp-client-writer (client)
+  "The only production response writer for this connection."
+  (unwind-protect
+      (mcp-call-contained
+       (lambda ()
+         (loop
+           (scl:process-wait "MCP response"
+                             (lambda () (or (getf client :closed) (getf client :queue))))
+           (when (getf client :closed) (return))
+           (let* ((entry (mcp-with-state-lock (pop (getf client :queue))))
+                  (response (getf entry :response)) (job (getf entry :job))
+                  (stream (getf client :stream)))
+             (if (eq (getf client :protocol) :legacy)
+                 (dolist (field response) (mcp-write-field stream field))
+                 (mcp-write-envelope stream response))
+             (send stream :force-output)
+             (mcp-with-state-lock
+               (if job (setf (getf client :execution) nil)
+                   (decf (getf client :controls))))
+             (when (and (not (getf (getf client :service) :running))
+                        (null (getf client :execution)))
+               (return))))))
+    (mcp-close-connection client)))
+
+(defun mcp-upgrade-service ()
+  "Drain a pre-worker loading connection without changing generation identity."
+  (when (and *mcp-service* (getf *mcp-service* :running)
+             (not (getf *mcp-service* :asynchronous)))
+    (mcp-with-state-lock
+      (let ((old *mcp-service*))
+        (unless (every (lambda (stream) (eq stream *mcp-current-client*))
+                       (getf old :clients))
+          (error "Close other MCP clients before upgrading the listener"))
+        (setf (getf old :running) nil
+              *mcp-bootstrap-service* old
+              *mcp-service* (copy-list old)
+              (getf *mcp-service* :running) t
+              (getf *mcp-service* :clients) nil
+              (getf *mcp-service* :asynchronous) t)))))
 
 (defun mcp-detect-world ()
   ;; VLM-WORLD-PATHNAME is a native accessor macro, not a FUNCALL target.
@@ -497,47 +713,74 @@ does not recognize."
 (defun mcp-disable-listener ()
   (sys:disable-services '(:mcp-server)))
 
-(defun mcp-close-client (stream)
+(defun mcp-close-stream (stream)
   (condition-case ()
       (ansi-common-lisp:handler-case (close stream :abort t)
         (ansi-common-lisp:error () nil))
     (error nil)))
 
+(defun mcp-close-client (stream)
+  (let ((client (mcp-with-state-lock
+                  (find stream *mcp-connections* :key (lambda (c) (getf c :stream))))))
+    (if client (mcp-close-connection client) (mcp-close-stream stream))))
+
 (defun mcp-handle-client (stream)
-  "Service one explicitly selected protocol for the life of a connection."
+  "Read and dispatch independently of execution and the response writer."
   (let* ((service *mcp-service*)
          (protocol (getf service :protocol))
          (session (mcp-v1-new-session))
+         (client (mcp-admit-client stream service protocol))
+         (*mcp-current-connection* client)
          (*mcp-current-client* stream))
-    (unless (and service (getf service :running))
+    (unless client
       (mcp-close-client stream)
       (return-from mcp-handle-client nil))
-    (push stream (getf service :clients))
     (unwind-protect
-        (condition-case (frame-error)
-            (ansi-common-lisp:handler-case
-                (progn
-                  (unless (member protocol '(:legacy :v1))
-                    (error "Unknown MCP protocol mode"))
-                  (loop while (getf service :running)
-                        for request = (mcp-read-request stream (eq protocol :legacy))
-                        while (and request (getf service :running))
-                        do (case protocol
-                             (:legacy
-                              (multiple-value-bind (result stdout stderr)
-                                  (mcp-eval request)
-                                (mcp-write-field stream result)
-                                (mcp-write-field stream stdout)
-                                (mcp-write-field stream stderr)))
-                             (:v1
-                              (mcp-write-envelope
-                               stream (mcp-v1-dispatch
-                                       (mcp-v1-decode request :request)
-                                       session service))))
-                           (send stream :force-output)))
-              (ansi-common-lisp:error () nil))
-          (error (format *error-output* "MCP connection closed: ~A~%" frame-error)))
-      (setf (getf service :clients) (delete stream (getf service :clients)))
-      (mcp-close-client stream))))
+        (progn
+          (scl:process-run-function "MCP response" #'mcp-client-writer client)
+          (mcp-call-contained
+           (lambda ()
+             (loop while (and (getf service :running) (not (getf client :closed)))
+                   do (scl:process-wait "MCP control space"
+                        (lambda () (or (getf client :closed)
+                                       (< (getf client :controls) +mcp-control-limit+))))
+                      (when (getf client :closed) (return))
+                      (let ((text (mcp-read-request stream (eq protocol :legacy))))
+                        (unless text (return))
+                        (mcp-with-state-lock
+                          (when (and (getf service :running) (not (getf client :closed)))
+                            (let ((response
+                                    (case protocol
+                                      (:v1 (mcp-v1-dispatch (mcp-v1-decode text :request)
+                                                            session service))
+                                      (:legacy
+                                       (mcp-submit-eval
+                                        (list :id (mcp-new-generation-id "legacy") :form text)
+                                        service client t))
+                                      (otherwise (error "Unknown MCP protocol mode")))))
+                              (when response (mcp-queue-response client response))))))
+                      ;; Legacy replies have no IDs: preserve their request
+                      ;; order instead of passing a later busy reply first.
+                      (when (and (eq protocol :legacy) (getf client :execution))
+                        (scl:process-wait "MCP legacy response"
+                          (lambda () (or (getf client :closed)
+                                         (null (getf client :execution)))))))
+             ;; The worker's legacy management job may have stopped its own
+             ;; service; let its reserved response drain before closing it.
+             (when (and (not (getf service :running)) (getf client :execution))
+               (scl:process-wait "MCP final response"
+                 (lambda () (or (getf client :closed)
+                                (null (getf client :execution)))))))))
+      (mcp-close-connection client))))
 
+;; Compile process entry points and their lock continuations before starting
+;; them. Native process/lock machinery must not depend on interpreter frames.
+(mapc #'compile
+      '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
+        mcp-admit-client mcp-submit-eval mcp-v1-dispatch
+        mcp-stop-service mcp-initialize-boot mcp-start-service
+        mcp-ensure-worker mcp-execute-job mcp-run-job mcp-worker-loop
+        mcp-close-connection mcp-client-writer mcp-handle-client))
+
+(mcp-upgrade-service)
 (mcp-start-service)

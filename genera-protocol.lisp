@@ -13,12 +13,13 @@
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
     :stale-generation :service-unavailable :package-not-found :reader-error
-    :evaluation-error))
+    :evaluation-error :busy :worker-unavailable))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
     :request-state :values :value-count :stdout :stderr :warnings
     :elapsed-ms :truncated :replaced :error :code :message :condition-type :target-id
+    :active-request-id :worker-unavailable
     :hello :status :eval :request-status :running :completed :failed
     :interrupted :unknown :unsupported-operation :invalid-request
     :unsupported-version :expected-world :authentication-failed
@@ -196,7 +197,7 @@
                       :print-level :print-length))
              (:request-status '(:boot-id :service-id :target-id))))
          (response-keys
-           '(:boot-id :service-id :world :package :busy :features :ok
+           '(:boot-id :service-id :world :package :busy :active-request-id :features :ok
              :request-state :values :value-count :stdout :stderr :warnings
              :elapsed-ms :truncated :replaced :error)))
     (case direction
@@ -243,7 +244,8 @@
      object '((:id . :id) (:client . :text) (:token . :text)
               (:boot-id . :id) (:service-id . :id) (:world . :nonempty-text)
               (:expected-world . :nonempty-text)
-              (:package . :text) (:busy . :boolean) (:features . :features)
+              (:package . :text) (:busy . :boolean) (:active-request-id . :id)
+              (:features . :features)
               (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
               (:print-level . :print-limit) (:print-length . :print-limit)
               (:target-id . :id) (:request-state . :state) (:values . :strings)

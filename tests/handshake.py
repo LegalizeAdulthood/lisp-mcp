@@ -78,7 +78,8 @@ class HandshakeChecks(unittest.TestCase):
         # connections exercise the production version-1 handler. It emits a
         # test-only ready field, then restores legacy in UNWIND-PROTECT.
         program = r'''
-(let ((others (remove :mcp-server net:*services-enabled*)))
+(let ((others (remove :mcp-server net:*services-enabled*))
+      (worker *mcp-worker*))
   (unwind-protect
       (let* ((id (mcp-start-service :protocol :v1 :token "test-secret" :replace t))
              (boot *mcp-boot-id*))
@@ -113,6 +114,7 @@ class HandshakeChecks(unittest.TestCase):
           (error "Boot initialization lost authentication"))
         (unless (equal others (remove :mcp-server net:*services-enabled*))
           (error "Unrelated services changed"))
+        (unless (eq worker *mcp-worker*) (error "Execution worker was replaced"))
         "lifecycle checked")
     (mcp-stop-service)
     (net:define-server :mcp-server (:medium :byte-stream :stream stream)
@@ -140,7 +142,8 @@ class HandshakeChecks(unittest.TestCase):
                 hello = wire_exchange(keeper, hello_request)
                 self.assertIn(":ok t", hello)
                 self.assertIn(":features (:status :eval)", hello)
-                self.assertIn(":busy nil", hello)
+                # This suite's long legacy management form owns the worker.
+                self.assertIn(":busy t", hello)
                 self.assertTrue(wire_string(hello, "world"))
                 self.assertTrue(wire_string(hello, "package"))
                 self.assertEqual(wire_exchange(keeper, hello_request), hello)
