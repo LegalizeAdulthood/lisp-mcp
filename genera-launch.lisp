@@ -1,4 +1,4 @@
-;;; Read-only launch configuration and prerequisite inspection for SBCL/WSL.
+;;; Local runtime configuration, inspection, and locked launch decisions.
 
 (in-package #:lisp-mcp)
 
@@ -293,3 +293,242 @@
   (if (eq (genera-runtime-mode runtime) :attach)
       (list :ok t :mode :attach :autostart nil :launch-permitted nil :checks nil)
       (genera-check-prerequisites runtime (genera-local-facts runtime))))
+
+#+linux
+(progn
+  (defvar *genera-launch-context* nil)
+
+  ;; Linux flock locks an open file description, including between threads.
+  ;; SB-POSIX:FLOCK names the fcntl structure, not the flock(2) function.
+  (sb-alien:define-alien-routine ("flock" genera-linux-flock) sb-alien:int
+    (fd sb-alien:int) (operation sb-alien:int))
+
+  (defun genera-same-file-p (one two)
+    (and (getf one :exists) (getf two :exists)
+         (eql (getf one :device) (getf two :device))
+         (eql (getf one :inode) (getf two :inode))))
+
+  (defun genera-launch-target (preflight)
+    (append (list :uid (sb-posix:geteuid)
+                  :linux-boot (string-trim '(#\Newline #\Return)
+                                (or (genera-read-small-file "/proc/sys/kernel/random/boot_id") "")))
+            (loop for key in '(:executable :world :partition)
+                  append (list key (genera-file-fact (getf (getf preflight :paths) key))))))
+
+  (defun genera-proc-stat (text)
+    ;; comm (field 2) can itself contain spaces and closing parentheses.
+    (let* ((end (and text (position #\) text :from-end t)))
+           (fields (and end (uiop:split-string (subseq text (+ end 2)))))
+           (start (and (>= (length fields) 20)
+                       (ignore-errors (parse-integer (nth 19 fields))))))
+      (when start (list :start-time start :state (first fields)))))
+
+  (defun genera-process-identity (pid target)
+    "Read one stable /proc identity. Never signal, launch, or trust argv[0]."
+    (let* ((base (format nil "/proc/~D/" pid))
+           (before (genera-proc-stat (genera-read-small-file (concatenate 'string base "stat"))))
+           (owner (genera-file-fact base)))
+      (when (and before (not (member (getf before :state) '("Z" "X") :test #'equal)))
+        (let* ((exe (genera-file-fact (concatenate 'string base "exe")))
+               (cmd (genera-read-small-file (concatenate 'string base "cmdline") 65536))
+               (argv (and cmd (uiop:split-string cmd :separator (string #\Null))))
+               (cwd (ignore-errors (sb-posix:readlink (concatenate 'string base "cwd"))))
+               (comm (string-trim '(#\Newline) (or (genera-read-small-file
+                                                    (concatenate 'string base "comm")) "")))
+               (world nil) (partition nil) (ambiguous nil))
+          (labels ((argument (flag)
+                     (let ((positions (loop for arg in (rest argv) for i from 1
+                                            when (equal arg flag) collect i)))
+                       (unless (= (length positions) 1) (setf ambiguous t))
+                       (let ((value (and positions (nth (1+ (first positions)) argv))))
+                         (when (and value (plusp (length value))
+                                    (or cwd (char= (char value 0) #\/)))
+                           (genera-file-fact (genera-runtime-path value (or cwd "/"))))))))
+            (setf world (argument "-world") partition (argument "-partition")))
+          (let* ((after (genera-proc-stat (genera-read-small-file (concatenate 'string base "stat"))))
+                 (relevant (or (genera-same-file-p exe (getf target :executable))
+                               (genera-same-file-p world (getf target :world))
+                               (genera-same-file-p partition (getf target :partition))
+                               (let ((name (file-namestring (getf (getf target :executable) :path))))
+                                 (or (equal comm (subseq name 0 (min 15 (length name))))
+                                     (and (first argv) (equal (file-namestring (first argv)) name)))))))
+            (when after
+              (list :pid pid :uid (getf owner :uid) :start-time (getf before :start-time)
+                    :linux-boot (getf target :linux-boot) :executable exe :world world :partition partition
+                    :relevant (not (null relevant))
+                    :unreadable (or (not (eql (getf before :start-time) (getf after :start-time)))
+                                    (member (getf after :state) '("Z" "X") :test #'equal)
+                                    (null cmd) (= (length cmd) 65536)
+                                    (not (getf exe :exists)) ambiguous
+                                    (not (getf world :exists)) (not (getf partition :exists))))))))))
+
+  (defun genera-process-matches-p (process target)
+    (and process (not (getf process :unreadable))
+         (eql (getf process :uid) (getf target :uid))
+         (every (lambda (key) (genera-same-file-p (getf process key) (getf target key)))
+                '(:executable :world :partition))))
+
+  (defun genera-discover-processes (target)
+    "Include manual VLMs, aliases, foreign owners, and resource conflicts."
+    (let ((matches nil) (conflicts nil))
+      (dolist (directory (uiop:subdirectories #P"/proc/"))
+        (let* ((name (car (last (pathname-directory directory))))
+               (pid (and (stringp name) (plusp (length name))
+                         (every #'digit-char-p name) (parse-integer name)))
+               (process (and pid (genera-process-identity pid target))))
+          (when (getf process :relevant)
+            (if (genera-process-matches-p process target)
+                (push process matches) (push process conflicts)))))
+      (list :matches (sort matches #'< :key (lambda (p) (getf p :pid)))
+            :conflicts (sort conflicts #'< :key (lambda (p) (getf p :pid))))))
+
+  (defun genera-private-directory (path)
+    (let* ((directory (uiop:ensure-directory-pathname path))
+           (name (string-right-trim "/" (namestring directory))))
+      (handler-case (sb-posix:lstat name)
+        (sb-posix:syscall-error (e)
+          (unless (= (sb-posix:syscall-errno e) sb-posix:enoent) (error e))
+          (let ((parent (uiop:pathname-parent-directory-pathname directory)))
+            (unless (probe-file parent) (genera-private-directory parent)))
+          (handler-case (sb-posix:mkdir name #o700)
+            (sb-posix:syscall-error (e)
+              (unless (= (sb-posix:syscall-errno e) sb-posix:eexist) (error e))))))
+      (let* ((stat (sb-posix:lstat name)) (mode (sb-posix:stat-mode stat)))
+        (unless (and (sb-posix:s-isdir mode) (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
+                     (zerop (logand mode #o077)))
+          (error "Insecure launch state directory: ~A" name)))
+      (namestring directory)))
+
+  (defun genera-private-open (path flags)
+    ;; O_CLOEXEC is 02000000 in Linux asm-generic/fcntl.h.
+    (let ((fd (sb-posix:open path (logior flags sb-posix:o-nofollow #o2000000) #o600)))
+      (handler-case
+          (let* ((stat (sb-posix:fstat fd)) (mode (sb-posix:stat-mode stat)))
+            (unless (and (sb-posix:s-isreg mode) (= (sb-posix:stat-uid stat) (sb-posix:geteuid))
+                         (= (sb-posix:stat-nlink stat) 1) (zerop (logand mode #o077)))
+              (error "Insecure launch state file: ~A" path))
+            fd)
+        (error (e) (sb-posix:close fd) (error e)))))
+
+  (defun genera-call-with-file-lock (path function)
+    (let ((fd (genera-private-open path (logior sb-posix:o-rdwr sb-posix:o-creat))))
+      (unwind-protect
+          (if (zerop (genera-linux-flock fd 6)) ; LOCK_EX | LOCK_NB
+              (funcall function)
+              (if (= (sb-alien:get-errno) sb-posix:eagain)
+                  (list :action :blocked :code :lock-busy)
+                  (error "Cannot acquire launch lock: ~A" path)))
+        ;; Closing releases flock, also after errors and nonlocal exits.
+        (sb-posix:close fd))))
+
+  (defun genera-identity-data (identity)
+    (append (list 1 (getf identity :uid) (getf identity :pid) (getf identity :start-time)
+                  (getf identity :linux-boot))
+            (loop for key in '(:executable :world :partition)
+                  for file = (getf identity key)
+                  append (list (getf file :path) (getf file :device) (getf file :inode)))))
+
+  (defun genera-read-launch-metadata (directory)
+    (let* ((path (concatenate 'string directory "identity.json"))
+           (fd (handler-case (genera-private-open path sb-posix:o-rdonly)
+                 (sb-posix:syscall-error (e)
+                   (if (= (sb-posix:syscall-errno e) sb-posix:enoent)
+                       nil (error e))))))
+      (when fd
+        (with-open-stream (in (sb-sys:make-fd-stream fd :input t :external-format :utf-8 :auto-close t))
+          (let ((text (make-string 16385)))
+            (let ((count (read-sequence text in)))
+              (when (> count 16384) (error "Oversized launch identity metadata"))
+              (let* ((yason:*parse-json-arrays-as-vectors* nil)
+                     (data (yason:parse (subseq text 0 count))))
+                (unless (and (listp data) (= (length data) 14) (eql (first data) 1)
+                             (every (lambda (i) (and (integerp (nth i data)) (>= (nth i data) 0)))
+                                    '(1 2 3 6 7 9 10 12 13))
+                             (plusp (third data))
+                             (every (lambda (i) (stringp (nth i data))) '(4 5 8 11)))
+                  (error "Invalid launch identity metadata"))
+                data)))))))
+
+  (defun genera-record-launch-identity (context identity)
+    "Record a verified live VLM while CONTEXT's launch locks are held."
+    (unless (and context (eq context *genera-launch-context*))
+      (error "Launch identity requires held launch locks"))
+    (let* ((target (getf context :target))
+           (current (genera-process-identity (getf identity :pid) target))
+           (directory (getf context :directory))
+           (temporary (format nil "~Aidentity-~D-~D.tmp" directory (sb-posix:getpid) (random most-positive-fixnum))))
+      (unless (and (genera-process-matches-p current target)
+                   (equal (genera-identity-data identity) (genera-identity-data current)))
+        (error "VLM identity changed before recording"))
+      (unwind-protect
+          (progn
+            (with-open-stream
+                (out (sb-sys:make-fd-stream
+                       (genera-private-open temporary (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-excl))
+                       :output t :external-format :utf-8 :auto-close t))
+              (yason:encode (coerce (genera-identity-data current) 'vector) out))
+            (sb-posix:rename temporary (concatenate 'string directory "identity.json")))
+        (when (probe-file temporary) (delete-file temporary)))))
+
+  (defun genera-probe-launch-endpoint (runtime &optional (port 8888))
+    "Presence only. A reachable TCP port is not a validated hello."
+    (let ((socket nil))
+      (unwind-protect
+          (handler-case
+              (sb-ext:with-timeout 0.5
+                (setf socket (usocket:socket-connect (genera-runtime-guest runtime) port
+                              :element-type '(unsigned-byte 8) :timeout 0.5))
+                :present)
+            (usocket:connection-refused-error () :absent)
+            (usocket:timeout-error () :absent)
+            (usocket:host-unreachable-error () :absent)
+            (sb-ext:timeout () :absent)
+            (error (e) (values :unknown (princ-to-string e))))
+        (when socket (usocket:socket-close socket)))))
+
+  (defun genera-launch-verdict (snapshot endpoint metadata)
+    (let ((matches (getf snapshot :matches)) (conflicts (getf snapshot :conflicts)))
+      (append
+       (cond (conflicts (list :action :blocked :code :process-conflict))
+             ((rest matches) (list :action :blocked :code :multiple-vlms))
+             ((eq endpoint :present) (list :action :observe :code :endpoint-present))
+             ((not (eq endpoint :absent)) (list :action :blocked :code :endpoint-unknown))
+             (matches (list :action :observe :code :vlm-present))
+             (t (list :action :launch :code :vlm-absent)))
+       (list :process (first matches) :conflicts conflicts :matches matches :metadata metadata
+             :endpoint endpoint))))
+
+  (defun genera-call-with-launch-decision (runtime consumer &key
+                                            (preflight (genera-launch-preflight runtime))
+                                            (endpoint-observer #'genera-probe-launch-endpoint))
+    "Call CONSUMER(decision, context) under both locks. Launch only there;
+record the child's verified identity before returning. Never launch here."
+    (unless (and (eq (genera-runtime-mode runtime) :local) (getf preflight :launch-permitted))
+      (return-from genera-call-with-launch-decision (list :action :blocked :code :launch-disabled :preflight preflight)))
+    (let* ((target (genera-launch-target preflight))
+           (world (getf target :world))
+           (state (genera-private-directory (genera-runtime-state-directory runtime)))
+           (directory (genera-private-directory
+                        (format nil "~Aworld-~D-~D/" state (getf world :device) (getf world :inode)))))
+      ;; The user-wide guard also serializes different worlds sharing a partition.
+      (genera-call-with-file-lock (concatenate 'string state "launch.lock")
+        (lambda ()
+          (genera-call-with-file-lock (concatenate 'string directory "launch.lock")
+            (lambda ()
+              (let* ((*genera-launch-context* (list :target target :directory directory))
+                     (snapshot (genera-discover-processes target))
+                     (endpoint (funcall endpoint-observer runtime))
+                     (saved (genera-read-launch-metadata directory))
+                     (recorded (and saved (genera-process-identity (third saved) target)))
+                     (metadata (cond ((null saved) :missing)
+                                     ((and (genera-process-matches-p recorded target)
+                                           (equal saved (genera-identity-data recorded))) :current)
+                                     (t :stale)))
+                     (decision (genera-launch-verdict snapshot endpoint metadata)))
+                (when (eq metadata :stale)
+                  (delete-file (concatenate 'string directory "identity.json")))
+                (when (and (eq metadata :current) (not (getf decision :process)))
+                  (setf (getf decision :action) :blocked (getf decision :code) :identity-race))
+                (when (and (getf decision :process) (not (eq (getf decision :action) :blocked)))
+                  (genera-record-launch-identity *genera-launch-context* (getf decision :process)))
+                (funcall consumer decision *genera-launch-context*)))))))))

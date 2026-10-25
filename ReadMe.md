@@ -140,6 +140,36 @@ endpoint, attaches no TAP device, runs no sudo, changes no display setting,
 and never saves or overwrites a world. Socket/TAP metadata checks do not
 prove display authentication, guest routing, or listener readiness.
 
+### Local launch ownership
+
+`genera-call-with-launch-decision` inspects processes and rechecks the TCP
+endpoint while holding Linux advisory locks. It passes a decision and a
+lock context to a callback. Only that callback may act on `:launch`; it
+must record the verified child's identity with
+`genera-record-launch-identity` before returning and releasing the locks.
+The decision helper itself starts no VLM.
+
+Use the same private `GENERA_STATE_DIR` for all clients of a runtime.
+A user-wide guard serializes decisions across worlds sharing a partition;
+a per-world lock uses the world's device/inode identity, including aliases.
+Directories are private to the current user. Lock and metadata files
+reject symlinks, hard links, foreign ownership, and public permissions.
+Locks release on errors or host exit; their descriptors close on exec.
+
+Discovery reads `/proc`, including VLMs started manually. It checks the
+canonical executable, world, partition, owner, PID, Linux start time, and
+Linux boot identity. Relative arguments resolve against the process's
+working directory. Unreadable candidate identities, conflicting resources,
+or several matching VLMs block launch. Stale metadata is discarded only
+under the locks after live discovery; a PID alone never establishes VLM
+identity. Invalid metadata blocks the decision.
+
+A matching process without a listener yields `:vlm-present` and must be
+observed through its boot deadline. A reachable TCP port yields
+`:endpoint-present`; a validated versioned handshake is still required.
+Neither result permits another VLM launch. External manual launchers do
+not participate in these advisory locks.
+
 ### Genera profile
 
 For a listener explicitly configured for version 1, use:
@@ -668,6 +698,7 @@ python3 tests/deadlines.py
 python3 tests/reconnect.py
 python3 tests/boot.py
 python3 tests/preflight.py
+python3 tests/launch.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -757,6 +788,12 @@ python3 tests/preflight.py --live-runtime \
 
 This check inspects the configured host runtime without launching or
 rebooting Genera and needs no computer control.
+
+The Linux launch runner uses disposable process fixtures and real
+advisory locks. It checks manual discovery, canonical paths and aliases,
+PID reuse and stale metadata, conflicting resources, concurrent clients,
+bounded endpoint probes, and lock release after callback errors or host
+death. Its stand-in processes read no Genera worlds or FEP partitions.
 
 To check structured evaluation and recovery on a running legacy listener:
 
