@@ -8,7 +8,7 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
@@ -23,7 +23,7 @@
     :active-request-id :worker-unavailable
     :result :history-limit :history-count :history-byte-limit :history-bytes
     :history-evictions :request-id-conflict
-    :hello :status :eval :request-status :interrupt :running :completed :failed
+    :hello :status :eval :request-status :interrupt :reset-listener-context :running :completed :failed
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
     :interrupted :unknown :unsupported-operation :invalid-request
@@ -198,7 +198,7 @@
   (let* ((request-keys
            (case (getf object :op)
              (:hello '(:client :token :expected-world))
-             (:status '(:boot-id :service-id))
+             ((:status :reset-listener-context) '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
              ((:request-status :interrupt) '(:boot-id :service-id :target-id))))
@@ -304,7 +304,7 @@
   "Check execution identity and the complete terminal result contract."
   (mcp-v1-validate request :request)
   (mcp-v1-validate response :response)
-  (unless (and (eq (getf request :op) :eval)
+  (unless (and (member (getf request :op) '(:eval :reset-listener-context))
                (every (lambda (key) (equal (getf request key) (getf response key)))
                       '(:id :boot-id :service-id)))
     (mcp-v1-error "Eval response identity mismatch"))

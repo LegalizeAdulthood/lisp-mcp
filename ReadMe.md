@@ -9,7 +9,7 @@ The default `generic` profile provides up to three tools:
 
 The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
-`genera_recover_session`, `genera_eval`, and the
+`genera_recover_session`, `genera_reset_listener_context`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 It additionally exposes `genera_interrupt` after a validated listener
 hello advertises targeted interruption.
@@ -328,7 +328,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the six
+does not expose host or Swank tools. Tool discovery advertises the seven
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -401,6 +401,31 @@ Successful recovery records `acknowledged: true` while preserving the
 outcome as `unknown`. It never retries or cancels work. Another client's
 later admission can still cause a subsequent eval to receive busy.
 
+### Listener context reset
+
+`genera_reset_listener_context` requires the current `boot_id` and
+`service_id`. Optional positive `timeout_ms` sets the host wait deadline,
+as for eval. The listener must advertise `:reset-listener-context`;
+older listeners return an unsupported tool failure without a reset request.
+
+Reset restores `*mcp-eval-package*` to the configured package object in
+`*mcp-default-package*`. Its initial value is the package named
+`COMMON-LISP-USER`; set it before loading the listener to choose another
+default. Eval output streams, print settings, warnings, and reader context
+are already bound afresh for each request. Reset preserves definitions,
+loaded systems, global values, and bounded request history. It changes
+neither generation ID and does not restart the world or worker.
+
+The wire operation `:reset-listener-context` uses the shared execution
+worker, generated request identity, terminal result envelope, and ledger.
+Success returns the restored package name as its one printed value.
+Active or uncertain local execution blocks submission; another client's
+active work is rejected by the listener's global admission check. Stale
+generations are rejected before execution. A missing result remains
+uncertain and blocks further execution until normal lookup/recovery;
+reset is never replayed automatically and never clears that tracking.
+Ordinary bounded history eviction still applies when recording a reset.
+
 ### Targeted interruption
 
 The optional `genera_interrupt` tool requires `request_id`, `boot_id`,
@@ -413,7 +438,7 @@ execution deadline.
 The tool appears only after the listener advertises `:interrupt` in a
 verified hello. The Genera profile advertises changing tool lists and
 sends `notifications/tools/list_changed` when support changes. Refresh
-`tools/list` after that notification. Older listeners retain the six
+`tools/list` after that notification. Older listeners retain the seven
 base tools; generic host/Swank discovery is unchanged.
 See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
 
@@ -884,6 +909,7 @@ python3 tests/launch.py
 python3 tests/detached.py
 python3 tests/startup.py
 python3 tests/interrupt.py
+python3 tests/context.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1035,6 +1061,18 @@ Set `GENERA_TOKEN` when configured. This runner leaves v1 selected and
 does not reload sources, restart Genera, or save a world. Native checks
 cover cleanup, protected-region refusal, explicit debugger recovery,
 delayed callbacks, worker survival, and an unrelated Lisp process.
+
+Check listener context reset in the same updated v1 world:
+
+```sh
+GENERA_HOST=genera.example LISP_MCP_PROFILE=genera GENERA_PROTOCOL=v1 \
+  python3 tests/context.py --live-v1
+```
+
+This runner verifies configured defaults, preserved definitions and values,
+retained results, and refusal during active or uncertain work. It restores
+the original default and current package after its native checks, without
+restarting Genera or saving a world.
 
 To check structured evaluation and recovery on a running legacy listener:
 

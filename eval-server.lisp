@@ -118,9 +118,10 @@ Returns #\\? for characters outside ASCII 9,10,13,32-126."
   (declare (ignore hook))
   (throw 'mcp-eval-bail condition))
 
-(defvar *mcp-eval-package* (find-package "COMMON-LISP-USER")
-  "Package in which MCP eval reads expressions.
-Reset to a better default after the first successful eval if needed.")
+(defvar *mcp-default-package* (find-package "COMMON-LISP-USER")
+  "Configured package restored by listener context reset.")
+(defvar *mcp-eval-package* *mcp-default-package*
+  "Current package in which MCP eval reads expressions.")
 
 (defun mcp-eval (string)
   "Evaluate STRING as a Lisp expression.
@@ -284,8 +285,9 @@ does not recognize."
          (out (mcp-capture-stream stdout))
          (err (mcp-capture-stream stderr))
          (terminal (make-two-way-stream (make-string-input-stream "") err))
-         (package-name (or (getf request :package)
-                           (package-name *mcp-eval-package*)))
+         (reset (eq (getf request :op) :reset-listener-context))
+         (package-name (if reset (package-name *mcp-default-package*)
+                           (or (getf request :package) (package-name *mcp-eval-package*))))
          (start (get-internal-real-time))
          (phase :package-not-found)
          (warnings nil)
@@ -304,7 +306,7 @@ does not recognize."
            (let ((*package* (or (find-package package-name)
                                (error "No package named ~A" package-name))))
              (setf package-name (package-name *package*) phase :reader-error)
-             (let ((form (mcp-read-eval-form (getf request :form))))
+             (let ((form (unless reset (mcp-read-eval-form (getf request :form)))))
                (setf phase :evaluation-error)
                (ansi-common-lisp:handler-bind
                    ((ansi-common-lisp:warning
@@ -316,7 +318,9 @@ does not recognize."
                  (setf printed
                        (mapcar (lambda (value) (mcp-render value budget))
                                (multiple-value-list
-                                (let ((*mcp-interruptible-job* job)) (eval form))))))))))
+                                (if reset
+                                    (progn (setf *mcp-eval-package* *package*) package-name)
+                                    (let ((*mcp-interruptible-job* job)) (eval form)))))))))))
       (let* ((diagnostics (make-mcp-budget :remaining 4096))
              (interrupted (and (not success) (getf job :interrupt-delivered)
                                (typep outcome 'sys:abort)))
@@ -554,7 +558,7 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features (append '(:status :request-status :eval)
+                :features (append '(:status :request-status :eval :reset-listener-context)
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
@@ -600,7 +604,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((eq (getf request :op) :eval)
+    ((member (getf request :op) '(:eval :reset-listener-context))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))

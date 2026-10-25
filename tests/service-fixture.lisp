@@ -5,6 +5,7 @@
 (load (merge-pathnames "../genera-protocol.lisp" *load-truename*))
 
 (defvar *mcp-eval-package* (find-package "COMMON-LISP-USER"))
+(defvar *mcp-default-package* (find-package "COMMON-LISP-USER"))
 (defvar *fixture-enables* 0)
 (defvar *fixture-disables* 0)
 (defvar *fixture-closed* nil)

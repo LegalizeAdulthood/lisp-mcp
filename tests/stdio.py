@@ -143,7 +143,8 @@ class StdioChecks(unittest.TestCase):
                 tools = mcp.receive()["result"]["tools"]
                 self.assertEqual({t["name"] for t in tools},
                                  {"genera_eval", "eval_genera", "genera_session_status",
-                                  "genera_request_status", "genera_recover_session", "genera_ensure_session"})
+                                  "genera_request_status", "genera_recover_session", "genera_ensure_session",
+                                  "genera_reset_listener_context"})
                 self.assertTrue(tools[0]["annotations"]["readOnlyHint"])
                 mcp.call("genera_session_status", "status")
                 self.assertEqual(structured(mcp.receive())["phase"], "not-started")

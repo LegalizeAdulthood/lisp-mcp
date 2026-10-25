@@ -342,6 +342,11 @@
                    "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("form"))
             (rpc-versioned-tool "eval_genera" "Compatibility alias for genera_eval."
                                  (jso "expression" (jso "type" "string")) #("expression"))
+            (rpc-versioned-tool "genera_reset_listener_context"
+              "Restore the configured bridge package; preserve world state and request history. Requires idle, resolved execution."
+              (jso "boot_id" (jso "type" "string" "minLength" 1)
+                   "service_id" (jso "type" "string" "minLength" 1)
+                   "timeout_ms" (jso "type" "integer" "minimum" 1)) #("boot_id" "service_id"))
             (rpc-versioned-tool "genera_request_status" "Look up a request without replay; retry control connection if needed."
               (rpc-identity-schema) #("request_id" "boot_id" "service_id") t)
             (rpc-versioned-tool "genera_recover_session" "Acknowledge a specific unknown outcome after fresh idle verification."
@@ -384,10 +389,12 @@
          (lookup (string= name "genera_request_status"))
          (recover (string= name "genera_recover_session"))
          (interrupt (string= name "genera_interrupt"))
+         (reset (string= name "genera_reset_listener_context"))
          (allowed (cond ((or lookup recover interrupt)
                          (append '("request_id" "boot_id" "service_id")
                                  (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
+                        (reset '("boot_id" "service_id" "timeout_ms"))
                         (ensure nil) (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
          (form-key (if structured "form" "expression")))
@@ -397,9 +404,9 @@
     (multiple-value-bind (refresh present) (gethash "refresh" arguments)
       (when (and present (not (member refresh '(yason:true yason:false))))
         (rpc-invalid "refresh must be a boolean")))
-    (when (or lookup recover interrupt)
+    (when (or lookup recover interrupt reset)
       (dolist (key (if recover '("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id")
-                              '("request_id" "boot_id" "service_id")))
+                              (if reset '("boot_id" "service_id") '("request_id" "boot_id" "service_id"))))
         (let ((value (gethash key arguments)))
           (unless (and (stringp value) (<= 1 (length value) 4096))
             (rpc-invalid "Request and generation identities must be nonempty text"))))
@@ -408,7 +415,7 @@
     (when (and interrupt (integerp (gethash "timeout_ms" arguments 5000))
                (> (gethash "timeout_ms" arguments 5000) 5000))
       (rpc-invalid "Interrupt timeout_ms must be at most 5000"))
-    (unless (or status lookup recover ensure interrupt)
+    (unless (or status lookup recover ensure interrupt reset)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -454,15 +461,20 @@
                                     (genera-session-error-kind failure))) "not-ready")
                   (if failure (princ-to-string failure) "Genera session is not ready")))))
           (handler-case
-              (let* ((form (gethash (if (string= name "genera_eval") "form" "expression") arguments))
-                     (fields (append (list :form form
-                                           :host-timeout (/ (gethash "timeout_ms" arguments
-                                                                                    (* 1000 *genera-timeout*)) 1000)
-                                           :print-level (gethash "print_level" arguments 6)
-                                           :print-length (gethash "print_length" arguments 100))
-                                     (when (gethash "package" arguments)
-                                       (list :package (gethash "package" arguments)))))
-                     (request (apply #'genera-submit-request session :eval fields)))
+              (let* ((reset (string= name "genera_reset_listener_context"))
+                     (form (gethash (if (string= name "genera_eval") "form" "expression") arguments))
+                     (fields (append
+                               (list :host-timeout (/ (gethash "timeout_ms" arguments
+                                                              (* 1000 *genera-timeout*)) 1000))
+                               (if reset
+                                   (list :expected-generation (list (gethash "boot_id" arguments)
+                                                                    (gethash "service_id" arguments)))
+                                   (append (list :form form :print-level (gethash "print_level" arguments 6)
+                                                 :print-length (gethash "print_length" arguments 100))
+                                           (when (gethash "package" arguments)
+                                             (list :package (gethash "package" arguments)))))))
+                     (request (apply #'genera-submit-request session
+                                     (if reset :reset-listener-context :eval) fields)))
                 (rpc-queue-work id name form request))
             (genera-session-error (condition)
               (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
