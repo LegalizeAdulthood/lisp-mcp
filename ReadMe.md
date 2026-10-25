@@ -72,6 +72,74 @@ status do not contact Genera. The Genera profile starts one asynchronous
 attach after `notifications/initialized`. Run the target Lisp first; the
 bridge does not start a VLM.
 
+### Local runtime preflight
+
+`genera-launch.lisp` provides read-only host diagnostics for an explicitly
+configured local WSL runtime. Remote endpoints use attach-only mode.
+Configuration is validated before MCP dispatch; filesystem inspection is
+performed only when `genera-preflight` is called.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GENERA_RUNTIME_MODE` | `attach` | `attach` or `local` |
+| `GENERA_AUTOSTART` | `false` | `true` permits local launch; `false` denies it |
+| `GENERA_VLM_ROOT` | unset | Absolute WSL working directory; required locally |
+| `GENERA_VLM_EXECUTABLE` | `genera` | VLM executable pathname |
+| `GENERA_VLM_WORLD` | unset | Existing boot-enabled world; required locally |
+| `GENERA_VLM_PARTITION` | unset | Existing FEP partition; required locally |
+| `GENERA_VLM_DEBUGGER` | `VLM_debugger` | Debugger executable pathname |
+| `GENERA_VLM_USER` | unset | Expected non-root WSL account; required locally |
+| `GENERA_VLM_NETWORK` | unset | Preconfigured TAP argument; required locally |
+| `GENERA_STATE_DIR` | XDG state root plus `lisp-mcp` | Private Linux state directory |
+| `GENERA_VLM_LOG` | `vlm.log` in the state directory | VLM log destination |
+
+The default state root is `XDG_STATE_HOME`, or `~/.local/state` when unset.
+Root, state, and log paths must be absolute Unix paths. Executable, world,
+partition, and debugger paths may be absolute or relative to the VLM root.
+Wildcards and Windows path syntax are rejected. Paths containing spaces
+remain single arguments; existing symlinks resolve to canonical paths.
+
+Local mode requires the Genera profile, protocol v1, and port 8888.
+`GENERA_HOST` must exactly match the guest IPv4 in the network argument:
+
+```text
+TAP:IPv4;mask=IPv4;gateway=IPv4;preconfiguredTAP=yes
+```
+
+The argument is preserved verbatim, including its guest netmask.
+Attach-only mode rejects autostart permission and does not inspect local
+runtime files. Configure and inspect from the host Lisp:
+
+```lisp
+(lisp-mcp::configure)
+(lisp-mcp::genera-preflight)
+```
+
+The returned property list includes `:ok`, `:launch-permitted`, canonical
+`:paths`, working `:root`, structured `:argv`, environment facts, TAP
+ownership, log metadata, and named `:checks`. Failed checks carry stable
+codes such as `:missing-executable`, `:missing-world`, `:wrong-user`,
+`:missing-display`, and `:tap-inaccessible`. `:argv` is NIL on failure.
+The fixed arguments retain VM size 2000, the debugger/world/network/FEP
+options, and foreground/background colors `#F0EDCC` and `#02343F`.
+
+Preflight checks regular files and permissions, the VLM's Linux ELF64
+x86-64 header, the actual WSL user, local X11 socket access, persistent TAP
+flags and owner/group access, `/dev/net/tun`, and log/state locations.
+All configured TAP owner and group restrictions must match, as required
+by the [Linux TAP driver](https://github.com/torvalds/linux/blob/v6.18/drivers/net/tun.c#L481).
+The check does not assume privileged network capabilities.
+It rejects log aliases of runtime files, including hard links. A missing
+state/log directory may be reported ready when its existing ancestor is
+writable; inspection does not create it. Existing state directories must
+be private and owned by the current user.
+
+`:launch-permitted` is a prerequisite verdict, not process ownership or
+an instruction to launch. Preflight starts no process, contacts no Genera
+endpoint, attaches no TAP device, runs no sudo, changes no display setting,
+and never saves or overwrites a world. Socket/TAP metadata checks do not
+prove display authentication, guest routing, or listener readiness.
+
 ### Genera profile
 
 For a listener explicitly configured for version 1, use:
@@ -599,6 +667,7 @@ python3 tests/stdio.py
 python3 tests/deadlines.py
 python3 tests/reconnect.py
 python3 tests/boot.py
+python3 tests/preflight.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -673,6 +742,21 @@ world; the check then requires a different boot ID. This runner does not
 launch, reboot, load sources, or save a world. It verifies repeated hook
 calls retain the worker, locks, service, and single hook registration;
 contained failures permit retry; a new TCP connection retains identity.
+
+The preflight runner uses temporary filesystem fixtures and explicit OS
+snapshots to check missing files, permissions, user/display/TAP failures,
+local versus attach-only policy, canonical argv, private state, and log
+aliases. It verifies that inspection leaves saved-file contents and
+metadata unchanged and creates no state/log files. To inspect a real WSL
+runtime after setting its local runtime variables:
+
+```sh
+python3 tests/preflight.py --live-runtime \
+  PreflightChecks.test_actual_wsl_prerequisites
+```
+
+This check inspects the configured host runtime without launching or
+rebooting Genera and needs no computer control.
 
 To check structured evaluation and recovery on a running legacy listener:
 

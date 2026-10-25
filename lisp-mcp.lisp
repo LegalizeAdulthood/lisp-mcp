@@ -95,6 +95,31 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
                                    supported)))
     value))
 
+(defvar *genera-runtime* nil)
+(defparameter *genera-launch-source* (merge-pathnames "genera-launch.lisp" *load-truename*))
+
+(defun genera-load-launch-module ()
+  (unless (fboundp 'genera-launch-preflight) (load *genera-launch-source*)))
+
+(defun genera-configured-runtime (profile protocol host port)
+  ;; Keep optional POSIX inspection out of the ordinary attach-only load path.
+  (when (or (fboundp 'genera-runtime-configuration)
+            (some #'uiop:getenv
+                  '("GENERA_RUNTIME_MODE" "GENERA_AUTOSTART" "GENERA_VLM_ROOT"
+                    "GENERA_VLM_EXECUTABLE" "GENERA_VLM_WORLD" "GENERA_VLM_PARTITION"
+                    "GENERA_VLM_DEBUGGER" "GENERA_VLM_USER" "GENERA_VLM_NETWORK"
+                    "GENERA_STATE_DIR" "GENERA_VLM_LOG")))
+    (genera-load-launch-module)
+    (funcall (symbol-function 'genera-runtime-configuration) profile protocol host port)))
+
+(defun genera-preflight (&optional runtime)
+  "Inspect local launch prerequisites on demand, without starting a VLM."
+  (genera-load-launch-module)
+  (funcall (symbol-function 'genera-launch-preflight)
+           (or runtime *genera-runtime*
+               (funcall (symbol-function 'genera-runtime-configuration)
+                        *profile* *genera-protocol* *genera-host* *genera-port*))))
+
 (defun configure ()
   "Validate all consumed settings before entering the MCP loop or doing I/O."
   (let ((profile (configuration-choice "LISP_MCP_PROFILE" "generic" '("generic" "genera")))
@@ -121,7 +146,8 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
     (when (and (or token world) (not (string= profile "genera")))
       (configuration-error (if token "GENERA_TOKEN" "GENERA_EXPECTED_WORLD")
                            "requires the genera profile and protocol v1"))
-    (setf *profile* profile
+    (setf *genera-runtime* (genera-configured-runtime profile protocol genera-host genera-port)
+          *profile* profile
           *genera-protocol* protocol
           *genera-host* genera-host
           *genera-port* genera-port
