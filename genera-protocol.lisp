@@ -8,14 +8,15 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file :run-tests))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
     :stale-generation :service-unavailable :package-not-found :reader-error
     :evaluation-error :busy :worker-unavailable :request-id-conflict
     :interrupted :interrupt-pending :interrupt-refused :request-not-active
-    :file-error :load-error :compile-error :source-mismatch :transfer-error))
+    :file-error :load-error :compile-error :source-mismatch :transfer-error
+    :unsupported-runner :test-runner-error :test-report-error :test-failure))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -29,6 +30,8 @@
     :source-size :source-hash :file-error :load-error :source-mismatch
     :compile-file :output-path :compile-completed :warnings-p :failure-p :loaded :compile-error
     :source-transfer :transfer :source-text :temporary-path :cleanup :transfer-error
+    :run-tests :runner :test-runners :test-status :passed :passed-count :failed-count
+    :unsupported-runner :test-runner-error :test-report-error :test-failure
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
     :interrupted :unknown :unsupported-operation :invalid-request
@@ -174,6 +177,13 @@
     (:text (stringp value))
     (:nonempty-text (and (stringp value) (plusp (length value))))
     (:source-path (and (stringp value) (<= 1 (length value) 4096)))
+    (:runner (and (stringp value) (<= 1 (length value) 128)
+                  (every (lambda (ch) (<= 33 (char-code ch) 126)) value)))
+    (:runner-names (and (listp value) (<= 1 (length value) 32)
+                        (member "form" value :test #'equal)
+                        (= (length value) (length (remove-duplicates value :test #'equal)))
+                        (every (lambda (name) (mcp-v1-type-p name :runner)) value)))
+    (:test-status (member value '(:passed :failed :unknown)))
     (:transfer-text (and (stringp value) (<= (length value) 65536)
                          (every (lambda (ch) (or (<= 32 (char-code ch) 126)
                                                  (member (char-code ch) '(9 10)))) value)))
@@ -210,6 +220,7 @@
              ((:status :reset-listener-context) '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
+             (:run-tests '(:boot-id :service-id :package :runner :form :timeout-ms :print-level :print-length))
              (:load '(:boot-id :service-id :package :timeout-ms :print-level :print-length
                       :original-path :path-kind :host-path :path :source-root :source-size :source-hash
                       :transfer :source-text))
@@ -224,7 +235,7 @@
              :history-limit :history-count :history-byte-limit :history-bytes
              :history-evictions :interrupt-state :original-path :path-kind :host-path :path :source-root
              :resolved-path :resolved-root :load :output-path :compile-completed :warnings-p :failure-p :loaded
-             :transfer :temporary-path :cleanup)))
+             :transfer :temporary-path :cleanup :runner :test-runners :test-status :passed-count :failed-count)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -236,6 +247,11 @@
            (unless (getf object key) (mcp-v1-error "Missing generation identity"))))
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
+       (when (eq (getf object :op) :run-tests)
+         (unless (and (mcp-v1-type-p (getf object :runner) :runner)
+                      (if (equal (getf object :runner) "form")
+                          (stringp (getf object :form)) (not (mcp-v1-present-p object :form))))
+           (mcp-v1-error "Tests require a runner and a form only for the form runner")))
        (when (member (getf object :op) '(:load :compile-file))
          (when (or (getf object :transfer) (mcp-v1-present-p object :source-text))
            (unless (and (eq (getf object :transfer) t)
@@ -263,6 +279,20 @@
       (:response
        (mcp-v1-plist object (append '(:version :id) response-keys)
                      '(:version :id :ok))
+       (when (some (lambda (key) (mcp-v1-present-p object key)) '(:runner :test-status :passed-count :failed-count))
+         (unless (and (mcp-v1-type-p (getf object :runner) :runner)
+                      (mcp-v1-type-p (getf object :test-status) :test-status)
+                      (eq (mcp-v1-present-p object :passed-count) (mcp-v1-present-p object :failed-count)))
+           (mcp-v1-error "Incomplete test outcome"))
+         (when (mcp-v1-present-p object :passed-count)
+           (unless (and (mcp-v1-type-p (getf object :passed-count) :nonnegative)
+                        (mcp-v1-type-p (getf object :failed-count) :nonnegative)
+                        (eq (getf object :test-status) (if (zerop (getf object :failed-count)) :passed :failed)))
+             (mcp-v1-error "Inconsistent test counts")))
+         (when (or (and (getf object :ok) (eq (getf object :test-status) :failed))
+                   (and (eq (getf (getf object :error) :code) :test-failure)
+                        (not (eq (getf object :test-status) :failed))))
+           (mcp-v1-error "Inconsistent test failure")))
        (when (some (lambda (key) (mcp-v1-present-p object key))
                    '(:original-path :path-kind :host-path :path :source-root :resolved-path :resolved-root))
          (dolist (key '(:original-path :path-kind :path :source-root))
@@ -334,6 +364,8 @@
               (:boot-id . :id) (:service-id . :id) (:world . :nonempty-text)
               (:expected-world . :nonempty-text)
               (:package . :text) (:busy . :boolean) (:active-request-id . :id)
+              (:runner . :runner) (:test-runners . :runner-names) (:test-status . :test-status)
+              (:passed-count . :nonnegative) (:failed-count . :nonnegative)
               (:original-path . :source-path) (:path-kind . :nonempty-text)
               (:host-path . :source-path) (:path . :source-path) (:source-root . :source-path)
               (:resolved-path . :source-path) (:resolved-root . :source-path)
@@ -370,13 +402,16 @@
     (when (and (getf request :expected-world)
                (not (string= (getf request :expected-world) (getf response :world))))
       (mcp-v1-error "Hello world mismatch")))
+  (when (and (getf response :ok) (member :run-tests (getf response :features))
+             (not (mcp-v1-type-p (getf response :test-runners) :runner-names)))
+    (mcp-v1-error "Test capability requires an explicit runner catalogue"))
   response)
 
 (defun mcp-v1-check-eval-response (request response)
   "Check execution identity and the complete terminal result contract."
   (mcp-v1-validate request :request)
   (mcp-v1-validate response :response)
-  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file))
+  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests))
                (every (lambda (key) (equal (getf request key) (getf response key)))
                       '(:id :boot-id :service-id)))
     (mcp-v1-error "Eval response identity mismatch"))
@@ -404,6 +439,10 @@
         (unless (mcp-v1-present-p response key) (mcp-v1-error "Missing compilation outcome")))
       (unless (equal (getf request :load) (getf response :load))
         (mcp-v1-error "Compile response load option mismatch")))
+    (when (eq (getf request :op) :run-tests)
+      (unless (and (equal (getf request :runner) (getf response :runner))
+                   (mcp-v1-present-p response :test-status))
+        (mcp-v1-error "Test response runner or outcome mismatch")))
     (when (and (not (getf response :ok))
                (not (mcp-v1-present-p (getf response :error) :condition-type)))
       (mcp-v1-error "Missing execution condition type")))

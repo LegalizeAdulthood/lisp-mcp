@@ -10,7 +10,7 @@ The default `generic` profile provides up to three tools:
 The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
 `genera_recover_session`, `genera_reset_listener_context`, `genera_load`,
-`genera_compile_file`, `genera_eval`, and the
+`genera_compile_file`, `genera_run_tests`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 It additionally exposes `genera_interrupt` after a validated listener
 hello advertises targeted interruption.
@@ -329,7 +329,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the nine
+does not expose host or Swank tools. Tool discovery advertises the ten
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -584,6 +584,65 @@ identify the actual generated native source. Transfer setup/write errors
 return `transfer-error`; subsequent verification, load, and compile errors
 retain their usual codes and common diagnostic data.
 
+### Tracked test execution
+
+`genera_run_tests` runs one explicit `form` or one configured named
+adapter. Optional `runner` defaults to `"form"`, which requires exactly
+one form. A named runner takes no form. Optional `package`, `print_level`,
+`print_length`, and positive `timeout_ms` match eval; the deadline is
+enforced by the host and does not cancel native execution.
+
+For a named adapter, set `*mcp-test-runners*` in `COMMON-LISP-USER` before
+attaching clients. Entries pair case-sensitive names with zero-argument
+function objects, for example:
+
+```lisp
+(setq *mcp-test-runners* (list (cons "project" #'run-project-tests)))
+```
+
+`"form"` is reserved. Names contain 1..128 printable non-space ASCII
+characters. The first 31 configured entries are considered; invalid
+entries are not advertised. Function symbols must be resolved explicitly
+with `#'`; user-supplied names are never interned or read as Lisp.
+Updated listeners advertise `:run-tests` and a bounded `:test-runners`
+catalogue in hello/status. Reattach clients after changing adapters.
+`genera_session_status` exposes the verified catalogue as `test_runners`.
+An unsupported name fails before native acceptance or ledger publication.
+Admission captures the selected function, so later configuration changes
+cannot select a different function for that accepted request.
+
+A runner may return this explicit report as its first value:
+
+```lisp
+'(:test-status :passed :passed-count 4 :failed-count 0)
+```
+
+`test-status` is `:passed`, `:failed`, or `:unknown`. Counts are optional;
+when supplied, both must be nonnegative 64-bit integers and agree with
+status: zero failures means passed, positive failures means failed.
+The report must start with `:test-status`, contain only those three keys,
+and have no duplicates. Malformed reports produce `test-report-error`.
+Adapters should translate their framework's actual results into this
+contract; the bridge does not scrape output or assume a framework API.
+
+Results retain common values, stdout/stderr, warnings, conditions,
+truncation flags, package, elapsed time, and request/generation identity.
+They add `runner`, `test_status`, and numeric `passed_count`/`failed_count`
+only when explicitly reported. A reported failure produces `test-failure`
+and a failed tool result while retaining reported counts and values.
+A signaled runner error produces `test-runner-error`; unreported test
+status remains unknown. An ordinary return such as T, NIL, or numeric
+values means execution completed, with `test_status: "unknown"` and no
+invented counts. Execution success alone does not prove tests passed.
+
+Test runs share the world-wide execution worker, bounded captures, and
+retained ledger with eval/load/compile. Active or uncertain work blocks
+another execution. A timeout or disconnect preserves the original ID;
+lookup and reconnect never repeat tests automatically. Retained duplicate
+IDs return the same result even after an adapter is removed. Test forms
+and adapters can change image state. Closing the client leaves accepted
+tests and Genera running.
+
 ### Listener context reset
 
 `genera_reset_listener_context` requires the current `boot_id` and
@@ -621,7 +680,7 @@ execution deadline.
 The tool appears only after the listener advertises `:interrupt` in a
 verified hello. The Genera profile advertises changing tool lists and
 sends `notifications/tools/list_changed` when support changes. Refresh
-`tools/list` after that notification. Older listeners retain the nine
+`tools/list` after that notification. Older listeners retain the ten
 base tools; generic host/Swank discovery is unchanged.
 See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
 
@@ -1097,6 +1156,7 @@ python3 tests/paths.py
 python3 tests/loading.py
 python3 tests/compiling.py
 python3 tests/transfer.py
+python3 tests/runners.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1306,6 +1366,17 @@ GENERA_HOST=genera.example GENERA_SOURCE_TRANSFER_ROOT='SYS:TRANSFER;' \
 The native test requires transfer initially disabled and temporarily sets
 the listener root to the supplied existing directory, restoring NIL on
 exit. It leaves uniquely named native fixture files for explicit cleanup.
+
+For native test reports, named adapters, bounded diagnostics, and
+timeout/disconnect recovery without replay:
+
+```sh
+GENERA_HOST=genera.example python3 tests/runners.py --live-v1
+```
+
+This runner temporarily adds a unique adapter and restores the prior
+configuration. It preserves saved worlds and leaves harmless test state
+in the running image.
 
 To check structured evaluation and recovery on a running legacy listener:
 

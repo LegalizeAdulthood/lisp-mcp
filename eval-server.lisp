@@ -384,6 +384,8 @@ does not recognize."
          (reset (eq (getf request :op) :reset-listener-context))
          (loading (member (getf request :op) '(:load :compile-file)))
          (compiling (eq (getf request :op) :compile-file))
+         (testing (eq (getf request :op) :run-tests))
+         (test-result (list :test-status :unknown :counts-known nil :passed-count nil :failed-count nil))
          (compilation (list :compile-completed nil :warnings-p nil :failure-p t :loaded nil :output-path nil))
          (transfer (list :temporary-path nil))
          (resolved nil)
@@ -407,8 +409,9 @@ does not recognize."
            (let ((*package* (or (find-package package-name)
                                (error "No package named ~A" package-name))))
              (setf package-name (package-name *package*) phase :reader-error)
-             (let ((form (unless (or reset loading) (mcp-read-eval-form (getf request :form)))))
-               (setf phase (if loading :file-error :evaluation-error))
+             (let ((form (unless (or reset loading (and testing (not (equal (getf request :runner) "form"))))
+                           (mcp-read-eval-form (getf request :form)))))
+               (setf phase (cond (loading :file-error) (testing :test-runner-error) (t :evaluation-error)))
                (ansi-common-lisp:handler-bind
                    ((ansi-common-lisp:warning
                       (lambda (condition)
@@ -422,6 +425,18 @@ does not recognize."
                                (multiple-value-list
                                 (cond
                                   (reset (setf *mcp-eval-package* *package*) package-name)
+                                  (testing
+                                   (let* ((*mcp-interruptible-job* job)
+                                          (results (multiple-value-list
+                                                    (if (equal (getf request :runner) "form") (eval form)
+                                                        (funcall (getf job :test-function))))))
+                                     (setf phase :test-report-error)
+                                     (mcp-note-test-report (first results) test-result)
+                                     (when (eq (getf test-result :test-status) :failed)
+                                       (setf printed (mapcar (lambda (value) (mcp-render value budget)) results)
+                                             phase :test-failure)
+                                       (error "Test runner reported failure"))
+                                     (values-list results)))
                                   (loading
                                    (mcp-call-with-source (getf request :source-root)
                                     (if (getf request :transfer)
@@ -468,6 +483,7 @@ does not recognize."
                       :replaced (or (mcp-budget-replaced budget)
                                     (mcp-budget-replaced diagnostics)))
                 (mcp-load-metadata request resolved compilation transfer)
+                (mcp-test-metadata request test-result)
                 (when failure (list :error failure)))))))
 
 ;;; --- Server ---
@@ -478,6 +494,8 @@ does not recognize."
   "Explicit listener mode: :LEGACY eval or :V1 data envelopes.")
 (defvar *mcp-transfer-root* nil
   "Explicit existing native directory for optional source transfer; NIL disables it.")
+(defvar *mcp-test-runners* nil
+  "Alist of runner name strings and zero-argument function objects. FORM is reserved.")
 (defconstant +mcp-listener-source-version+ 1)
 (defvar *mcp-autostart* t
   "Bind NIL while loading definitions without starting runtime resources.")
@@ -529,8 +547,47 @@ does not recognize."
   ;; Property order is irrelevant; omission and an explicit default differ.
   (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
                     :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load
-                    :transfer :source-text)
+                    :transfer :source-text :runner)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
+
+(defun mcp-test-runner (name)
+  (if (equal name "form") :form
+      (loop for entries = *mcp-test-runners* then (cdr entries) repeat 31
+            while (consp entries) for entry = (car entries)
+            when (and (consp entry) (mcp-v1-type-p (car entry) :runner)
+                      (equal name (car entry)) (not (symbolp (cdr entry)))
+                      (functionp (cdr entry))) return (cdr entry))))
+
+(defun mcp-test-runner-names ()
+  (remove-duplicates
+   (cons "form" (loop for entries = *mcp-test-runners* then (cdr entries) repeat 31
+                     while (consp entries) for entry = (car entries)
+                     when (and (consp entry) (mcp-v1-type-p (car entry) :runner)
+                               (not (symbolp (cdr entry))) (functionp (cdr entry))) collect (car entry))) :test #'equal))
+
+(defun mcp-note-test-report (value state)
+  ;; An ordinary Lisp value, including T or numeric values, proves no counts.
+  (when (and (consp value) (eq (car value) :test-status))
+    (mcp-v1-check-tree value)
+    (mcp-v1-plist value '(:test-status :passed-count :failed-count) '(:test-status))
+    (unless (and (mcp-v1-type-p (getf value :test-status) :test-status)
+                 (eq (mcp-v1-present-p value :passed-count) (mcp-v1-present-p value :failed-count)))
+      (error "Invalid test report status or count pair"))
+    (when (mcp-v1-present-p value :passed-count)
+      (unless (and (mcp-v1-type-p (getf value :passed-count) :nonnegative)
+                   (mcp-v1-type-p (getf value :failed-count) :nonnegative)
+                   (eq (getf value :test-status) (if (zerop (getf value :failed-count)) :passed :failed)))
+        (error "Test report counts do not agree with its status")))
+    (setf (getf state :test-status) (getf value :test-status)
+          (getf state :counts-known) (mcp-v1-present-p value :passed-count)
+          (getf state :passed-count) (getf value :passed-count)
+          (getf state :failed-count) (getf value :failed-count))))
+
+(defun mcp-test-metadata (request &optional state)
+  (when (eq (getf request :op) :run-tests)
+    (append (list :runner (getf request :runner) :test-status (getf state :test-status :unknown))
+            (when (getf state :counts-known)
+              (list :passed-count (getf state :passed-count) :failed-count (getf state :failed-count))))))
 
 (defun mcp-load-metadata (request &optional proof compilation transfer)
   (when (member (getf request :op) '(:load :compile-file))
@@ -618,13 +675,17 @@ does not recognize."
         (return-from mcp-submit-eval
           (mcp-v1-failure request :unsupported-operation
                           "Remote execution deadlines are not available" service))))
-    (let ((active (or (mcp-active-request-id)
+    (let ((test-function (when (eq (getf request :op) :run-tests) (mcp-test-runner (getf request :runner))))
+          (active (or (mcp-active-request-id)
                       (getf (getf (getf client :execution) :request) :id)))
           (code (cond ((or *mcp-worker-failed* (not (mcp-worker-live-p)))
                        :worker-unavailable)
                       ((or (mcp-execution-busy-p) (getf client :execution)) :busy)
                       ((or (null client) (getf client :closed)
                            (not (getf service :running))) :service-unavailable))))
+      (when (and (eq (getf request :op) :run-tests) (null test-function))
+        (return-from mcp-submit-eval
+          (mcp-v1-failure request :unsupported-runner "Test runner is not configured" service)))
       (when code
         (return-from mcp-submit-eval
           (if legacy
@@ -633,7 +694,7 @@ does not recognize."
               (append (mcp-v1-failure request code "Execution was not accepted" service)
                       (when active (list :active-request-id active))))))
       (let ((job (list :request request :service service :client client
-                       :legacy legacy :state :pending :result nil
+                       :legacy legacy :state :pending :result nil :test-function test-function
                        :interrupt-state nil :interrupt-delivered nil)))
         (unless legacy
           (let ((entry (list :id (getf request :id)
@@ -703,9 +764,10 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file)
+                :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests)
                                   (when *mcp-transfer-root* '(:source-transfer))
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
+                :test-runners (mcp-test-runner-names)
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
                 :history-count (length (getf service :history))
@@ -750,7 +812,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file))
+    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
@@ -903,6 +965,7 @@ does not recognize."
         (append (mcp-v1-failure request :evaluation-error
                                 (mcp-render condition budget nil) (getf job :service))
                 (mcp-load-metadata request)
+                (mcp-test-metadata request)
                 (list :request-state :failed :values nil :value-count 0
                       :stdout "" :stderr "" :warnings nil :package ""
                       :elapsed-ms 0 :truncated (mcp-budget-truncated budget)
