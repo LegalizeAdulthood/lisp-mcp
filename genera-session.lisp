@@ -87,7 +87,7 @@
     (setf (genera-request-failure request)
           (make-condition 'genera-session-error :kind :timeout :session session
                           :format-control "Host wait deadline expired; Genera work was not stopped"))
-    (if (eq (genera-request-state request) :queued)
+    (if (member (genera-request-state request) '(:queued :preparing))
         (progn
           (setf (genera-request-state request) :not-submitted
                 (genera-session-queue session) (delete request (genera-session-queue session)))
@@ -116,7 +116,7 @@
     (dolist (request (loop for value being the hash-values of (genera-session-pending session)
                           collect value))
       (unless (genera-request-failure request) (setf (genera-request-failure request) condition))
-      (if (eq (genera-request-state request) :queued)
+      (if (member (genera-request-state request) '(:queued :preparing))
           (progn (setf (genera-request-state request) :not-submitted)
                  (genera-release session request))
           (setf (genera-request-state request) :unresolved)))
@@ -131,7 +131,7 @@
                  '(:id :boot-id :service-id))
     (mcp-v1-error "Response identity does not match its request"))
   (case (getf request :op)
-    ((:eval :reset-listener-context) (mcp-v1-check-eval-response request response))
+    ((:eval :reset-listener-context :load) (mcp-v1-check-eval-response request response))
     (:status
      (when (getf response :ok)
        (dolist (key '(:world :package :busy :features))
@@ -449,14 +449,16 @@
       (error (or (genera-session-failure session)
                  (make-condition 'genera-session-error :kind :closed
                                  :format-control "Genera session is closed"))))
-    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context))
+    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load))
       (genera-session-error :unsupported "Unsupported session operation"))
     (unless (member operation (getf (genera-session-hello session) :features))
       (genera-session-error :unsupported "Listener does not advertise this operation"))
     (let ((expected (getf fields :expected-generation)))
       (when expected (apply #'genera-check-generation session expected))
       (remf fields :expected-generation))
-    (let* ((execution (not (null (member operation '(:eval :reset-listener-context)))))
+    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load)))))
+           (deferred (getf fields :defer))
+           (defer-option (remf fields :defer))
            (idle-only (getf fields :idle-only))
            (idle-option (remf fields :idle-only))
            (timeout (or (getf fields :host-timeout) (if execution *genera-timeout*
@@ -468,8 +470,9 @@
                                                (incf (genera-session-counter session)))
                                    :op operation :boot-id (getf hello :boot-id)
                                    :service-id (getf hello :service-id)) fields))
-           (payload (string-to-octets (mcp-v1-encode envelope :request))))
-      (declare (ignore ignored idle-option))
+           (payload (unless deferred (string-to-octets (mcp-v1-encode envelope :request)))))
+      (declare (ignore ignored idle-option defer-option))
+      (when (and deferred (not (eq operation :load))) (error "Only file execution can be prepared"))
       (unless (and (realp timeout) (> timeout 0)) (error "Host timeout must be positive"))
       (when (and idle-only
                  (or (genera-session-execution session)
@@ -480,14 +483,44 @@
                 (>= (genera-session-controls session) +genera-control-limit+))
         (genera-session-error :busy "Session request capacity is occupied"))
       (let ((request (%make-genera-request :envelope envelope :payload payload
+                                          :state (if deferred :preparing :queued)
                                           :execution-p execution :deadline (+ (genera-now) timeout))))
-        (setf (gethash (getf envelope :id) (genera-session-pending session)) request
-              (genera-session-queue session) (nconc (genera-session-queue session) (list request)))
+        (setf (gethash (getf envelope :id) (genera-session-pending session)) request)
+        (unless deferred
+          (setf (genera-session-queue session) (nconc (genera-session-queue session) (list request))))
         (if execution (setf (genera-session-execution session) request
                             (genera-session-status-stale session) t)
             (incf (genera-session-controls session)))
         (sb-thread:condition-broadcast (genera-session-changed session))
         request))))
+
+(defun genera-cancel-preparation (session request kind message)
+  "Release only a request that has never been queued for transmission."
+  (sb-thread:with-mutex ((genera-session-lock session))
+    (when (eq (genera-request-state request) :preparing)
+      (setf (genera-request-failure request)
+            (make-condition 'genera-session-error :kind kind :session session
+                            :format-control "~A" :format-arguments (list message))
+            (genera-request-state request) :not-submitted)
+      (genera-release session request)
+      (sb-thread:condition-broadcast (genera-session-changed session)))))
+
+(defun genera-complete-preparation (session request fields)
+  (sb-thread:with-mutex ((genera-session-lock session))
+    (genera-expire-request session request)
+    (when (genera-request-failure request) (error (genera-request-failure request)))
+    (unless (and (eq request (genera-session-execution session))
+                 (eq (genera-request-state request) :preparing)
+                 (eq (genera-session-state session) :ready) (not (genera-session-stop session)))
+      (genera-session-error :closed "File preparation no longer owns execution"))
+    (let* ((old (genera-request-envelope request))
+           (envelope (append old fields)))
+      (genera-check-generation session (getf old :boot-id) (getf old :service-id))
+      (setf (genera-request-payload request) (string-to-octets (mcp-v1-encode envelope :request))
+            (genera-request-envelope request) envelope (genera-request-state request) :queued
+            (genera-session-queue session) (nconc (genera-session-queue session) (list request)))
+      (sb-thread:condition-broadcast (genera-session-changed session))))
+  request)
 
 (defun genera-await-request (session request)
   "Wait for this handle only; the socket owner can complete other controls."
@@ -750,6 +783,9 @@
                                    (genera-session-history session))))
                (result (getf response :result)))
           (cond (result
+                 (when (and known (eq (getf (genera-request-envelope known) :op) :load))
+                   (genera-session-checked
+                    (lambda () (mcp-v1-check-eval-response (genera-request-envelope known) result))))
                  (if known
                      (progn
                        (when (and (genera-request-response known)

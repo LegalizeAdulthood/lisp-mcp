@@ -273,12 +273,14 @@ does not recognize."
 
 (defvar *mcp-interruptible-job* nil)
 
-(defun mcp-probe-source (root target)
+(defun mcp-call-with-source (root target &optional function)
   "Read a source file only after canonical native containment is checked."
   (let* ((directory (namestring (send (fs:parse-pathname root) :translated-pathname)))
          (file (namestring (truename (send (fs:parse-pathname target) :translated-pathname))))
          (unix (find #\/ directory))
          (a 1) (b 0) (size 0) (raw 0) (cr nil))
+    (when (or (> (length directory) 4096) (> (length file) 4096))
+      (error "Canonical source pathname exceeds 4096 characters"))
     (unless (and (plusp (length directory)) (find (char directory (1- (length directory))) "/>;")
                  (< (length directory) (length file))
                  (if unix (string= directory file :end2 (length directory))
@@ -295,8 +297,16 @@ does not recognize."
                (unless (and cr (= code 10))
                  (incf size)
                  (setf a (mod (+ a (if (= code 13) 10 code)) 65521) b (mod (+ b a) 65521)))
-               (setf cr (= code 13))))
-    (list directory file size (+ (ash b 16) a))))
+               (setf cr (= code 13)))
+      (let ((proof (list directory file size (+ (ash b 16) a))))
+        (if function
+            (progn
+              (unless (file-position in 0) (error "Source stream cannot be rewound"))
+              (funcall function in proof))
+            proof)))))
+
+(defun mcp-probe-source (root target)
+  (mcp-call-with-source root target))
 
 (defun mcp-v1-eval (request service &optional job)
   "Read, evaluate, and print one authorized form with bounded retained output."
@@ -311,6 +321,8 @@ does not recognize."
          (err (mcp-capture-stream stderr))
          (terminal (make-two-way-stream (make-string-input-stream "") err))
          (reset (eq (getf request :op) :reset-listener-context))
+         (loading (eq (getf request :op) :load))
+         (resolved nil)
          (package-name (if reset (package-name *mcp-default-package*)
                            (or (getf request :package) (package-name *mcp-eval-package*))))
          (start (get-internal-real-time))
@@ -331,8 +343,8 @@ does not recognize."
            (let ((*package* (or (find-package package-name)
                                (error "No package named ~A" package-name))))
              (setf package-name (package-name *package*) phase :reader-error)
-             (let ((form (unless reset (mcp-read-eval-form (getf request :form)))))
-               (setf phase :evaluation-error)
+             (let ((form (unless (or reset loading) (mcp-read-eval-form (getf request :form)))))
+               (setf phase (if loading :file-error :evaluation-error))
                (ansi-common-lisp:handler-bind
                    ((ansi-common-lisp:warning
                       (lambda (condition)
@@ -343,9 +355,21 @@ does not recognize."
                  (setf printed
                        (mapcar (lambda (value) (mcp-render value budget))
                                (multiple-value-list
-                                (if reset
-                                    (progn (setf *mcp-eval-package* *package*) package-name)
-                                    (let ((*mcp-interruptible-job* job)) (eval form)))))))))))
+                                (cond
+                                  (reset (setf *mcp-eval-package* *package*) package-name)
+                                  (loading
+                                   (mcp-call-with-source (getf request :source-root) (getf request :path)
+                                    (lambda (stream proof)
+                                      (setf resolved proof)
+                                      (when (and (mcp-v1-present-p request :source-size)
+                                                 (not (equal (cddr proof)
+                                                       (list (getf request :source-size) (getf request :source-hash)))))
+                                        (setf phase :source-mismatch)
+                                        (error "Host and Genera source fingerprints differ"))
+                                      (setf phase :load-error)
+                                      (let ((*mcp-interruptible-job* job))
+                                        (load stream :verbose nil :print nil :set-default-pathname nil)))))
+                                  (t (let ((*mcp-interruptible-job* job)) (eval form))))))))))))
       (let* ((diagnostics (make-mcp-budget :remaining 4096))
              (interrupted (and (not success) (getf job :interrupt-delivered)
                                (typep outcome 'sys:abort)))
@@ -368,6 +392,7 @@ does not recognize."
                                      (mcp-budget-truncated diagnostics))
                       :replaced (or (mcp-budget-replaced budget)
                                     (mcp-budget-replaced diagnostics)))
+                (mcp-load-metadata request resolved)
                 (when failure (list :error failure)))))))
 
 ;;; --- Server ---
@@ -425,8 +450,15 @@ does not recognize."
 
 (defun mcp-request-identity (request)
   ;; Property order is irrelevant; omission and an explicit default differ.
-  (loop for key in '(:op :form :package :timeout-ms :print-level :print-length)
+  (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
+                    :original-path :path-kind :host-path :path :source-root :source-size :source-hash)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
+
+(defun mcp-load-metadata (request &optional proof)
+  (when (eq (getf request :op) :load)
+    (append (loop for key in '(:original-path :path-kind :host-path :path :source-root)
+                  when (mcp-v1-present-p request key) append (list key (getf request key)))
+            (when proof (list :resolved-root (first proof) :resolved-path (second proof))))))
 
 (defun mcp-ensure-ledger (service)
   ;; Extend an older live service in place; readers retain this same plist.
@@ -583,7 +615,7 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features (append '(:status :request-status :eval :reset-listener-context)
+                :features (append '(:status :request-status :eval :reset-listener-context :load)
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
@@ -629,7 +661,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((member (getf request :op) '(:eval :reset-listener-context))
+    ((member (getf request :op) '(:eval :reset-listener-context :load))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
@@ -781,6 +813,7 @@ does not recognize."
              (budget (make-mcp-budget :remaining 4096)))
         (append (mcp-v1-failure request :evaluation-error
                                 (mcp-render condition budget nil) (getf job :service))
+                (mcp-load-metadata request)
                 (list :request-state :failed :values nil :value-count 0
                       :stdout "" :stderr "" :warnings nil :package ""
                       :elapsed-ms 0 :truncated (mcp-budget-truncated budget)
@@ -980,7 +1013,7 @@ does not recognize."
 ;; them. Native process/lock machinery must not depend on interpreter frames.
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
-        mcp-probe-source
+        mcp-call-with-source mcp-probe-source
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

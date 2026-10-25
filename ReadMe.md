@@ -9,7 +9,8 @@ The default `generic` profile provides up to three tools:
 
 The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
-`genera_recover_session`, `genera_reset_listener_context`, `genera_eval`, and the
+`genera_recover_session`, `genera_reset_listener_context`, `genera_load`,
+`genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 It additionally exposes `genera_interrupt` after a validated listener
 hello advertises targeted interruption.
@@ -328,7 +329,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the seven
+does not expose host or Swank tools. Tool discovery advertises the eight
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -418,8 +419,8 @@ without touching files or connecting during discovery. No source root
 defaults to the VLM directory, process directory, or Windows drive mount.
 
 The internal `genera-resolve-source` API accepts a persistent session,
-`path_kind` (`genera`, `host`, or `relative`), and a path. It supplies the
-mapping layer for subsequent file tools; this change adds no MCP tool.
+`path_kind` (`genera`, `host`, or `relative`), and a path. `genera_load`
+uses the same mapping rules and verifies inside its one load request.
 `host` accepts absolute Unix paths or the configured Windows drive alias.
 `relative` uses forward slashes beneath the host source root. `genera`
 accepts a literal host-qualified logical or native pathname; Genera
@@ -451,6 +452,50 @@ files need canonical containment and readable supported text. The resolver
 does not copy files, start file servers, install mappings in Genera, or
 fall back to transfer. Revalidate immediately before later file execution;
 a path proof does not freeze a file or survive a generation change.
+
+### Verified file loading
+
+`genera_load` requires `path` and explicit `path_kind` (`genera`, `host`,
+or `relative`). Configure the source roots above and establish filesystem
+credentials in Genera first. Optional `package`, `print_level`, and
+`print_length` match eval. Positive `timeout_ms` sets the host wait
+deadline, including local preparation and queue time; its default is
+`GENERA_TIMEOUT`. Updated listeners advertise `:load`; older listeners
+return an unsupported tool failure before any load is sent.
+
+One request ID reserves the host execution slot before local mapping or
+fingerprinting. Preparation runs off the MCP reader, so status, ping, and
+controls remain responsive. Preparation failure, expiry, or EOF before
+transmission reports `not-submitted` and releases only that reservation.
+The local I/O timer ends before runnable work is published. Submission
+rechecks the original generation. Active or uncertain execution blocks
+another eval, reset, or load throughout preparation and execution.
+
+The `:load` envelope uses the shared native worker and retained ledger.
+Before executing source, the worker resolves the actual file, checks
+canonical root containment, reads bounded supported text, and compares
+the host fingerprint when applicable. It rewinds and loads that same
+open stream, without changing the user's default pathname. Path fields
+are bounded to 4096 characters. No probe/eval round trip precedes the
+load, and no file is copied or transferred implicitly.
+
+Results retain the common values, output, warnings, conditions, elapsed
+time, truncation flags, and request/generation identity. They also report
+`original_path`, `path_kind`, mapped `path`, `source_root`, optional
+`host_path`, and actual `resolved_root`/`resolved_path` when known.
+Missing native files produce `file-error`; stale mapped sources produce
+`source-mismatch`; reader or execution failure during load produces
+`load-error`. A failed load can leave definitions or other partial effects.
+Host mapping failures retain the original and attempted paths without
+submitting native work.
+
+A deadline or connection loss after submission leaves the outcome
+uncertain and blocks further execution. Use `genera_request_status`
+with the original identity to reconcile its retained result, or the
+existing explicit recovery workflow. Neither waiting, reconnecting,
+lookup, nor a duplicate retained request automatically reloads a file.
+The optional targeted interrupt also covers the actual load; timeout
+alone does not cancel it.
 
 ### Listener context reset
 
@@ -489,7 +534,7 @@ execution deadline.
 The tool appears only after the listener advertises `:interrupt` in a
 verified hello. The Genera profile advertises changing tool lists and
 sends `notifications/tools/list_changed` when support changes. Refresh
-`tools/list` after that notification. Older listeners retain the seven
+`tools/list` after that notification. Older listeners retain the eight
 base tools; generic host/Swank discovery is unchanged.
 See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
 
@@ -962,6 +1007,7 @@ python3 tests/startup.py
 python3 tests/interrupt.py
 python3 tests/context.py
 python3 tests/paths.py
+python3 tests/loading.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1136,6 +1182,19 @@ GENERA_HOST=genera.example GENERA_SOURCE_ROOT=/srv/source \
   GENERA_SOURCE_WINDOWS_ROOT='C:\source' \
   GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' python3 tests/paths.py --live-v1
 ```
+
+To check actual file loading in a disposable writable native source root:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
+  python3 tests/loading.py --live-v1
+```
+
+The runner creates uniquely named files with overwrite rejection. It
+checks definitions, output, warnings, missing files, load errors, stale
+fingerprints, retained duplicate IDs, and a timed-out load completing
+once. It leaves the new fixture files and definitions in the disposable
+runtime; it does not save a world or overwrite an existing file.
 
 To check structured evaluation and recovery on a running legacy listener:
 

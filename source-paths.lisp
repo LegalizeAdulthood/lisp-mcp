@@ -144,6 +144,19 @@
                (setf cr (= code 13)))
       (list size (+ (ash b 16) a)))))
 
+(defun genera-load-fields (kind original &optional (mapping *genera-source-mapping*))
+  "Prepare local mapping and fingerprint; native verification stays in LOAD."
+  (let* ((path (genera-map-source kind original mapping))
+         (host (genera-source-path-host-path path))
+         (fingerprint (when host
+                        (handler-case (genera-source-fingerprint host)
+                          (error (e) (genera-path-fail path :source-unreadable (princ-to-string e)))))))
+    (values (append (list :original-path original :path-kind kind
+                          :path (genera-source-path-genera-path path)
+                          :source-root (genera-source-mapping-genera-root mapping))
+                    (when host (list :host-path host :source-size (first fingerprint)
+                                     :source-hash (second fingerprint)))) path)))
+
 (defun genera-resolve-source (session kind original &optional (mapping *genera-source-mapping*))
   "Require a tracked native probe before returning a verified pathname."
   (let* ((path (genera-map-source kind original mapping))

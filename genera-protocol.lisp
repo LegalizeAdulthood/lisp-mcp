@@ -8,13 +8,14 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
     :stale-generation :service-unavailable :package-not-found :reader-error
     :evaluation-error :busy :worker-unavailable :request-id-conflict
-    :interrupted :interrupt-pending :interrupt-refused :request-not-active))
+    :interrupted :interrupt-pending :interrupt-refused :request-not-active
+    :file-error :load-error :source-mismatch))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -23,7 +24,9 @@
     :active-request-id :worker-unavailable
     :result :history-limit :history-count :history-byte-limit :history-bytes
     :history-evictions :request-id-conflict
-    :hello :status :eval :request-status :interrupt :reset-listener-context :running :completed :failed
+    :hello :status :eval :request-status :interrupt :reset-listener-context :load :running :completed :failed
+    :original-path :path-kind :host-path :path :source-root :resolved-path :resolved-root
+    :source-size :source-hash :file-error :load-error :source-mismatch
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
     :interrupted :unknown :unsupported-operation :invalid-request
@@ -168,6 +171,7 @@
   (case type
     (:text (stringp value))
     (:nonempty-text (and (stringp value) (plusp (length value))))
+    (:source-path (and (stringp value) (<= 1 (length value) 4096)))
     (:id (and (stringp value) (<= 1 (length value) 128)))
     (:boolean (or (null value) (eq value t)))
     (:nonnegative (and (mcp-v1-integer-p value) (>= value 0)))
@@ -201,13 +205,16 @@
              ((:status :reset-listener-context) '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
+             (:load '(:boot-id :service-id :package :timeout-ms :print-level :print-length
+                      :original-path :path-kind :host-path :path :source-root :source-size :source-hash))
              ((:request-status :interrupt) '(:boot-id :service-id :target-id))))
          (response-keys
            '(:boot-id :service-id :world :package :busy :active-request-id :features :ok
              :request-state :values :value-count :stdout :stderr :warnings
              :elapsed-ms :truncated :replaced :error :target-id :result
              :history-limit :history-count :history-byte-limit :history-bytes
-             :history-evictions :interrupt-state)))
+             :history-evictions :interrupt-state :original-path :path-kind :host-path :path :source-root
+             :resolved-path :resolved-root)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -219,12 +226,35 @@
            (unless (getf object key) (mcp-v1-error "Missing generation identity"))))
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
+       (when (eq (getf object :op) :load)
+         (dolist (key '(:original-path :path-kind :path :source-root))
+           (unless (getf object key) (mcp-v1-error "Incomplete load path")))
+         (unless (member (getf object :path-kind) '("genera" "host" "relative") :test #'equal)
+           (mcp-v1-error "Invalid path kind"))
+         (unless (and (eq (mcp-v1-present-p object :source-size) (mcp-v1-present-p object :source-hash))
+                      (or (equal (getf object :path-kind) "genera")
+                          (and (getf object :host-path) (mcp-v1-present-p object :source-size))))
+           (mcp-v1-error "Mapped loads require a host path and complete fingerprint"))
+         (when (mcp-v1-present-p object :source-size)
+           (unless (and (mcp-v1-type-p (getf object :source-size) :nonnegative)
+                        (<= (getf object :source-size) 16777216)
+                        (mcp-v1-type-p (getf object :source-hash) :nonnegative)
+                        (<= (getf object :source-hash) 4294967295))
+             (mcp-v1-error "Invalid source fingerprint"))))
        (when (and (member (getf object :op) '(:request-status :interrupt))
                   (null (getf object :target-id)))
          (mcp-v1-error "Missing target request identity")))
       (:response
        (mcp-v1-plist object (append '(:version :id) response-keys)
                      '(:version :id :ok))
+       (when (some (lambda (key) (mcp-v1-present-p object key))
+                   '(:original-path :path-kind :host-path :path :source-root :resolved-path :resolved-root))
+         (dolist (key '(:original-path :path-kind :path :source-root))
+           (unless (getf object key) (mcp-v1-error "Incomplete load path metadata")))
+         (unless (member (getf object :path-kind) '("genera" "host" "relative") :test #'equal)
+           (mcp-v1-error "Invalid load result path kind"))
+         (when (and (getf object :ok) (not (and (getf object :resolved-path) (getf object :resolved-root))))
+           (mcp-v1-error "Load success requires canonical paths")))
        (when (mcp-v1-present-p object :result)
          (let ((result (getf object :result)))
            (mcp-v1-validate result :response)
@@ -268,6 +298,9 @@
               (:boot-id . :id) (:service-id . :id) (:world . :nonempty-text)
               (:expected-world . :nonempty-text)
               (:package . :text) (:busy . :boolean) (:active-request-id . :id)
+              (:original-path . :source-path) (:path-kind . :nonempty-text)
+              (:host-path . :source-path) (:path . :source-path) (:source-root . :source-path)
+              (:resolved-path . :source-path) (:resolved-root . :source-path)
               (:features . :features)
               (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
               (:print-level . :print-limit) (:print-length . :print-limit)
@@ -304,7 +337,7 @@
   "Check execution identity and the complete terminal result contract."
   (mcp-v1-validate request :request)
   (mcp-v1-validate response :response)
-  (unless (and (member (getf request :op) '(:eval :reset-listener-context))
+  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load))
                (every (lambda (key) (equal (getf request key) (getf response key)))
                       '(:id :boot-id :service-id)))
     (mcp-v1-error "Eval response identity mismatch"))
@@ -318,6 +351,13 @@
                       ((eq (getf (getf response :error) :code) :interrupted) :interrupted)
                       (t :failed)))
       (mcp-v1-error "Invalid terminal eval state"))
+    (when (eq (getf request :op) :load)
+      (dolist (key '(:original-path :path-kind :host-path :path :source-root))
+        (unless (equal (getf request key) (getf response key))
+          (mcp-v1-error "Load response path mismatch")))
+      (when (and (getf response :ok)
+                 (not (and (getf response :resolved-path) (getf response :resolved-root))))
+        (mcp-v1-error "Load success requires resolved paths")))
     (when (and (not (getf response :ok))
                (not (mcp-v1-present-p (getf response :error) :condition-type)))
       (mcp-v1-error "Missing execution condition type")))

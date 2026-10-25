@@ -30,7 +30,7 @@
            (hello (hrequest :hello :token "test-secret" :expected-world "fixture.vlod"))
            (reply (mcp-v1-dispatch hello session)))
       (hcheck t (getf reply :ok))
-      (hcheck '(:status :request-status :eval :reset-listener-context) (getf reply :features))
+      (hcheck '(:status :request-status :eval :reset-listener-context :load) (getf reply :features))
       (hcheck "fixture.vlod" (getf reply :world))
       (hcheck nil (getf reply :busy))
       (hcheck reply (mcp-v1-dispatch hello session))

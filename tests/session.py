@@ -26,7 +26,7 @@ def greeting(request):
 def response(request, value="42"):
     result = {":version": 1, ":id": request[":id"], ":ok": True,
               ":boot-id": "boot", ":service-id": "service"}
-    if request[":op"] in (":eval", ":reset-listener-context"):
+    if request[":op"] in (":eval", ":reset-listener-context", ":load"):
         result.update({":request-state": ":completed", ":values": [value], ":value-count": 1,
                        ":stdout": "a\nb\r\nc\t", ":stderr": "", ":warnings": None,
                        ":package": "USER", ":elapsed-ms": 1, ":truncated": None,

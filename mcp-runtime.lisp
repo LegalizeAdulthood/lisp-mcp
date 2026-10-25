@@ -133,7 +133,7 @@
                              "message" (princ-to-string failure)))))
             status)))))
 
-(defun rpc-tool-failure (id code message &optional request)
+(defun rpc-tool-failure (id code message &optional request context)
   (let ((object (jso "ok" 'yason:false "error" (jso "code" code "message" message)
                      "session" (rpc-session-status))))
     (when request
@@ -141,7 +141,20 @@
         (setf (gethash (rpc-key key) object) (getf (genera-request-envelope request) key)))
       (setf (gethash "request_state" object) (rpc-name (genera-request-state request))))
     (when (string= *profile* "genera") (setf (gethash "timeout_enforced_by" object) "host"))
+    (when context (maphash (lambda (key value) (setf (gethash key object) value)) context))
     (rpc-structured-result id object t)))
+
+(defun rpc-load-context (arguments request &optional path)
+  (let ((object (rpc-bridge-json
+                 (loop for key in '(:host-path :path :source-root)
+                       for value = (and request (getf (genera-request-envelope request) key))
+                       when value append (list key value)))))
+    (setf (gethash "original_path" object) (gethash "path" arguments)
+          (gethash "path_kind" object) (gethash "path_kind" arguments))
+    (when path
+      (setf (gethash "host_path" object) (genera-source-path-host-path path)
+            (gethash "path" object) (genera-source-path-genera-path path)))
+    object))
 
 (defun rpc-emit (runtime response)
   (when response
@@ -234,8 +247,23 @@
              (rpc-structured-result id object (not (getf response :ok)))))
           (request
             (let* ((session (rpc-runtime-session *rpc-runtime*))
-                   (response (genera-await-request session request))
+                   (response
+                     (progn
+                       (when (string= name "genera_load")
+                         (let ((fields
+                                 (sb-ext:with-timeout (max .001 (- (genera-request-deadline request) (genera-now)))
+                                  (append (genera-load-fields (gethash "path_kind" expression) (gethash "path" expression))
+                                     (list :print-level (gethash "print_level" expression 6)
+                                           :print-length (gethash "print_length" expression 100))
+                                     (when (gethash "package" expression)
+                                       (list :package (gethash "package" expression)))))))
+                           ;; Cancel the local I/O timer before publishing runnable work.
+                           (genera-complete-preparation session request fields)))
+                       (genera-await-request session request)))
                    (object (rpc-bridge-json response)))
+              (when (string= name "genera_load")
+                (maphash (lambda (key value) (unless (gethash key object) (setf (gethash key object) value)))
+                         (rpc-load-context expression request)))
               (setf (gethash "timeout_enforced_by" object) "host")
               (rpc-structured-result id object (not (getf response :ok)))))
           (t
@@ -244,7 +272,19 @@
                       ((string= name "eval_swank") (eval-swank-tool expression))
                       (t (eval-genera expression)))
               (rpc-tool-result id text failed))))
+      (genera-path-error (condition)
+        (genera-cancel-preparation (rpc-runtime-session *rpc-runtime*) request
+                                  (genera-path-error-kind condition) (princ-to-string condition))
+        (rpc-tool-failure id (rpc-name (genera-path-error-kind condition)) (princ-to-string condition)
+                          request (rpc-load-context expression request (genera-path-error-path condition))))
+      (sb-ext:timeout ()
+        (genera-cancel-preparation (rpc-runtime-session *rpc-runtime*) request :timeout "File preparation deadline expired")
+        (rpc-tool-failure id "timeout" "File preparation deadline expired; load was not submitted"
+                          request (rpc-load-context expression request)))
       (genera-session-error (condition)
+        (when (and request (string= name "genera_load"))
+          (genera-cancel-preparation (rpc-runtime-session *rpc-runtime*) request
+                                    (genera-session-error-kind condition) (princ-to-string condition)))
         (if (string= name "genera_interrupt")
             (let ((object (jso "ok" 'yason:false
                               "error" (jso "code" (rpc-name (genera-session-error-kind condition))
@@ -258,8 +298,13 @@
               (rpc-structured-result id object t))
         (rpc-tool-failure id (rpc-name (or (getf (getf (genera-session-error-response condition) :error) :code)
                                           (genera-session-error-kind condition)))
-                          (princ-to-string condition) request)))
-      (error () (rpc-tool-failure id "internal-error" "Tool execution failed" request)))))
+                          (princ-to-string condition) request
+                          (when (string= name "genera_load") (rpc-load-context expression request)))))
+      (error ()
+        (when (and request (string= name "genera_load"))
+          (genera-cancel-preparation (rpc-runtime-session *rpc-runtime*) request :internal-error "File preparation failed"))
+        (rpc-tool-failure id "internal-error" "Tool execution failed" request
+                          (when (string= name "genera_load") (rpc-load-context expression request)))))))
 
 (defun rpc-pending-work (runtime control)
   (cond ((eq control :interrupt) (rpc-runtime-interrupt-work runtime))
@@ -342,6 +387,13 @@
                    "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("form"))
             (rpc-versioned-tool "eval_genera" "Compatibility alias for genera_eval."
                                  (jso "expression" (jso "type" "string")) #("expression"))
+            (rpc-versioned-tool "genera_load" "Verify and load one source file without replay."
+              (jso "path" (jso "type" "string" "minLength" 1)
+                   "path_kind" (jso "type" "string" "enum" #("genera" "host" "relative"))
+                   "package" (jso "type" "string" "minLength" 1)
+                   "timeout_ms" (jso "type" "integer" "minimum" 1)
+                   "print_level" (jso "type" #("integer" "null") "minimum" 0)
+                   "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("path" "path_kind"))
             (rpc-versioned-tool "genera_reset_listener_context"
               "Restore the configured bridge package; preserve world state and request history. Requires idle, resolved execution."
               (jso "boot_id" (jso "type" "string" "minLength" 1)
@@ -390,10 +442,12 @@
          (recover (string= name "genera_recover_session"))
          (interrupt (string= name "genera_interrupt"))
          (reset (string= name "genera_reset_listener_context"))
+         (loading (string= name "genera_load"))
          (allowed (cond ((or lookup recover interrupt)
                          (append '("request_id" "boot_id" "service_id")
                                  (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
+                        (loading '("path" "path_kind" "package" "timeout_ms" "print_level" "print_length"))
                         (reset '("boot_id" "service_id" "timeout_ms"))
                         (ensure nil) (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
@@ -415,7 +469,11 @@
     (when (and interrupt (integerp (gethash "timeout_ms" arguments 5000))
                (> (gethash "timeout_ms" arguments 5000) 5000))
       (rpc-invalid "Interrupt timeout_ms must be at most 5000"))
-    (unless (or status lookup recover ensure interrupt reset)
+    (when loading
+      (unless (and (stringp (gethash "path" arguments)) (<= 1 (length (gethash "path" arguments)) 4096)
+                   (member (gethash "path_kind" arguments) '("genera" "host" "relative") :test #'equal))
+        (rpc-invalid "Load requires a nonempty path and explicit path_kind")))
+    (unless (or status lookup recover ensure interrupt reset loading)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -462,23 +520,26 @@
                   (if failure (princ-to-string failure) "Genera session is not ready")))))
           (handler-case
               (let* ((reset (string= name "genera_reset_listener_context"))
+                     (loading (string= name "genera_load"))
                      (form (gethash (if (string= name "genera_eval") "form" "expression") arguments))
                      (fields (append
                                (list :host-timeout (/ (gethash "timeout_ms" arguments
                                                               (* 1000 *genera-timeout*)) 1000))
-                               (if reset
+                               (cond (loading (list :defer t))
+                                 (reset
                                    (list :expected-generation (list (gethash "boot_id" arguments)
-                                                                    (gethash "service_id" arguments)))
-                                   (append (list :form form :print-level (gethash "print_level" arguments 6)
+                                                                    (gethash "service_id" arguments))))
+                                 (t (append (list :form form :print-level (gethash "print_level" arguments 6)
                                                  :print-length (gethash "print_length" arguments 100))
                                            (when (gethash "package" arguments)
-                                             (list :package (gethash "package" arguments)))))))
+                                             (list :package (gethash "package" arguments))))))))
                      (request (apply #'genera-submit-request session
-                                     (if reset :reset-listener-context :eval) fields)))
-                (rpc-queue-work id name form request))
+                                     (cond (loading :load) (reset :reset-listener-context) (t :eval)) fields)))
+                (rpc-queue-work id name (if loading arguments form) request))
             (genera-session-error (condition)
               (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
-                                (princ-to-string condition)))
+                                (princ-to-string condition) nil
+                                (when (string= name "genera_load") (rpc-load-context arguments nil))))
             (error () (rpc-tool-failure id "invalid-source" "Source cannot be sent to Genera")))))))
 
 (defun handle-request (message)
