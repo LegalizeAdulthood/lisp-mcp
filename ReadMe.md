@@ -1,58 +1,157 @@
-# lisp-mcp
+# lisp-mcp: Genera on Windows and Linux
 
-An MCP (Model Context Protocol) server for Common Lisp evaluation.
-The default `generic` profile provides up to three tools:
+This fork connects MCP clients to a persistent Symbolics Genera world.
+Use it from a Windows client through WSL, or run the MCP server directly
+on Linux. The Genera profile provides session management, evaluation,
+file loading and compilation, test execution, inspection, and recovery
+without replaying uncertain work.
 
-- **eval_host_cl** -- available in the generic profile; evaluates expressions in the MCP server's own SBCL process
-- **eval_swank** -- connects to a running Lisp via the Swank protocol (the backend used by SLIME and Sly)
-- **eval_genera** -- bridges to a Symbolics Genera machine over TCP
+Choose [Windows through WSL](#windows-client-through-wsl) or
+[direct Linux use](#linux-client).
 
-The explicit `genera` profile provides `genera_session_status`,
-`genera_ensure_session`, `genera_request_status`,
-`genera_recover_session`, `genera_reset_listener_context`, `genera_load`,
-`genera_compile_file`, `genera_run_tests`, `genera_describe`,
-`genera_apropos`, `genera_eval`, and the
-`eval_genera(expression)` compatibility alias.
-Verified listener capabilities additionally enable `genera_interrupt`
-and `genera_find_definition`.
+## How it runs
 
-## Prerequisites
+The bridge and Genera run in separate processes:
 
-- [SBCL](https://www.sbcl.org/) on the host machine
-- [Quicklisp](https://www.quicklisp.org/) installed in SBCL (the MCP server loads `usocket` and `yason` via Quicklisp)
+```text
+Windows MCP client
+    |
+    | stdio through wsl.exe
+    v
+WSL: SBCL MCP bridge -- TCP --> Genera VLM
 
-## MCP configuration
-
-Add the following to your `.mcp.json` (or the MCP configuration of your client):
-
-```json
-{
-    "mcpServers": {
-        "lisp": {
-            "command": "/path/to/lisp-mcp.sh",
-            "env": {
-                "LISP_MCP_PROFILE": "generic",
-                "GENERA_PROTOCOL": "legacy",
-                "SWANK_PORT": "4005",
-                "GENERA_HOST": "genera.example",
-                "GENERA_PORT": "8888"
-            }
-        }
-    }
-}
+Linux MCP client -- stdio --> SBCL MCP bridge -- TCP --> Genera VLM
 ```
 
-Only `command` is required. The environment variables enable the optional tools.
+SBCL runs the MCP bridge: protocol handling, connection management,
+request tracking, and optional VLM startup. Genera executes the submitted
+Lisp forms and owns the live world state. Closing the MCP client leaves
+Genera running.
 
-### WSL clients and local autostart
+For Windows, install SBCL and the bridge inside WSL. For direct Linux
+use, install them on the Linux host. Both workflows use
+`LISP_MCP_PROFILE=genera` and `GENERA_PROTOCOL=v1`. The inherited generic
+profile remains available for [compatibility](#compatibility-profile);
+select the Genera profile explicitly in the client configuration.
 
-Run the bridge in the same WSL distribution and non-root account as the
-VLM. Install SBCL and Quicklisp there, including `usocket` and `yason`.
-Load those dependencies once before connecting an MCP client so initial
-compilation output cannot enter the protocol stream. Local launch also
-requires Linux x86-64, `/usr/bin/setsid`, a working WSLg/X11 display, an
-accessible preconfigured persistent TAP, and read/write `/dev/net/tun`.
-The bridge inspects these prerequisites; it does not configure networking.
+## Requirements
+
+- A Windows MCP client with WSL, or an MCP client running on Linux.
+- [SBCL](https://www.sbcl.org/) in the Linux environment that runs the
+  bridge: inside WSL for Windows, or on the native Linux host.
+- [Quicklisp](https://www.quicklisp.org/) in that SBCL installation,
+  including `usocket` and `yason`.
+- A reachable Genera VLM with the versioned listener installed as
+  described below. The VLM may be local to the bridge or on another host.
+
+Load the bridge dependencies once in the same Linux environment before
+connecting an MCP client, so first-use compilation output cannot enter
+its protocol stream:
+
+```sh
+sbcl --noinform --non-interactive --load "$HOME/quicklisp/setup.lisp" \
+  --eval "(ql:quickload '(:usocket :yason))"
+```
+
+Managed local VLM startup currently requires WSL, Linux x86-64,
+`/usr/bin/setsid`, a working WSLg/X11 display, an accessible preconfigured
+persistent TAP, and read/write `/dev/net/tun`. The bridge checks these
+prerequisites; it does not provision networking. On native Linux, start
+Genera separately and use attach mode.
+
+## Install the Genera listener
+
+Install matching copies of the native files before configuring either
+client workflow. The versioned listener and boot hook support both WSL
+and separately started Linux VLMs.
+
+Install `genera-protocol.lisp`, `eval-server.lisp`, and
+`genera-boot.lisp` at verified Genera pathnames. `SYS:SITE;` may reside
+inside a FEP partition; copying files beside the VLM executable does not
+make them visible there. Use an available file service or a trusted
+installation channel, then verify the files in Genera:
+
+```lisp
+(probe-file "SYS:SITE;genera-protocol.lisp")
+(probe-file "SYS:SITE;eval-server.lisp")
+(probe-file "SYS:SITE;genera-boot.lisp")
+```
+
+### Install the boot hook
+
+`genera-boot.lisp` registers `"MCP listener"` with Genera's warm
+initialization list. Genera runs this list after namespace and network
+initialization on cold and warm boots. Save the loaded definitions and
+hook in a separate world; startup then needs no console source loading.
+Keep the original world and partition as recovery copies.
+
+After installing all three source files at verified Genera paths, load
+them in `COMMON-LISP-USER`. To load definitions without starting a
+listener, bind `*mcp-autostart*` to NIL:
+
+```lisp
+(let ((*package* (find-package "COMMON-LISP-USER"))
+      (*mcp-autostart* nil))
+  (declare (special *mcp-autostart*))
+  (load "SYS:SITE;genera-protocol.lisp")
+  (load "SYS:SITE;eval-server.lisp")
+  (load "SYS:SITE;genera-boot.lisp"))
+```
+
+Register the desired protocol and optional token. For versioned startup:
+
+```lisp
+(mcp-install-boot-hook :protocol :v1 :enable-network t)
+(mcp-boot-status)
+```
+
+`:enable-network t` explicitly enables the configured Genera networks
+before starting the listener. Omit it when the site's startup already
+enables networking. Add `:token "shared-secret"` for authenticated
+versioned access; configuration, including that token, is saved in the
+world. Legacy startup remains available with `:protocol :legacy`.
+Supply `:world "world.vlod"` only when VLM world detection is unavailable.
+
+To start the installed versioned listener in the current world, call:
+
+```lisp
+(mcp-boot-start)
+(mcp-boot-status)
+```
+
+A manually started VLM on Linux can use this listener without saving a
+new world.
+
+To retain the listener and hook across restores, use Save World or
+`si:disk-save` to create a complete world at a **new** destination that
+does not already exist. For a VLM, use its verified embedded-host
+pathname; ordinary file-service access to that host is a separate
+facility. Never overwrite any existing saved world. Boot the new world
+with its matching partition and verify hello/status before entering
+console commands.
+
+The hook discards saved bridge streams, locks, request history, and
+worker references. It creates fresh runtime resources and new boot and
+service IDs. A repeated `mcp-boot-start` in the same boot preserves these
+resources and identities; reconnecting also preserves them. Installation
+replaces the named hook entry rather than adding another entry. It does
+not save a world or start a VLM.
+
+`mcp-boot-status` reports boot/listener source versions (currently 1),
+state, and bounded failure diagnostics without tokens. Startup failures
+are contained so Genera can finish booting. For manual recovery, inspect
+that status from the console, correct the installed source/configuration,
+reload the matching files with autostart disabled, and call
+`mcp-boot-start`. Configuration changes to a running service still require
+explicit service replacement. Save another new world after updating
+definitions or installation settings; an existing saved world retains
+its previous definitions.
+
+## Windows client through WSL
+
+For managed local startup, run the bridge in the same WSL distribution
+and non-root account as the VLM. The Windows MCP client starts the bridge
+through `wsl.exe`; SBCL and Quicklisp run inside that distribution.
 
 Use the existing `lisp-mcp.sh` entry point. A Windows MCP client can run
 `wsl.exe` with an argument array; pass Linux environment settings through
@@ -93,240 +192,76 @@ with the following; this preserves the entry point and its `$0` path:
  "lisp-mcp", "/path/to/lisp-mcp/lisp-mcp.sh"]
 ```
 
-Install the Genera boot hook below before enabling autostart. No console
+Install the Genera boot hook above before enabling autostart. No console
 login is required for a correctly installed hook. To connect to an
 already running remote listener, omit all local runtime settings and
 keep the Genera profile with explicit `GENERA_PROTOCOL=v1`.
-The checked-in `.mcp.json` retains the generic/legacy example, including
-host and Swank tools. Client-specific deployment files can select v1
-without changing that workflow.
 
-### Startup validation
+## Linux client
 
-The bridge validates configuration before reading MCP requests or opening
-connections. Invalid settings produce a diagnostic naming the variable
-on stderr, leave stdout empty, and exit with status 2.
-
-- Ports must contain decimal digits only and be in `1..65535`.
-- `GENERA_TIMEOUT` must contain a positive whole number of seconds. It
-  applies to evaluations in the generic profile and supplies the default
-  host wait deadline for versioned Genera evaluation.
-- Hostnames and IP addresses must be nonempty and contain no whitespace
-  or control characters. `SWANK_PACKAGE` must be nonempty text without
-  surrounding whitespace or control characters.
-- Unset `GENERA_HOST` to disable Genera; unset `SWANK_PORT` to disable
-  Swank. Empty values are errors. Supplied settings are validated even
-  when their optional tool is disabled.
-
-| Variable | Default | Supported values |
-|---|---|---|
-| `LISP_MCP_PROFILE` | `generic` | `generic` or `genera` |
-| `GENERA_PROTOCOL` | `legacy` | `legacy` with `generic`; explicit `v1` with `genera` |
-| `GENERA_TOKEN` | *(unset)* | Optional shared token for the Genera profile |
-| `GENERA_EXPECTED_WORLD` | *(unset)* | Optional expected world basename for the Genera profile |
-
-Unsupported profile or protocol selections fail at startup; the bridge
-never falls back to legacy. The Genera profile requires `GENERA_HOST`
-and explicit `GENERA_PROTOCOL=v1`. Token and expected-world settings
-require that profile and contain at most 4,096 printable ASCII characters
-without surrounding whitespace. Initialization, discovery, and local
-status do not contact Genera. The Genera profile starts asynchronous
-connection management after `notifications/initialized`. Default attach
-mode requires a running target Lisp. Explicit local autostart can launch
-the configured VLM as described below.
-
-### Local runtime preflight
-
-`genera-launch.lisp` provides read-only host diagnostics for an explicitly
-configured local WSL runtime. Remote endpoints use attach-only mode.
-Configuration is validated before MCP dispatch; filesystem inspection is
-deferred to explicit preflight or managed local startup.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `GENERA_RUNTIME_MODE` | `attach` | `attach` or `local` |
-| `GENERA_AUTOSTART` | `false` | `true` permits local launch; `false` denies it |
-| `GENERA_VLM_ROOT` | unset | Absolute WSL working directory; required locally |
-| `GENERA_VLM_EXECUTABLE` | `genera` | VLM executable pathname |
-| `GENERA_VLM_WORLD` | unset | Existing boot-enabled world; required locally |
-| `GENERA_VLM_PARTITION` | unset | Existing FEP partition; required locally |
-| `GENERA_VLM_DEBUGGER` | `VLM_debugger` | Debugger executable pathname |
-| `GENERA_VLM_USER` | unset | Expected non-root WSL account; required locally |
-| `GENERA_VLM_NETWORK` | unset | Preconfigured TAP argument; required locally |
-| `GENERA_STATE_DIR` | XDG state root plus `lisp-mcp` | Private Linux state directory |
-| `GENERA_VLM_LOG` | `vlm.log` in the state directory | VLM log destination |
-
-The default state root is `XDG_STATE_HOME`, or `~/.local/state` when unset.
-Root, state, and log paths must be absolute Unix paths. Executable, world,
-partition, and debugger paths may be absolute or relative to the VLM root.
-Wildcards and Windows path syntax are rejected. Paths containing spaces
-remain single arguments; existing symlinks resolve to canonical paths.
-
-Local mode requires the Genera profile, protocol v1, and port 8888.
-`GENERA_HOST` must exactly match the guest IPv4 in the network argument:
-
-```text
-TAP:IPv4;mask=IPv4;gateway=IPv4;preconfiguredTAP=yes
-```
-
-The argument is preserved verbatim, including its guest netmask.
-Attach-only mode rejects autostart permission and does not inspect local
-runtime files. Configure and inspect from the host Lisp:
-
-```lisp
-(lisp-mcp::configure)
-(lisp-mcp::genera-preflight)
-```
-
-The returned property list includes `:ok`, `:launch-permitted`, canonical
-`:paths`, working `:root`, structured `:argv`, environment facts, TAP
-ownership, log metadata, and named `:checks`. Failed checks carry stable
-codes such as `:missing-executable`, `:missing-world`, `:wrong-user`,
-`:missing-display`, and `:tap-inaccessible`. `:argv` is NIL on failure.
-The fixed arguments retain VM size 2000, the debugger/world/network/FEP
-options, and foreground/background colors `#F0EDCC` and `#02343F`.
-
-Preflight checks regular files and permissions, the VLM's Linux ELF64
-x86-64 header, the actual WSL user, local X11 socket access, persistent TAP
-flags and owner/group access, `/dev/net/tun`, and log/state locations.
-All configured TAP owner and group restrictions must match, as required
-by the [Linux TAP driver](https://github.com/torvalds/linux/blob/v6.18/drivers/net/tun.c#L481).
-The check does not assume privileged network capabilities.
-It rejects log aliases of runtime files, including hard links. A missing
-state/log directory may be reported ready when its existing ancestor is
-writable; inspection does not create it. Existing state directories must
-be private and owned by the current user.
-The Linux `setsid` utility must be installed at `/usr/bin/setsid`.
-Existing log files must also be private to the current user.
-
-`:launch-permitted` is a prerequisite verdict, not process ownership or
-an instruction to launch. Preflight starts no process, contacts no Genera
-endpoint, attaches no TAP device, runs no sudo, changes no display setting,
-and never saves or overwrites a world. Socket/TAP metadata checks do not
-prove display authentication, guest routing, or listener readiness.
-
-### Local launch ownership
-
-`genera-call-with-launch-decision` inspects processes and rechecks the TCP
-endpoint while holding Linux advisory locks. It passes a decision and a
-lock context to a callback. Only that callback may act on `:launch`; it
-must record the verified child's identity with
-`genera-record-launch-identity` before returning and releasing the locks.
-The decision helper itself starts no VLM.
-
-Use the same private `GENERA_STATE_DIR` for all clients of a runtime.
-A user-wide guard serializes decisions across worlds sharing a partition;
-a per-world lock uses the world's device/inode identity, including aliases.
-Directories are private to the current user. Lock and metadata files
-reject symlinks, hard links, foreign ownership, and public permissions.
-Locks release on errors or host exit; their descriptors close on exec.
-
-Discovery reads `/proc`, including VLMs started manually. It checks the
-canonical executable, world, partition, owner, PID, Linux start time, and
-Linux boot identity. Relative arguments resolve against the process's
-working directory. Unreadable candidate identities, conflicting resources,
-or several matching VLMs block launch. Stale metadata is discarded only
-under the locks after live discovery; a PID alone never establishes VLM
-identity. Invalid metadata blocks the decision.
-
-A matching process without a listener yields `:vlm-present` and must be
-observed through its boot deadline. A reachable TCP port yields
-`:endpoint-present`; a validated versioned handshake is still required.
-Neither result permits another VLM launch. External manual launchers do
-not participate in these advisory locks.
-
-### Detached VLM launch
-
-`genera-launch-vlm` performs locked discovery and launches only for a
-`:launch` decision. It returns a report and an optional observation handle.
-It passes the verified executable and fixed argv directly to
-`/usr/bin/setsid --wait --`, with the configured runtime working directory.
-Arguments are literal strings; no shell parses them. The child inherits
-the host environment, including WSLg's `DISPLAY`, `WAYLAND_DISPLAY`, and
-`XDG_RUNTIME_DIR`.
-
-The VLM starts in its own Linux session with `/dev/null` as stdin.
-Only stdin and the log-backed stdout/stderr survive exec; MCP protocol
-streams, launch locks, and unrelated host descriptors are closed.
-The private log is opened for append without following links or replacing
-existing content. Runtime-file aliases and launch-state destinations are
-rejected. An optional `setsid` observer waits for the VLM's exit status;
-the VLM PID is identified separately and verified before recording it.
-
-The report includes `:action`, `:code`, `:attempted`, process identity,
-launcher PID, working directory, and log path. A successful spawn reports
-`:launched` and `:vlm-started`; listener readiness requires the versioned
-handshake. Immediate exit reports `:early-exit` and its exit code.
-`genera-launch-observation` checks the returned handle for later exit or
-identity changes. Neither function respawns or stops an existing VLM.
-If the observer exits first, a verified live VLM remains `:running`.
-Later VLM exit has an unknown exit code when its observer was lost.
-
-Closing the launching SBCL/MCP process releases its resources while the
-VLM and its log remain independent. WSL shutdown, Windows shutdown, or
-explicit VLM termination still ends the live world. Verify client
-close/reopen in the installed WSL environment; systemd unit existence
-alone does not establish that lifetime behavior.
-
-### Bounded start-or-attach
-
-With local mode and `GENERA_AUTOSTART=true`, startup begins after the MCP
-`notifications/initialized` notification. Initialization and tool discovery
-do no runtime inspection or launch. Startup first tries a versioned hello,
-using `GENERA_EXPECTED_WORLD` or the canonical local world's basename.
-A valid hello attaches immediately. Protocol, token, world, or stalled
-hello failures stop startup without launching a replacement.
-
-When the endpoint is unreachable, startup checks prerequisites, acquires
-the launch locks, and repeats discovery and the authenticated hello under
-those locks. One matching VLM is observed through the boot deadline;
-it is preserved even when its listener never becomes ready. Lock contention
-joins the other client's work. Each cycle permits one launch attempt.
-Launch failure or boot timeout stops that cycle without a respawn loop.
-
-`GENERA_CONNECT_TIMEOUT` bounds each connection/hello operation, default
-5 seconds. `GENERA_BOOT_TIMEOUT` bounds a complete startup cycle, default
-300 seconds. Both accept positive decimal integers in seconds. Connection
-and child-identity waits are clipped to the remaining boot budget.
-`GENERA_TIMEOUT` remains the separate evaluation wait deadline.
-
-Call `genera_ensure_session` with an empty arguments object to join active
-startup or explicitly retry a failed cycle. A ready session returns
-immediately. Concurrent ensure calls share their cycle ticket. The tool
-does not retry evaluations or acknowledge unresolved outcomes. Remote
-and attach-only configurations can reconnect through a bounded ensure
-cycle and never launch a local process.
-
-Cached status remains immediate and never launches a VLM. During managed
-startup it reports state `starting`, a phase such as `attach-first`,
-`preflight`, `lock`, `launch`, or `boot`, and a `startup` object with cycle
-number, remaining milliseconds, launch attempt, log, and process identity
-when known. A stopped cycle reports `failed` with an actionable error.
-Status refresh during startup returns not-ready; it does not start another
-cycle. After readiness, ordinary connection maintenance continues without
-permission to launch or replace a VLM. MCP EOF stops host startup and I/O
-workers while preserving any launched VLM and unresolved execution.
-
-### Genera profile
-
-For a listener explicitly configured for version 1, use:
+Run `lisp-mcp.sh` directly from the Linux MCP client. SBCL, Quicklisp,
+and the bridge run on that Linux host; no Windows launcher is involved.
+Configure an already-running versioned Genera listener:
 
 ```json
 {
     "mcpServers": {
-        "lisp": {
-            "command": "/path/to/lisp-mcp.sh",
+        "lisp-mcp": {
+            "command": "/bin/sh",
+            "args": ["/path/to/lisp-mcp/lisp-mcp.sh"],
             "env": {
                 "LISP_MCP_PROFILE": "genera",
                 "GENERA_PROTOCOL": "v1",
                 "GENERA_HOST": "genera.example",
                 "GENERA_PORT": "8888",
-                "GENERA_EXPECTED_WORLD": "world.vlod"
+                "GENERA_RUNTIME_MODE": "attach",
+                "GENERA_AUTOSTART": "false"
             }
         }
     }
 }
 ```
+
+Replace the script path and endpoint with your deployment values.
+`GENERA_HOST` is the address reachable from the Linux bridge. Use the same
+configuration for a VLM started separately on that host or a remote
+Genera listener. Set `GENERA_TOKEN` and `GENERA_EXPECTED_WORLD` when
+required by the listener.
+
+For a terminal MCP client or diagnostic session, the equivalent launch is:
+
+```sh
+LISP_MCP_PROFILE=genera GENERA_PROTOCOL=v1 \
+  GENERA_HOST=genera.example GENERA_PORT=8888 \
+  /bin/sh /path/to/lisp-mcp/lisp-mcp.sh
+```
+
+The process uses stdin/stdout for MCP JSON-RPC. Its stdout is not an
+interactive Lisp prompt. Keep diagnostic output on stderr.
+
+Attach mode does not inspect VLM runtime files, launch a VLM, or require
+local TAP/display configuration. It still requires network access to the
+Genera listener. Managed `local` mode currently rejects non-WSL hosts
+with `not-wsl`; use attach mode on native Linux.
+
+## Genera tools
+
+The Genera profile exposes:
+
+- `genera_session_status` and `genera_ensure_session` for connection
+  status and bounded start-or-attach.
+- `genera_eval` and its `eval_genera(expression)` compatibility alias.
+- `genera_load`, `genera_compile_file`, and `genera_run_tests`.
+- `genera_describe` and `genera_apropos` for bounded inspection.
+- `genera_request_status` and `genera_recover_session` for retained
+  results and explicit recovery.
+- `genera_reset_listener_context` to restore listener package context.
+
+Verified listener capabilities additionally enable `genera_interrupt`
+and `genera_find_definition`. Host evaluation and Swank tools belong to
+the generic compatibility profile.
+
+### Genera profile
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
@@ -875,145 +810,216 @@ advertised. Named test runners and source transfer require explicit
 configuration. Direct host file mapping additionally requires verified
 filesystem sharing; a Genera logical root alone does not establish it.
 
-## Tools
+## Deployment reference
 
-### eval_host_cl
+### Startup validation
 
-Evaluate a Common Lisp expression in the MCP server's own SBCL process.
-Available in the generic profile, with no additional configuration.
-Stdout, stderr, and return values are captured and returned.
+The bridge validates configuration before reading MCP requests or opening
+connections. Invalid settings produce a diagnostic naming the variable
+on stderr, leave stdout empty, and exit with status 2.
 
-### eval_swank
+- Ports must contain decimal digits only and be in `1..65535`.
+- `GENERA_TIMEOUT` must contain a positive whole number of seconds. It
+  supplies the default host wait deadline for versioned Genera execution
+  and the evaluation timeout in the generic compatibility profile.
+- Hostnames and IP addresses must be nonempty and contain no whitespace
+  or control characters. `SWANK_PACKAGE` must be nonempty text without
+  surrounding whitespace or control characters.
+- The Genera profile requires `GENERA_HOST`. In the generic profile,
+  unset it to disable Genera, or unset `SWANK_PORT` to disable Swank.
+  Empty values are errors. Supplied settings are validated even when
+  their optional tool is disabled.
 
-Evaluate a Common Lisp expression on a running Lisp that has a Swank server. This is the most useful tool for development -- it lets the LLM interact with your live Lisp image, load systems, inspect state, and run tests.
-
-The Swank client implements the Swank wire protocol, handles debugger entry by automatically invoking the `*ABORT` restart and returning the error description, and responds to interactive prompts (e.g. `y-or-n-p` during compilation).
-
-Start a Swank server in your target Lisp:
-
-```lisp
-(swank:create-server :port 4005 :dont-close t)
-```
-
-The `:dont-close t` argument keeps the server listening after the first connection disconnects, so the MCP server can reconnect between requests.
-
-To have Swank automatically start an additional server on a fixed port whenever you launch SLIME from Emacs with `M-x slime`, add the following to your Emacs configuration:
-
-```elisp
-(add-hook 'slime-connected-hook
-          (lambda ()
-            (slime-eval-async '(swank:create-server :port 4005 :dont-close t))))
-```
-
-Then set `SWANK_PORT` in the MCP configuration to enable the tool.
-
-| Variable | Default | Description |
+| Variable | Default | Supported values |
 |---|---|---|
-| `SWANK_PORT` | *(unset)* | TCP port of the Swank server. When set, enables `eval_swank`. |
-| `SWANK_HOST` | `127.0.0.1` | Hostname or IP of the Swank server |
-| `SWANK_PACKAGE` | `COMMON-LISP-USER` | Package in which expressions are evaluated |
+| `LISP_MCP_PROFILE` | `generic` | `generic` or `genera` |
+| `GENERA_PROTOCOL` | `legacy` | `legacy` with `generic`; explicit `v1` with `genera` |
+| `GENERA_TOKEN` | *(unset)* | Optional shared token for the Genera profile |
+| `GENERA_EXPECTED_WORLD` | *(unset)* | Optional expected world basename for the Genera profile |
 
-### eval_genera
+Unsupported profile or protocol selections fail at startup; the bridge
+never falls back to legacy. The Genera profile requires `GENERA_HOST`
+and explicit `GENERA_PROTOCOL=v1`. Token and expected-world settings
+require that profile and contain at most 4,096 printable ASCII characters
+without surrounding whitespace. Initialization, discovery, and local
+status do not contact Genera. The Genera profile starts asynchronous
+connection management after `notifications/initialized`. Default attach
+mode requires a running Genera listener. Explicit local autostart can
+launch the configured WSL VLM as described below.
 
-Evaluate a Lisp expression on a Symbolics Genera machine. Requires `eval-server.lisp` running on the Genera side.
+### Local runtime preflight
 
-Set `GENERA_HOST` in the MCP configuration to enable the tool.
+`genera-launch.lisp` provides read-only host diagnostics for an explicitly
+configured local WSL runtime. Remote endpoints use attach-only mode.
+Configuration is validated before MCP dispatch; filesystem inspection is
+deferred to explicit preflight or managed local startup.
 
-| Variable | Default | Description |
+| Variable | Default | Meaning |
 |---|---|---|
-| `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
-| `GENERA_PORT` | `8888` | TCP port of the eval server |
-| `GENERA_TIMEOUT` | `300` | Generic evaluation timeout; default versioned host wait deadline, in seconds |
+| `GENERA_RUNTIME_MODE` | `attach` | `attach` or `local` |
+| `GENERA_AUTOSTART` | `false` | `true` permits local launch; `false` denies it |
+| `GENERA_VLM_ROOT` | unset | Absolute WSL working directory; required locally |
+| `GENERA_VLM_EXECUTABLE` | `genera` | VLM executable pathname |
+| `GENERA_VLM_WORLD` | unset | Existing boot-enabled world; required locally |
+| `GENERA_VLM_PARTITION` | unset | Existing FEP partition; required locally |
+| `GENERA_VLM_DEBUGGER` | `VLM_debugger` | Debugger executable pathname |
+| `GENERA_VLM_USER` | unset | Expected non-root WSL account; required locally |
+| `GENERA_VLM_NETWORK` | unset | Preconfigured TAP argument; required locally |
+| `GENERA_STATE_DIR` | XDG state root plus `lisp-mcp` | Private Linux state directory |
+| `GENERA_VLM_LOG` | `vlm.log` in the state directory | VLM log destination |
 
-#### Setting up the Genera side
+The default state root is `XDG_STATE_HOME`, or `~/.local/state` when unset.
+Root, state, and log paths must be absolute Unix paths. Executable, world,
+partition, and debugger paths may be absolute or relative to the VLM root.
+Wildcards and Windows path syntax are rejected. Paths containing spaces
+remain single arguments; existing symlinks resolve to canonical paths.
 
-Install `genera-protocol.lisp`, `eval-server.lisp`, and optionally
-`genera-boot.lisp` at verified Genera pathnames. `SYS:SITE;` may reside
-inside a FEP partition; copying files beside the VLM executable does not
-make them visible there. Use an available file service or a trusted
-installation channel, then verify the files in Genera:
+Local mode requires the Genera profile, protocol v1, and port 8888.
+`GENERA_HOST` must exactly match the guest IPv4 in the network argument:
+
+```text
+TAP:IPv4;mask=IPv4;gateway=IPv4;preconfiguredTAP=yes
+```
+
+The argument is preserved verbatim, including its guest netmask.
+Attach-only mode rejects autostart permission and does not inspect local
+runtime files. Configure and inspect from the host Lisp:
 
 ```lisp
-(probe-file "SYS:SITE;genera-protocol.lisp")
-(probe-file "SYS:SITE;eval-server.lisp")
+(lisp-mcp::configure)
+(lisp-mcp::genera-preflight)
 ```
 
-Load both files in `COMMON-LISP-USER` from the Genera Lisp Listener:
+The returned property list includes `:ok`, `:launch-permitted`, canonical
+`:paths`, working `:root`, structured `:argv`, environment facts, TAP
+ownership, log metadata, and named `:checks`. Failed checks carry stable
+codes such as `:missing-executable`, `:missing-world`, `:wrong-user`,
+`:missing-display`, and `:tap-inaccessible`. `:argv` is NIL on failure.
+The fixed arguments retain VM size 2000, the debugger/world/network/FEP
+options, and foreground/background colors `#F0EDCC` and `#02343F`.
 
-```lisp
-(let ((*package* (find-package "COMMON-LISP-USER")))
-  (load "SYS:SITE;genera-protocol.lisp")
-  (load "SYS:SITE;eval-server.lisp"))
-```
+Preflight checks regular files and permissions, the VLM's Linux ELF64
+x86-64 header, the actual WSL user, local X11 socket access, persistent TAP
+flags and owner/group access, `/dev/net/tun`, and log/state locations.
+All configured TAP owner and group restrictions must match, as required
+by the [Linux TAP driver](https://github.com/torvalds/linux/blob/v6.18/drivers/net/tun.c#L481).
+The check does not assume privileged network capabilities.
+It rejects log aliases of runtime files, including hard links. A missing
+state/log directory may be reported ready when its existing ancestor is
+writable; inspection does not create it. Existing state directories must
+be private and owned by the current user.
+The Linux `setsid` utility must be installed at `/usr/bin/setsid`.
+Existing log files must also be private to the current user.
 
-Load the files once per boot. The listener defines a TCP server
-(`:mcp-server`) on port 8888 that accepts length-prefixed Lisp expressions
-and returns result, stdout, and stderr as three length-prefixed fields.
+`:launch-permitted` is a prerequisite verdict, not process ownership or
+an instruction to launch. Preflight starts no process, contacts no Genera
+endpoint, attaches no TAP device, runs no sudo, changes no display setting,
+and never saves or overwrites a world. Socket/TAP metadata checks do not
+prove display authentication, guest routing, or listener readiness.
 
-To verify it is running:
+### Local launch ownership
 
-```sh
-echo -n '11 (+ 1 2 3 4)' | nc -w 2 genera.example 8888 | cat -v
-```
+`genera-call-with-launch-decision` inspects processes and rechecks the TCP
+endpoint while holding Linux advisory locks. It passes a decision and a
+lock context to a callback. Only that callback may act on `:launch`; it
+must record the verified child's identity with
+`genera-record-launch-identity` before returning and releasing the locks.
+The decision helper itself starts no VLM.
 
-#### Starting the listener at boot
+Use the same private `GENERA_STATE_DIR` for all clients of a runtime.
+A user-wide guard serializes decisions across worlds sharing a partition;
+a per-world lock uses the world's device/inode identity, including aliases.
+Directories are private to the current user. Lock and metadata files
+reject symlinks, hard links, foreign ownership, and public permissions.
+Locks release on errors or host exit; their descriptors close on exec.
 
-`genera-boot.lisp` registers `"MCP listener"` with Genera's warm
-initialization list. Genera runs this list after namespace and network
-initialization on cold and warm boots. Save the loaded definitions and
-hook in a separate world; startup then needs no console source loading.
-Keep the original world and partition as recovery copies.
+Discovery reads `/proc`, including VLMs started manually. It checks the
+canonical executable, world, partition, owner, PID, Linux start time, and
+Linux boot identity. Relative arguments resolve against the process's
+working directory. Unreadable candidate identities, conflicting resources,
+or several matching VLMs block launch. Stale metadata is discarded only
+under the locks after live discovery; a PID alone never establishes VLM
+identity. Invalid metadata blocks the decision.
 
-After installing all three source files at verified Genera paths, load
-them in `COMMON-LISP-USER`. To load definitions without starting a
-listener, bind `*mcp-autostart*` to NIL:
+A matching process without a listener yields `:vlm-present` and must be
+observed through its boot deadline. A reachable TCP port yields
+`:endpoint-present`; a validated versioned handshake is still required.
+Neither result permits another VLM launch. External manual launchers do
+not participate in these advisory locks.
 
-```lisp
-(let ((*package* (find-package "COMMON-LISP-USER"))
-      (*mcp-autostart* nil))
-  (declare (special *mcp-autostart*))
-  (load "SYS:SITE;genera-protocol.lisp")
-  (load "SYS:SITE;eval-server.lisp")
-  (load "SYS:SITE;genera-boot.lisp"))
-```
+### Detached VLM launch
 
-Register the desired protocol and optional token. For versioned startup:
+`genera-launch-vlm` performs locked discovery and launches only for a
+`:launch` decision. It returns a report and an optional observation handle.
+It passes the verified executable and fixed argv directly to
+`/usr/bin/setsid --wait --`, with the configured runtime working directory.
+Arguments are literal strings; no shell parses them. The child inherits
+the host environment, including WSLg's `DISPLAY`, `WAYLAND_DISPLAY`, and
+`XDG_RUNTIME_DIR`.
 
-```lisp
-(mcp-install-boot-hook :protocol :v1 :enable-network t)
-(mcp-boot-status)
-```
+The VLM starts in its own Linux session with `/dev/null` as stdin.
+Only stdin and the log-backed stdout/stderr survive exec; MCP protocol
+streams, launch locks, and unrelated host descriptors are closed.
+The private log is opened for append without following links or replacing
+existing content. Runtime-file aliases and launch-state destinations are
+rejected. An optional `setsid` observer waits for the VLM's exit status;
+the VLM PID is identified separately and verified before recording it.
 
-`:enable-network t` explicitly enables the configured Genera networks
-before starting the listener. Omit it when the site's startup already
-enables networking. Add `:token "shared-secret"` for authenticated
-versioned access; configuration, including that token, is saved in the
-world. Legacy startup remains available with `:protocol :legacy`.
-Supply `:world "world.vlod"` only when VLM world detection is unavailable.
+The report includes `:action`, `:code`, `:attempted`, process identity,
+launcher PID, working directory, and log path. A successful spawn reports
+`:launched` and `:vlm-started`; listener readiness requires the versioned
+handshake. Immediate exit reports `:early-exit` and its exit code.
+`genera-launch-observation` checks the returned handle for later exit or
+identity changes. Neither function respawns or stops an existing VLM.
+If the observer exits first, a verified live VLM remains `:running`.
+Later VLM exit has an unknown exit code when its observer was lost.
 
-Use Save World or `si:disk-save` to create a complete world at a **new**
-destination that does not already exist. For a VLM, use its verified
-embedded-host pathname; ordinary file-service access to that host is a
-separate facility. Never overwrite any existing saved world.
-Boot the new world with its matching partition and
-verify hello/status before entering console commands.
+Closing the launching SBCL/MCP process releases its resources while the
+VLM and its log remain independent. WSL shutdown, Windows shutdown, or
+explicit VLM termination still ends the live world. Verify client
+close/reopen in the installed WSL environment; systemd unit existence
+alone does not establish that lifetime behavior.
 
-The hook discards saved bridge streams, locks, request history, and
-worker references. It creates fresh runtime resources and new boot and
-service IDs. A repeated `mcp-boot-start` in the same boot preserves these
-resources and identities; reconnecting also preserves them. Installation
-replaces the named hook entry rather than adding another entry. It does
-not save a world or start a VLM.
+### Bounded start-or-attach
 
-`mcp-boot-status` reports boot/listener source versions (currently 1),
-state, and bounded failure diagnostics without tokens. Startup failures
-are contained so Genera can finish booting. For manual recovery, inspect
-that status from the console, correct the installed source/configuration,
-reload the matching files with autostart disabled, and call
-`mcp-boot-start`. Configuration changes to a running service still require
-explicit service replacement. Save another new world after updating
-definitions or installation settings; an existing saved world retains
-its previous definitions.
+With local mode and `GENERA_AUTOSTART=true`, startup begins after the MCP
+`notifications/initialized` notification. Initialization and tool discovery
+do no runtime inspection or launch. Startup first tries a versioned hello,
+using `GENERA_EXPECTED_WORLD` or the canonical local world's basename.
+A valid hello attaches immediately. Protocol, token, world, or stalled
+hello failures stop startup without launching a replacement.
+
+When the endpoint is unreachable, startup checks prerequisites, acquires
+the launch locks, and repeats discovery and the authenticated hello under
+those locks. One matching VLM is observed through the boot deadline;
+it is preserved even when its listener never becomes ready. Lock contention
+joins the other client's work. Each cycle permits one launch attempt.
+Launch failure or boot timeout stops that cycle without a respawn loop.
+
+`GENERA_CONNECT_TIMEOUT` bounds each connection/hello operation, default
+5 seconds. `GENERA_BOOT_TIMEOUT` bounds a complete startup cycle, default
+300 seconds. Both accept positive decimal integers in seconds. Connection
+and child-identity waits are clipped to the remaining boot budget.
+`GENERA_TIMEOUT` remains the separate evaluation wait deadline.
+
+Call `genera_ensure_session` with an empty arguments object to join active
+startup or explicitly retry a failed cycle. A ready session returns
+immediately. Concurrent ensure calls share their cycle ticket. The tool
+does not retry evaluations or acknowledge unresolved outcomes. Remote
+and attach-only configurations can reconnect through a bounded ensure
+cycle and never launch a local process.
+
+Cached status remains immediate and never launches a VLM. During managed
+startup it reports state `starting`, a phase such as `attach-first`,
+`preflight`, `lock`, `launch`, or `boot`, and a `startup` object with cycle
+number, remaining milliseconds, launch attempt, log, and process identity
+when known. A stopped cycle reports `failed` with an actionable error.
+Status refresh during startup returns not-ready; it does not start another
+cycle. After readiness, ordinary connection maintenance continues without
+permission to launch or replace a VLM. MCP EOF stops host startup and I/O
+workers while preserving any launched VLM and unresolved execution.
+
+## Listener protocol reference
 
 ### Framing limits
 
@@ -1261,11 +1267,119 @@ closes after its reply; reconnect afterward. Generation IDs survive
 this transition; new evaluations receive busy until that handler finishes.
 Worker entry points and lock continuations are compiled during loading.
 
-## Host acceptance checks
+## Compatibility profile
 
-Use Python 3 and the existing SBCL/Quicklisp prerequisites. Load the
-dependencies once before starting MCP so first-use compilation output
-cannot enter its stdout:
+The inherited `generic` profile supports host SBCL evaluation, Swank,
+and the older Genera wire protocol. It remains the implementation default
+when no profile is configured. The checked-in `.mcp.json` is an example
+for this compatibility profile. Use the Windows or Linux Genera
+configurations above for this fork's tracked Genera workflow.
+
+For a generic client, use the following configuration shape:
+
+```json
+{
+    "mcpServers": {
+        "lisp": {
+            "command": "/path/to/lisp-mcp.sh",
+            "env": {
+                "LISP_MCP_PROFILE": "generic",
+                "GENERA_PROTOCOL": "legacy",
+                "SWANK_PORT": "4005",
+                "GENERA_HOST": "genera.example",
+                "GENERA_PORT": "8888"
+            }
+        }
+    }
+}
+```
+
+In this profile, only `command` is required. Environment variables enable
+the optional backends.
+
+### eval_host_cl
+
+`eval_host_cl` evaluates a Common Lisp expression in the MCP server's
+own SBCL process.
+Available in the generic profile, with no additional configuration.
+Stdout, stderr, and return values are captured and returned.
+
+### eval_swank
+
+`eval_swank` evaluates a Common Lisp expression in a separate Lisp with
+a running Swank server. This compatibility backend supports loading
+systems, inspecting state, and running tests through that Lisp.
+
+The Swank client implements the Swank wire protocol, handles debugger entry by automatically invoking the `*ABORT` restart and returning the error description, and responds to interactive prompts (e.g. `y-or-n-p` during compilation).
+
+Start a Swank server in your target Lisp:
+
+```lisp
+(swank:create-server :port 4005 :dont-close t)
+```
+
+The `:dont-close t` argument keeps the server listening after the first connection disconnects, so the MCP server can reconnect between requests.
+
+To have Swank automatically start an additional server on a fixed port whenever you launch SLIME from Emacs with `M-x slime`, add the following to your Emacs configuration:
+
+```elisp
+(add-hook 'slime-connected-hook
+          (lambda ()
+            (slime-eval-async '(swank:create-server :port 4005 :dont-close t))))
+```
+
+Then set `SWANK_PORT` in the MCP configuration to enable the tool.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SWANK_PORT` | *(unset)* | TCP port of the Swank server. When set, enables `eval_swank`. |
+| `SWANK_HOST` | `127.0.0.1` | Hostname or IP of the Swank server |
+| `SWANK_PACKAGE` | `COMMON-LISP-USER` | Package in which expressions are evaluated |
+
+### eval_genera
+
+In the generic profile, `eval_genera` uses the legacy three-field wire
+protocol. It requires `eval-server.lisp` running in legacy mode on Genera.
+The Genera profile's alias instead uses the versioned tracked session.
+
+Set `GENERA_HOST` in the MCP configuration to enable the tool.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
+| `GENERA_PORT` | `8888` | TCP port of the eval server |
+| `GENERA_TIMEOUT` | `300` | Generic evaluation timeout; default versioned host wait deadline, in seconds |
+
+### Legacy listener setup
+
+For the generic legacy profile, load the paired listener files manually.
+The primary Genera setup above installs a versioned boot hook instead.
+
+Load both files in `COMMON-LISP-USER` from the Genera Lisp Listener:
+
+```lisp
+(let ((*package* (find-package "COMMON-LISP-USER")))
+  (load "SYS:SITE;genera-protocol.lisp")
+  (load "SYS:SITE;eval-server.lisp"))
+```
+
+Load the files once per boot. The listener defines a TCP server
+(`:mcp-server`) on port 8888 that accepts length-prefixed Lisp expressions
+and returns result, stdout, and stderr as three length-prefixed fields.
+
+To verify it is running:
+
+```sh
+echo -n '11 (+ 1 2 3 4)' | nc -w 2 genera.example 8888 | cat -v
+```
+
+## Validation
+
+### Host checks
+
+Run host checks in the Linux environment used by the bridge, either
+native Linux or WSL. Use Python 3 and the SBCL/Quicklisp prerequisites.
+Load dependencies once so first-use compilation cannot enter MCP stdout:
 
 ```sh
 cd /path/to/lisp-mcp
@@ -1313,22 +1427,6 @@ checks verify content/token exclusion and bounded progress with unread
 stderr. Detached-process fixtures use an explicit release barrier for
 parent-exit/discovery checks instead of assuming a short child lifetime.
 
-Against a boot-loaded v1 listener in a disposable writable source root:
-
-```sh
-GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
-  python3 tests/conformance.py --live-v1 NativeConformanceChecks -v
-```
-
-This native check creates a new source file and compiler output, exercises
-all nine execution entry points, retrieves results from a new host,
-checks output truncation, and deliberately evicts old completed ledger
-entries. It also checks stale-generation and oversized-frame rejection.
-Run only with no other client work pending; it leaves test definitions
-and files in the disposable runtime. It does not reload listener sources,
-replace a service, restart Genera, or save a world. The separate lifecycle
-and boot runners below verify cold startup and detached persistence.
-
 If Quicklisp is installed outside the usual home directory, set
 `LISP_MCP_TEST_QUICKLISP` to its `setup.lisp` path for the test runners.
 This optional test setting does not change production startup.
@@ -1350,42 +1448,23 @@ The protocol runner checks shared fixtures in separate host and listener
 packages, schema and resource limits, reader-syntax rejection, literal
 newlines, and explicit envelope transport without legacy fallback.
 
-After loading the updated listener in Genera, run:
+### Versioned Genera checks
+
+Against a boot-loaded v1 listener in a disposable writable source root:
 
 ```sh
-GENERA_HOST=genera.example GENERA_PORT=8888 \
-  python3 tests/framing.py --live-genera
+GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
+  python3 tests/conformance.py --live-v1 NativeConformanceChecks -v
 ```
 
-The live check sends fragmented ASCII requests, verifies stdout and
-literal newlines, reuses a connection, checks malformed-client closure,
-and finishes with an evaluation through the host bridge. Host fixtures
-do not establish compatibility with Genera streams or condition handling.
-
-To check the paired codec sources against a running legacy listener:
-
-```sh
-GENERA_HOST=genera.example GENERA_PORT=8888 \
-  python3 tests/protocol.py --live-genera
-```
-
-This live check reloads both Lisp files, compares the shared fixtures in
-Genera, and temporarily selects envelope mode to check one framed reply
-per request and rejection without eval. It retains a legacy control
-connection and restores legacy mode when finished.
-
-To check authenticated hello/status and native service lifecycle:
-
-```sh
-GENERA_HOST=genera.example GENERA_PORT=8888 \
-  python3 tests/handshake.py --live-genera
-```
-
-This check requires a running legacy listener on a VLM. It reloads both
-sources, temporarily configures a versioned service with a test token,
-and checks identity, client closure, and bootstrap-loader replacement.
-It simulates boot-identity initialization without rebooting the world,
-then restores legacy mode and removes the test token.
+This native check creates a new source file and compiler output, exercises
+all nine execution entry points, retrieves results from a new host,
+checks output truncation, and deliberately evicts old completed ledger
+entries. It also checks stale-generation and oversized-frame rejection.
+Run only with no other client work pending; it leaves test definitions
+and files in the disposable runtime. It does not reload listener sources,
+replace a service, restart Genera, or save a world. The separate lifecycle
+and boot runners below verify cold startup and detached persistence.
 
 After independently cold-booting a world with the installed versioned
 hook, check its already running listener:
@@ -1572,6 +1651,49 @@ GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:SITE;' \
 Without `--live-v1`, checks use portable adapter and host fixtures.
 They cover capability discovery/loss, kind admission, bounded recorded
 paths, malformed replies, missing source, and recovery without replay.
+
+### Legacy compatibility checks
+
+These runners require a disposable legacy listener. Several temporarily
+replace its service or reload native sources and restore legacy mode.
+Use the versioned checks above for a running v1 deployment.
+
+After loading the updated listener in Genera, run:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/framing.py --live-genera
+```
+
+The live check sends fragmented ASCII requests, verifies stdout and
+literal newlines, reuses a connection, checks malformed-client closure,
+and finishes with an evaluation through the host bridge. Host fixtures
+do not establish compatibility with Genera streams or condition handling.
+
+To check the paired codec sources against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/protocol.py --live-genera
+```
+
+This live check reloads both Lisp files, compares the shared fixtures in
+Genera, and temporarily selects envelope mode to check one framed reply
+per request and rejection without eval. It retains a legacy control
+connection and restores legacy mode when finished.
+
+To check authenticated hello/status and native service lifecycle:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/handshake.py --live-genera
+```
+
+This check requires a running legacy listener on a VLM. It reloads both
+sources, temporarily configures a versioned service with a test token,
+and checks identity, client closure, and bootstrap-loader replacement.
+It simulates boot-identity initialization without rebooting the world,
+then restores legacy mode and removes the test token.
 
 To check structured evaluation and recovery on a running legacy listener:
 
