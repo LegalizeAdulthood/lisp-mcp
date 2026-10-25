@@ -1,0 +1,98 @@
+;;; Boot policy uses the real listener policy and explicit native substitutes.
+
+(load (merge-pathnames "service-fixture.lisp" *load-truename*))
+(in-package #:genera-protocol-fixture)
+
+(defvar *boot-checks* 0)
+(defvar *fixture-boot-head* (list "fixture" 1))
+(defvar *fixture-boot-clock* 1)
+(defvar *fixture-resets* 0)
+(defvar *fixture-network-failure* nil)
+(defvar *fixture-networks* 0)
+
+(defun bcheck (expected actual)
+  (incf *boot-checks*)
+  (unless (equal expected actual) (error "Expected ~S, got ~S" expected actual)))
+(defun mcp-native-boot-marker ()
+  (list *fixture-boot-head* 0 *fixture-boot-clock*))
+(defun mcp-enable-boot-network ()
+  (incf *fixture-networks*)
+  (when *fixture-network-failure* (error "secret diagnostic")))
+(defun mcp-call-contained (function)
+  (handler-case (values t (funcall function)) (error (e) (values nil e))))
+(defun mcp-reset-native-runtime ()
+  (incf *fixture-resets*)
+  (setf *mcp-service* nil *mcp-boot-id* nil *mcp-worker* nil
+        *mcp-worker-busy* nil *mcp-worker-failed* nil
+        *mcp-connections* nil *mcp-listener-installed* nil))
+
+(with-open-file (source (merge-pathnames "../genera-boot.lisp" *load-truename*))
+  (let ((text (with-output-to-string (out)
+                (loop for line = (read-line source nil nil) while line
+                      until (search ";;; --- Genera boot adapters ---" line)
+                      do (write-line line out)))))
+    (with-input-from-string (in text)
+      (loop for form = (read in nil nil) while form do (eval form)))))
+
+(mcp-start-service :protocol :v1 :token "private-token")
+(let ((boot *mcp-boot-id*) (service *mcp-service*))
+  (bcheck 1 (mcp-configure-boot :v1 "private-token" nil t))
+  (bcheck service *mcp-service*)
+  (bcheck boot *mcp-boot-id*)
+  (bcheck (getf service :service-id) (mcp-boot-start))
+  (bcheck 0 *fixture-resets*)
+  (bcheck (getf service :service-id) (mcp-boot-start))
+  (bcheck service *mcp-service*)
+  (bcheck nil (search "private-token" (prin1-to-string (mcp-boot-status))))
+  ;; Equal history values can still belong to a different restored world.
+  (setf *fixture-boot-head* (copy-list *fixture-boot-head*)
+        *mcp-worker-busy* 'saved-job *mcp-worker-failed* t
+        *mcp-connections* '(saved-stream) *mcp-worker* 'saved-worker)
+  (mcp-boot-start)
+  (bcheck 1 *fixture-resets*)
+  (bcheck nil (equal boot *mcp-boot-id*))
+  (bcheck nil (eq service *mcp-service*))
+  (bcheck nil *mcp-connections*)
+  (bcheck nil *mcp-worker-busy*)
+  (bcheck nil *mcp-worker-failed*)
+  (bcheck "private-token" (getf *mcp-service* :token))
+  (bcheck "fixture.vlod" (getf *mcp-service* :world)))
+
+(let ((boot *mcp-boot-id*) (service (getf *mcp-service* :service-id)))
+  ;; Same-boot source reload/configure, busy work, and repeated hook calls
+  ;; preserve identities and never clear tracked work.
+  (mcp-configure-boot :v1 "private-token" nil nil)
+  (let ((*mcp-worker-busy* 'live-job))
+    (bcheck service (mcp-boot-start))
+    (bcheck 'live-job *mcp-worker-busy*))
+  (bcheck boot *mcp-boot-id*)
+  (bcheck 1 *fixture-resets*)
+  ;; A warm-boot clock change also invalidates saved bridge resources.
+  (incf *fixture-boot-clock*)
+  (mcp-boot-start)
+  (bcheck 2 *fixture-resets*)
+  (bcheck nil (equal boot *mcp-boot-id*)))
+
+(mcp-configure-boot :v1 "private-token" nil t)
+(setf *fixture-boot-head* (copy-list *fixture-boot-head*)
+      *fixture-network-failure* t)
+(bcheck nil (mcp-boot-start))
+(bcheck :failed (getf (mcp-boot-status) :state))
+(bcheck nil (getf (mcp-boot-status) :running))
+(bcheck nil (search "secret" (prin1-to-string (mcp-boot-status))))
+(let ((boot *mcp-boot-id*) (resets *fixture-resets*))
+  (setf *fixture-network-failure* nil)
+  (mcp-boot-start)
+  (bcheck :ready (getf (mcp-boot-status) :state))
+  (bcheck nil (getf (mcp-boot-status) :error))
+  (bcheck boot *mcp-boot-id*)
+  (bcheck resets *fixture-resets*))
+
+(let ((configuration *mcp-boot-configuration*))
+  (dolist (arguments '((:invalid nil nil nil) (:legacy "token" nil nil)
+                       (:v1 "" nil nil) (:v1 nil "" nil)))
+    (bcheck t (handler-case (progn (apply #'mcp-configure-boot arguments) nil)
+                (error () t)))
+    (bcheck configuration *mcp-boot-configuration*)))
+
+(format t "~&Boot unit checks: ~D~%" *boot-checks*)

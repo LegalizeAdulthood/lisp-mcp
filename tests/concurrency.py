@@ -70,11 +70,12 @@ class ConcurrencyChecks(unittest.TestCase):
             # invalid internal job. It must exit without a console debugger,
             # retain the unresolved slot, and refuse another submission.
             fault = '''(progn
- (defun mcp-test-worker-failure ()
+ (defun mcp-test-worker-failure (owner)
    (let ((cell (list nil)))
      (scl:process-run-function "MCP isolated failure check"
        (lambda ()
          (let ((*mcp-state-lock* (process:make-lock "MCP isolated state" :recursive t))
+               (*mcp-worker* (if owner scl:*current-process* *mcp-worker*))
                (*mcp-worker-busy* (list :state :pending :request (list :id "fault") :client 42))
                (*mcp-worker-failed* nil) (*mcp-bootstrap-service* nil))
            (mcp-worker-loop)
@@ -85,9 +86,9 @@ class ConcurrencyChecks(unittest.TestCase):
      (scl:process-wait-with-timeout "MCP isolated failure" 3 (lambda () (car cell)))
      (car cell)))
  (compile 'mcp-test-worker-failure)
- (mcp-test-worker-failure))'''
+ (list (mcp-test-worker-failure t) (mcp-test-worker-failure nil)))'''
             self.assertEqual(legacy(control, fault.replace("\n", "\r")),
-                             "(T RUNNING WORKER-UNAVAILABLE)")
+                             "((T RUNNING WORKER-UNAVAILABLE) (NIL RUNNING BUSY))")
             legacy(control, '(setq *mcp-concurrency-counter* 0)')
             legacy(control, '(setf (getf *mcp-service* :protocol) :v1 *mcp-protocol* :v1)')
             try:

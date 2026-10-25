@@ -244,12 +244,15 @@ Set `GENERA_HOST` in the MCP configuration to enable the tool.
 
 #### Setting up the Genera side
 
-If `SYS:SITE;` is shared with the host filesystem, copy
-`genera-protocol.lisp` and `eval-server.lisp` into its backing directory.
-For example:
+Install `genera-protocol.lisp`, `eval-server.lisp`, and optionally
+`genera-boot.lisp` at verified Genera pathnames. `SYS:SITE;` may reside
+inside a FEP partition; copying files beside the VLM executable does not
+make them visible there. Use an available file service or a trusted
+installation channel, then verify the files in Genera:
 
-```sh
-cp genera-protocol.lisp eval-server.lisp /opt/symbolics/lib/sys.sct/site/
+```lisp
+(probe-file "SYS:SITE;genera-protocol.lisp")
+(probe-file "SYS:SITE;eval-server.lisp")
 ```
 
 Load both files in `COMMON-LISP-USER` from the Genera Lisp Listener:
@@ -269,6 +272,64 @@ To verify it is running:
 ```sh
 echo -n '11 (+ 1 2 3 4)' | nc -w 2 genera.example 8888 | cat -v
 ```
+
+#### Starting the listener at boot
+
+`genera-boot.lisp` registers `"MCP listener"` with Genera's warm
+initialization list. Genera runs this list after namespace and network
+initialization on cold and warm boots. Save the loaded definitions and
+hook in a separate world; startup then needs no console source loading.
+Keep the original world and partition as recovery copies.
+
+After installing all three source files at verified Genera paths, load
+them in `COMMON-LISP-USER`. To load definitions without starting a
+listener, bind `*mcp-autostart*` to NIL:
+
+```lisp
+(let ((*package* (find-package "COMMON-LISP-USER"))
+      (*mcp-autostart* nil))
+  (declare (special *mcp-autostart*))
+  (load "SYS:SITE;genera-protocol.lisp")
+  (load "SYS:SITE;eval-server.lisp")
+  (load "SYS:SITE;genera-boot.lisp"))
+```
+
+Register the desired protocol and optional token. For versioned startup:
+
+```lisp
+(mcp-install-boot-hook :protocol :v1 :enable-network t)
+(mcp-boot-status)
+```
+
+`:enable-network t` explicitly enables the configured Genera networks
+before starting the listener. Omit it when the site's startup already
+enables networking. Add `:token "shared-secret"` for authenticated
+versioned access; configuration, including that token, is saved in the
+world. Legacy startup remains available with `:protocol :legacy`.
+Supply `:world "world.vlod"` only when VLM world detection is unavailable.
+
+Use Save World or `si:disk-save` to create a complete world at a **new**
+destination. For a VLM, use its verified embedded-host pathname; ordinary
+file-service access to that host is a separate facility. Never overwrite
+the recovery world. Boot the new world with its matching partition and
+verify hello/status before entering console commands.
+
+The hook discards saved bridge streams, locks, request history, and
+worker references. It creates fresh runtime resources and new boot and
+service IDs. A repeated `mcp-boot-start` in the same boot preserves these
+resources and identities; reconnecting also preserves them. Installation
+replaces the named hook entry rather than adding another entry. It does
+not save a world or start a VLM.
+
+`mcp-boot-status` reports boot/listener source versions (currently 1),
+state, and bounded failure diagnostics without tokens. Startup failures
+are contained so Genera can finish booting. For manual recovery, inspect
+that status from the console, correct the installed source/configuration,
+reload the matching files with autostart disabled, and call
+`mcp-boot-start`. Configuration changes to a running service still require
+explicit service replacement. Save another new world after updating
+definitions or installation settings; an existing saved world retains
+its previous definitions.
 
 ### Framing limits
 
@@ -537,6 +598,7 @@ python3 tests/session.py
 python3 tests/stdio.py
 python3 tests/deadlines.py
 python3 tests/reconnect.py
+python3 tests/boot.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -596,6 +658,21 @@ sources, temporarily configures a versioned service with a test token,
 and checks identity, client closure, and bootstrap-loader replacement.
 It simulates boot-identity initialization without rebooting the world,
 then restores legacy mode and removes the test token.
+
+After independently cold-booting a world with the installed versioned
+hook, check its already running listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_EXPECTED_WORLD=bridge.vlod \
+  python3 tests/boot.py --live-genera
+```
+
+Set `GENERA_TOKEN` when configured. Optionally set
+`GENERA_PREVIOUS_BOOT_ID` to the identity observed before restoring the
+world; the check then requires a different boot ID. This runner does not
+launch, reboot, load sources, or save a world. It verifies repeated hook
+calls retain the worker, locks, service, and single hook registration;
+contained failures permit retry; a new TCP connection retains identity.
 
 To check structured evaluation and recovery on a running legacy listener:
 

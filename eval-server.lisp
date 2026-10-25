@@ -342,6 +342,9 @@ does not recognize."
 
 (defvar *mcp-protocol* :legacy
   "Explicit listener mode: :LEGACY eval or :V1 data envelopes.")
+(defconstant +mcp-listener-source-version+ 1)
+(defvar *mcp-autostart* t
+  "Bind NIL while loading definitions without starting runtime resources.")
 
 (defvar *mcp-service* nil)
 (defvar *mcp-boot-id* nil)
@@ -588,6 +591,18 @@ does not recognize."
        (setf *mcp-listener-installed* nil
              *mcp-boot-id* (mcp-new-generation-id "boot"))))))
 
+(defun mcp-check-service-configuration (protocol token world)
+  (unless (member protocol '(:legacy :v1)) (error "Unknown MCP protocol mode"))
+  (when token
+    (unless (and (stringp token) (<= 1 (length token) 4096)
+                 (every (lambda (ch) (<= 32 (char-code ch) 126)) token))
+      (error "Token must be nonempty printable ASCII text"))
+    (unless (eq protocol :v1) (error "Authentication requires version-1 mode")))
+  (when world
+    (mcp-v1-check-text world)
+    (when (zerop (length world)) (error "World name must be nonempty")))
+  t)
+
 (defun mcp-start-service (&key (protocol *mcp-protocol*)
                              (token nil token-supplied-p)
                              (world nil world-supplied-p) replace)
@@ -598,15 +613,7 @@ does not recognize."
             (selected-token (if token-supplied-p token (getf previous :token)))
             (selected-world (if world-supplied-p world
                                 (or (getf previous :world) (mcp-detect-world)))))
-       (unless (member protocol '(:legacy :v1)) (error "Unknown MCP protocol mode"))
-       (when selected-token
-         (unless (and (stringp selected-token) (<= 1 (length selected-token) 4096)
-                      (every (lambda (ch) (<= 32 (char-code ch) 126)) selected-token))
-           (error "Token must be nonempty printable ASCII text"))
-         (unless (eq protocol :v1) (error "Authentication requires version-1 mode")))
-       (when selected-world
-         (mcp-v1-check-text selected-world)
-         (when (zerop (length selected-world)) (error "World name must be nonempty")))
+       (mcp-check-service-configuration protocol selected-token selected-world)
        (when (and (eq protocol :v1) (null selected-world))
          (error "Configure a world name when it cannot be detected"))
        (when (and previous (getf previous :running) (not replace))
@@ -663,7 +670,9 @@ does not recognize."
              (error "MCP execution worker is unavailable; it was not replaced")))
           (t
            (setf *mcp-worker*
-                 (scl:process-run-function "MCP execution" #'mcp-worker-loop))))))
+                 (scl:process-run-function
+                  '(:name "MCP execution" :warm-boot-action :flush)
+                  #'mcp-worker-loop))))))
 
 (defun mcp-worker-failure (job condition)
   (if (getf job :legacy)
@@ -697,7 +706,10 @@ does not recognize."
   ;; Keep this boundary outside argument setup and completion bookkeeping,
   ;; including for a worker already running an older loop after source reload.
   (let ((success (mcp-call-contained (lambda () (mcp-execute-job job)))))
-    (unless success (mcp-with-state-lock (setf *mcp-worker-failed* t)))
+    (unless success
+      (mcp-with-state-lock
+        (when (eq scl:*current-process* *mcp-worker*)
+          (setf *mcp-worker-failed* t))))
     success))
 
 (defun mcp-worker-loop ()
@@ -719,7 +731,11 @@ does not recognize."
                           *mcp-worker-busy*)))
                (unless (mcp-run-job job) (return)))))))
     ;; Preserve an unresolved slot; never create another worker beside it.
-    (mcp-with-state-lock (setf *mcp-worker-failed* t))))
+    (mcp-with-state-lock
+      ;; A saved worker may unwind after native boot created its successor.
+      ;; Its cleanup must not poison that fresh service's execution slot.
+      (when (eq scl:*current-process* *mcp-worker*)
+        (setf *mcp-worker-failed* t)))))
 
 (defun mcp-close-connection (client)
   (let ((stream nil))
@@ -822,7 +838,9 @@ does not recognize."
       (return-from mcp-handle-client nil))
     (unwind-protect
         (progn
-          (scl:process-run-function "MCP response" #'mcp-client-writer client)
+          (scl:process-run-function
+           '(:name "MCP response" :warm-boot-action :flush)
+           #'mcp-client-writer client)
           (mcp-call-contained
            (lambda ()
              (loop while (and (getf service :running) (not (getf client :closed)))
@@ -867,5 +885,6 @@ does not recognize."
         mcp-ensure-worker mcp-execute-job mcp-run-job mcp-worker-loop
         mcp-close-connection mcp-client-writer mcp-handle-client))
 
-(mcp-upgrade-service)
-(mcp-start-service)
+(when *mcp-autostart*
+  (mcp-upgrade-service)
+  (mcp-start-service))
