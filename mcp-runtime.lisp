@@ -6,10 +6,77 @@
   (lock (sb-thread:make-mutex :name "MCP runtime"))
   (changed (sb-thread:make-waitqueue :name "MCP runtime"))
   (version "2024-11-05") initialized input-closed stop writer-stop failed
-  replies work control-work interrupt-work interrupt-supported definition-supported tools-dirty (calls (make-hash-table :test 'equal)))
+  replies work control-work interrupt-work interrupt-supported definition-supported tools-dirty
+  diagnostic-writer diagnostic-queue (diagnostic-count 0) (diagnostic-dropped 0) diagnostic-stop
+  (diagnostic-lock (sb-thread:make-mutex :name "MCP diagnostics"))
+  (diagnostic-changed (sb-thread:make-waitqueue :name "MCP diagnostics"))
+  (calls (make-hash-table :test 'equal)))
 (defvar *rpc-runtime* nil)
 (defconstant +rpc-work-limit+ 16)
 (defconstant +rpc-reply-limit+ 32)
+(defconstant +rpc-diagnostic-limit+ 64)
+(defvar *rpc-task-name* nil)
+(defvar *rpc-task-start* nil)
+(defvar *rpc-task-request* nil)
+
+(defun rpc-diagnostic-text (value)
+  (when (stringp value)
+    (if (and *genera-token* (search *genera-token* value)) "[redacted]"
+        (map 'string (lambda (ch) (if (<= 32 (char-code ch) 126) ch #\?))
+             (subseq value 0 (min 128 (length value)))))))
+
+(defun rpc-note-diagnostic (object text)
+  ;; Only scalar metadata is logged. Producers never write to stderr.
+  (when (and *rpc-runtime* (string= *profile* "genera"))
+    (let* ((runtime *rpc-runtime*)
+           (session (gethash "session" object))
+           (status (if (hash-table-p session) session object))
+           (startup (gethash "startup" status))
+           (process (and (hash-table-p startup) (gethash "process" startup)))
+           (envelope (and *rpc-task-request* (genera-request-envelope *rpc-task-request*)))
+           (event (jso "event" "genera-result" "timestamp" (- (get-universal-time) 2208988800)
+                       "operation" (or *rpc-task-name* "status-or-admission")
+                       "phase" (rpc-diagnostic-text (or (gethash "phase" status)
+                                                         (if *rpc-task-request* "execution" "control")))
+                       "request_id" (rpc-diagnostic-text (or (getf envelope :id) (gethash "request_id" object)))
+                       "boot_id" (rpc-diagnostic-text (or (getf envelope :boot-id) (gethash "boot_id" status)))
+                       "service_id" (rpc-diagnostic-text (or (getf envelope :service-id) (gethash "service_id" status)))
+                       "outcome" (rpc-diagnostic-text (or (gethash "request_state" object) (gethash "state" status)
+                                                        (if (eq (gethash "ok" object) 'yason:false) "failed" "completed")))
+                       "host_elapsed_ms" (if *rpc-task-start* (max 0 (round (* 1000 (- (genera-now) *rpc-task-start*)))) 0)
+                       "request_bytes" (if *rpc-task-request* (length (genera-request-payload *rpc-task-request*)) 0)
+                       "result_bytes" (length (sb-ext:string-to-octets text :external-format :utf-8)))))
+      (when (hash-table-p (gethash "error" object))
+        (setf (gethash "error_code" event)
+              (rpc-diagnostic-text (gethash "code" (gethash "error" object)))))
+      (when (hash-table-p process)
+        (dolist (key '("pid" "uid" "start_time"))
+          (when (integerp (gethash key process)) (setf (gethash key event) (gethash key process)))))
+      (let ((line (with-output-to-string (out) (yason:encode event out))))
+        (sb-thread:with-mutex ((rpc-runtime-diagnostic-lock runtime))
+          (if (>= (rpc-runtime-diagnostic-count runtime) +rpc-diagnostic-limit+)
+              (incf (rpc-runtime-diagnostic-dropped runtime))
+              (progn
+                (setf (rpc-runtime-diagnostic-queue runtime)
+                      (nconc (rpc-runtime-diagnostic-queue runtime) (list line)))
+                (incf (rpc-runtime-diagnostic-count runtime))
+                (sb-thread:condition-broadcast (rpc-runtime-diagnostic-changed runtime)))))))))
+
+(defun rpc-diagnostic-loop (runtime)
+  (handler-case
+      (loop
+        (let ((line
+                (sb-thread:with-mutex ((rpc-runtime-diagnostic-lock runtime))
+                  (loop while (and (null (rpc-runtime-diagnostic-queue runtime))
+                                   (not (rpc-runtime-diagnostic-stop runtime)))
+                        do (sb-thread:condition-wait (rpc-runtime-diagnostic-changed runtime)
+                                                     (rpc-runtime-diagnostic-lock runtime)))
+                  (unless (rpc-runtime-diagnostic-queue runtime) (return))
+                  (decf (rpc-runtime-diagnostic-count runtime))
+                  (pop (rpc-runtime-diagnostic-queue runtime)))))
+          (write-line line (rpc-runtime-diagnostic runtime))
+          (force-output (rpc-runtime-diagnostic runtime))))
+    (error () nil)))
 
 (define-condition rpc-argument-error (simple-error) ())
 (defun rpc-invalid (message)
@@ -41,7 +108,9 @@
     (make-response id result)))
 
 (defun rpc-structured-result (id object &optional failed)
-  (rpc-tool-result id (with-output-to-string (out) (yason:encode object out)) failed object))
+  (let ((text (with-output-to-string (out) (yason:encode object out))))
+    (rpc-note-diagnostic object text)
+    (rpc-tool-result id text failed object)))
 
 (defun rpc-startup-status (cycle)
   (let* ((report (genera-startup-cycle-launch-info cycle))
@@ -70,7 +139,8 @@
   (let ((session (rpc-runtime-session *rpc-runtime*)))
     (if (null session)
         (jso "state" "disconnected" "phase" "not-started" "connected" 'yason:false
-             "busy" 'yason:false "remote_status_stale" 'yason:true "pending_requests" 0)
+             "busy" 'yason:false "remote_status_stale" 'yason:true "pending_requests" 0
+             "diagnostics_dropped" (rpc-runtime-diagnostic-dropped *rpc-runtime*))
         (sb-thread:with-mutex ((genera-session-lock session))
           (let* ((hello (genera-session-hello session))
                  (cycle (genera-session-startup session))
@@ -89,6 +159,7 @@
                                              (work "executing") (t "ready"))
                               "phase" (rpc-name (if starting (genera-startup-cycle-phase cycle)
                                                      (genera-session-phase session)))
+                              "diagnostics_dropped" (rpc-runtime-diagnostic-dropped *rpc-runtime*)
                               "connected" (rpc-boolean connected)
                               "busy" (rpc-boolean (or work (getf (genera-session-cached-status session) :busy)))
                               "remote_status_stale"
@@ -214,7 +285,7 @@
         (setf (rpc-runtime-failed runtime) t)
         (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
 
-(defun rpc-run-work (task)
+(defun rpc-run-work-1 (task)
   (destructuring-bind (id name expression request) task
     (handler-case
         (cond
@@ -321,6 +392,10 @@
           (genera-cancel-preparation (rpc-runtime-session *rpc-runtime*) request :internal-error "File preparation failed"))
         (rpc-tool-failure id "internal-error" "Tool execution failed" request
                           (when (rpc-file-tool-p name) (rpc-load-context expression request)))))))
+
+(defun rpc-run-work (task)
+  (let ((*rpc-task-name* (second task)) (*rpc-task-start* (genera-now)) (*rpc-task-request* (fourth task)))
+    (rpc-run-work-1 task)))
 
 (defun rpc-pending-work (runtime control)
   (cond ((eq control :interrupt) (rpc-runtime-interrupt-work runtime))
@@ -567,7 +642,8 @@
       (rpc-invalid "timeout_ms must be a positive integer"))))
 
 (defun handle-tools-call (id params)
-  (let* ((name (gethash "name" params)) (arguments (gethash "arguments" params (jso))))
+  (let* ((name (gethash "name" params)) (arguments (gethash "arguments" params (jso)))
+         (*rpc-task-name* name) (*rpc-task-start* (genera-now)))
     (unless (and (stringp name) (find name (rpc-tools) :key (lambda (tool) (gethash "name" tool))
                                                                :test #'string=))
       (rpc-invalid "Unknown or disabled tool"))
@@ -676,14 +752,18 @@
   (sb-thread:with-mutex ((rpc-runtime-lock runtime))
     (setf (rpc-runtime-writer-stop runtime) t)
     (sb-thread:condition-broadcast (rpc-runtime-changed runtime)))
+  (sb-thread:with-mutex ((rpc-runtime-diagnostic-lock runtime))
+    (setf (rpc-runtime-diagnostic-stop runtime) t)
+    (sb-thread:condition-broadcast (rpc-runtime-diagnostic-changed runtime)))
   (if (string= *profile* "generic")
       (sb-thread:join-thread (rpc-runtime-writer runtime))
-      (let ((writer (rpc-runtime-writer runtime)))
-        (sb-thread:join-thread writer :timeout .25 :default nil)
-        (when (sb-thread:thread-alive-p writer)
-          ;; Genera's socket and the tool worker are already closed. Avoid
-          ;; SBCL's exit-time stdout flush waiting on a non-reading client.
-          (sb-ext:exit :code 0 :abort t)))))
+      (dolist (writer (list (rpc-runtime-writer runtime) (rpc-runtime-diagnostic-writer runtime)))
+        (when writer
+          (sb-thread:join-thread writer :timeout .25 :default nil)
+          (when (sb-thread:thread-alive-p writer)
+            ;; Socket and tool workers are closed; a blocked client stream
+            ;; must not make SBCL's exit-time flush retain the host process.
+            (sb-ext:exit :code 0 :abort t))))))
 
 (defun main ()
   (handler-case (configure)
@@ -698,7 +778,10 @@
           (rpc-runtime-control-worker runtime)
           (sb-thread:make-thread (lambda () (rpc-work-loop runtime t)) :name "MCP controls")
           (rpc-runtime-interrupt-worker runtime)
-          (sb-thread:make-thread (lambda () (rpc-work-loop runtime :interrupt)) :name "MCP interrupt confirmation"))
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime :interrupt)) :name "MCP interrupt confirmation")
+          (rpc-runtime-diagnostic-writer runtime)
+          (when (string= *profile* "genera")
+            (sb-thread:make-thread (lambda () (rpc-diagnostic-loop runtime)) :name "MCP diagnostics")))
     (unwind-protect
         (loop
           (let ((message (handler-case (read-json-rpc)

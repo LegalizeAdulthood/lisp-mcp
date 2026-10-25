@@ -41,13 +41,14 @@ class DetachedChecks(unittest.TestCase):
         self.addCleanup(self.stop_child)
 
     def stop_child(self):
-        if self.report.exists():
-            try:
-                pid = json.loads(self.report.read_text())["pid"]
-                if Path(f"/proc/{pid}/exe").resolve() == self.f.executable:
-                    os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, FileNotFoundError):
-                pass
+        # A failed duplicate-launch assertion may have created two fixtures.
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdecimal():
+                try:
+                    if entry.joinpath("exe").resolve() == self.f.executable:
+                        os.kill(int(entry.name), signal.SIGTERM)
+                except (ProcessLookupError, FileNotFoundError, PermissionError):
+                    pass
 
     def run_launch(self, body=None, environment=None, argv=None, log=None):
         q = lambda p: lisp_string(str(p))
@@ -83,7 +84,8 @@ class DetachedChecks(unittest.TestCase):
         self.f.world.rename(world)
         self.f.world = world
         before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in (world, self.f.partition)]
-        report, argv = self.run_launch(environment={"VLM_FIXTURE_DELAY": "1500"})
+        release = self.f.root / "release"
+        report, argv = self.run_launch(environment={"VLM_FIXTURE_RELEASE": str(release)})
         self.assertEqual(report[":action"], ":launched", report)
         child = json.loads(self.report.read_text())
         self.assertEqual(child["argv"], argv)
@@ -96,6 +98,7 @@ class DetachedChecks(unittest.TestCase):
         self.assertTrue(Path(f'/proc/{child["pid"]}').exists(), "child died with SBCL parent")
         self.assertEqual(json.loads(self.f.metadata_path().read_text())[2], child["pid"])
         self.assertEqual(self.f.probe()[":action"], ":observe", "child inherited launch locks")
+        release.write_text("release")
         deadline = time.monotonic() + 5
         while "after parent exit" not in self.log.read_text() and time.monotonic() < deadline:
             time.sleep(.03)
@@ -160,9 +163,10 @@ class DetachedChecks(unittest.TestCase):
         self.assertEqual(self.f.world.read_text(), "fixture world")
 
     def test_existing_process_is_observed_without_a_second_launch(self):
-        report, _ = self.run_launch()
+        release = self.f.root / "release"
+        report, _ = self.run_launch(environment={"VLM_FIXTURE_RELEASE": str(release)})
         self.assertEqual(report[":action"], ":launched", report)
-        report, _ = self.run_launch()
+        report, _ = self.run_launch(environment={"VLM_FIXTURE_RELEASE": str(release)})
         self.assertEqual(report[":action"], ":observe", report)
         self.assertEqual(self.log.read_text().count("fixture stdout before"), 1)
 

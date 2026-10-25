@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 static void string(FILE *out, const char *text)
@@ -22,6 +23,7 @@ int main(int argc, char **argv)
     const char *report = getenv("VLM_FIXTURE_REPORT");
     const char *delay = getenv("VLM_FIXTURE_DELAY");
     const char *code = getenv("VLM_FIXTURE_EXIT");
+    const char *release = getenv("VLM_FIXTURE_RELEASE");
     if (!report) return 90;
     FILE *out = fopen(report, "w");
     if (!out) return 91;
@@ -64,7 +66,17 @@ int main(int argc, char **argv)
     puts("fixture stdout before parent exit");
     fputs("fixture stderr before parent exit\n", stderr);
     fflush(NULL);
-    usleep((unsigned)(delay ? atoi(delay) : 3000) * 1000);
+    if (release) {
+        struct timespec start, now;
+        if (clock_gettime(CLOCK_MONOTONIC, &start)) return 95;
+        while (access(release, F_OK)) {
+            if (clock_gettime(CLOCK_MONOTONIC, &now)) return 95;
+            if (now.tv_sec - start.tv_sec >= 30) return 96;
+            usleep(10000);
+        }
+    } else {
+        usleep((unsigned)(delay ? atoi(delay) : 3000) * 1000);
+    }
     puts("fixture stdout after parent exit");
     fputs("fixture stderr after parent exit\n", stderr);
     fflush(NULL);

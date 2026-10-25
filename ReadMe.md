@@ -828,6 +828,53 @@ pending handshake or eval, while accepted Genera work continues. Generic
 stdin batches drain accepted tool calls in their existing order. Logs
 use stderr; stdout contains only JSON-RPC responses.
 
+### Diagnostics and recovery
+
+The Genera profile emits JSON diagnostic records on stderr with operation,
+phase, generation/request identity, host elapsed milliseconds, byte
+counts, outcome, and error code when present. Startup snapshots include
+verified PID, UID, and process start time when available. Forms, source
+contents, returned values, captured output, condition messages, and client
+RPC IDs are excluded. Configured token occurrences in identity fields are
+redacted. These records are diagnostic metadata, not a recovery journal.
+
+A separate writer drains at most 64 queued diagnostic records. A full
+queue drops records instead of delaying protocol responses or execution;
+`diagnostics_dropped` in cached status counts those drops. An unread
+stderr cannot retain the host process after EOF. Keep client diagnostics
+and the configured VLM log in private storage.
+
+Recover in this order:
+
+1. Read cached `genera_session_status`. For failed startup, inspect its
+   phase, error, and VLM log. Correct configuration or prerequisites,
+   then call `genera_ensure_session`. An existing VLM without a listener
+   is preserved after the boot deadline; another launch is refused.
+2. After a timeout or partial reply, preserve the original `request_id`,
+   `boot_id`, and `service_id`. Wait for reconnection and call
+   `genera_request_status` with that identity. A transient connection or
+   protocol fault can be reported before reconnection completes.
+3. Use a retained terminal result as the outcome. If still running,
+   continue observing or request the separately advertised interrupt.
+   A timeout, dropped connection, or abort request alone proves nothing
+   about completion. Do not resubmit the expression or file operation.
+4. For unknown or evicted history, inspect application state. Explicit
+   recovery requires the original identity, current expected generation,
+   acknowledgement of the unknown outcome, and fresh idle verification.
+   Service replacement loses ledger history; boot replacement also loses
+   the previous live world. Recovery does not recreate either state.
+5. Closing the MCP client leaves Genera running. Reopen a client and use
+   the saved identifiers for retained lookup. Shutdown or world replacement
+   is a separate operator action, never automatic request recovery.
+
+Inspection, file operations, tests, reset, and the compatibility alias
+share eval admission and uncertainty tracking. File-level definition
+lookup and targeted interrupt are capability-gated. Backtrace inspection
+and invoking named debugger restarts are unavailable; no such tools are
+advertised. Named test runners and source transfer require explicit
+configuration. Direct host file mapping additionally requires verified
+filesystem sharing; a Genera logical root alone does not establish it.
+
 ## Tools
 
 ### eval_host_cl
@@ -1247,7 +1294,40 @@ python3 tests/loading.py
 python3 tests/compiling.py
 python3 tests/transfer.py
 python3 tests/runners.py
+python3 tests/inspection.py
+python3 tests/definitions.py
+python3 tests/conformance.py
 ```
+
+Run the complete host suite sequentially, without modifying or reloading
+sources during a run:
+
+```sh
+python3 -m unittest discover -s tests -p '*.py' -v
+```
+
+The conformance runner checks both MCP revisions, complete tool schemas,
+the generic profile, and every execution entry point across deadline,
+late-result, partial-reply, and generation-change recovery. Diagnostic
+checks verify content/token exclusion and bounded progress with unread
+stderr. Detached-process fixtures use an explicit release barrier for
+parent-exit/discovery checks instead of assuming a short child lifetime.
+
+Against a boot-loaded v1 listener in a disposable writable source root:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
+  python3 tests/conformance.py --live-v1 NativeConformanceChecks -v
+```
+
+This native check creates a new source file and compiler output, exercises
+all nine execution entry points, retrieves results from a new host,
+checks output truncation, and deliberately evicts old completed ledger
+entries. It also checks stale-generation and oversized-frame rejection.
+Run only with no other client work pending; it leaves test definitions
+and files in the disposable runtime. It does not reload listener sources,
+replace a service, restart Genera, or save a world. The separate lifecycle
+and boot runners below verify cold startup and detached persistence.
 
 If Quicklisp is installed outside the usual home directory, set
 `LISP_MCP_TEST_QUICKLISP` to its `setup.lisp` path for the test runners.
