@@ -40,6 +40,63 @@ Add the following to your `.mcp.json` (or the MCP configuration of your client):
 
 Only `command` is required. The environment variables enable the optional tools.
 
+### WSL clients and local autostart
+
+Run the bridge in the same WSL distribution and non-root account as the
+VLM. Install SBCL and Quicklisp there, including `usocket` and `yason`.
+Load those dependencies once before connecting an MCP client so initial
+compilation output cannot enter the protocol stream. Local launch also
+requires Linux x86-64, `/usr/bin/setsid`, a working WSLg/X11 display, an
+accessible preconfigured persistent TAP, and read/write `/dev/net/tun`.
+The bridge inspects these prerequisites; it does not configure networking.
+
+Use the existing `lisp-mcp.sh` entry point. A Windows MCP client can run
+`wsl.exe` with an argument array; pass Linux environment settings through
+`env` inside WSL. For example, after installing a boot-enabled world:
+
+```json
+{
+    "mcpServers": {
+        "lisp-mcp": {
+            "command": "wsl.exe",
+            "args": [
+                "-d", "YourDistribution", "-u", "your-user", "--exec",
+                "env",
+                "LISP_MCP_PROFILE=genera", "GENERA_PROTOCOL=v1",
+                "GENERA_HOST=192.0.2.2", "GENERA_PORT=8888",
+                "GENERA_RUNTIME_MODE=local", "GENERA_AUTOSTART=true",
+                "GENERA_VLM_ROOT=/home/your-user/genera",
+                "GENERA_VLM_WORLD=bridge.vlod", "GENERA_VLM_PARTITION=fep0",
+                "GENERA_VLM_USER=your-user",
+                "GENERA_VLM_NETWORK=tap0:192.0.2.2;mask=255.255.255.0;gateway=192.0.2.1;preconfiguredTAP=yes",
+                "GENERA_STATE_DIR=/home/your-user/.local/state/lisp-mcp",
+                "/bin/sh", "/path/to/lisp-mcp/lisp-mcp.sh"
+            ]
+        }
+    }
+}
+```
+
+Replace the example paths, account, addresses, and TAP settings with
+verified values. The executable and debugger default to `genera` and
+`VLM_debugger` in the runtime root. All clients of that runtime must share
+the state directory. Use a Linux checkout for the shell entry point.
+For a Windows checkout containing CRLF, replace the final two arguments
+with the following; this preserves the entry point and its `$0` path:
+
+```json
+["/bin/sh", "-c", "exec /bin/sh -c \"$(tr -d '\\r' < \"$1\")\" \"$1\"",
+ "lisp-mcp", "/path/to/lisp-mcp/lisp-mcp.sh"]
+```
+
+Install the Genera boot hook below before enabling autostart. No console
+login is required for a correctly installed hook. To connect to an
+already running remote listener, omit all local runtime settings and
+keep the Genera profile with explicit `GENERA_PROTOCOL=v1`.
+The checked-in `.mcp.json` retains the generic/legacy example, including
+host and Swank tools. Client-specific deployment files can select v1
+without changing that workflow.
+
 ### Startup validation
 
 The bridge validates configuration before reading MCP requests or opening
@@ -483,9 +540,10 @@ world. Legacy startup remains available with `:protocol :legacy`.
 Supply `:world "world.vlod"` only when VLM world detection is unavailable.
 
 Use Save World or `si:disk-save` to create a complete world at a **new**
-destination. For a VLM, use its verified embedded-host pathname; ordinary
-file-service access to that host is a separate facility. Never overwrite
-the recovery world. Boot the new world with its matching partition and
+destination that does not already exist. For a VLM, use its verified
+embedded-host pathname; ordinary file-service access to that host is a
+separate facility. Never overwrite any existing saved world.
+Boot the new world with its matching partition and
 verify hello/status before entering console commands.
 
 The hook discards saved bridge streams, locks, request history, and
@@ -887,6 +945,34 @@ Lisp evaluator. Checks cover cold/warm startup, concurrent clients,
 joined ensure calls, boot deadlines, handshake rejection, failed boot,
 explicit retry, EOF, and preservation of unresolved execution. Real
 Genera cold-boot and stream behavior require the separate native checks.
+
+The lifecycle runner uses the existing shell entry point against an
+already boot-loaded v1 listener. Set the Genera profile and runtime
+environment, then run:
+
+```sh
+python3 tests/lifecycle.py --live-v1 --report /path/to/new-report.json
+```
+
+It checks responsive initialization/status, warm attach, repeated eval,
+persistent state, two-client serialization, client close/reopen, and a
+lost terminal reply reconciled without replay. It creates one uniquely
+named in-memory test variable and leaves Genera running in v1 mode.
+Reports contain generation/request identities and runtime paths; store
+them outside a public source checkout.
+
+With an absent endpoint and local autostart enabled, add `--cold` to
+require one real launch. Add `--previous-report /path/to/old-report.json`
+after booting a separate world copy to require a new boot identity and
+absence of the old in-memory marker. The runner never stops a VLM,
+copies a partition, or saves a world. Prepare the separate runtime and
+stop a disposable VLM explicitly before the cold check.
+
+Optional `--replace-service` replaces the idle listener and clears its
+history, then checks a changed service ID, retained boot/state, and
+reported history loss. Use a disposable test world with no other work.
+Older `--live-genera` runners below require legacy mode and restore it;
+do not run them against a v1 deployment.
 
 To check structured evaluation and recovery on a running legacy listener:
 
