@@ -62,6 +62,8 @@ class Bridge:
 
     def receive(self, timeout=4):
         packet = self.output.get(timeout=timeout)
+        while packet.get("method") == "notifications/tools/list_changed":
+            packet = self.output.get(timeout=timeout)
         if "bad_stdout" in packet:
             raise AssertionError(packet)
         return packet

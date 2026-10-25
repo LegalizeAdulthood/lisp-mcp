@@ -23,7 +23,7 @@
 
 (defstruct (genera-session (:constructor %make-genera-session))
   host port token expected-world (io-timeout 5) (connect-timeout 5) owner socket hello
-  runtime startup-managed startup startup-thread (startup-counter 0) (boot-timeout 300)
+  runtime startup-managed startup startup-thread (startup-counter 0) (boot-timeout 300) features-changed
   reconnect supervisor (retry-min .25) (retry-max 5) (health-interval 30)
   (observe-interval .5) (failures 0) (reconnects 0) retry-at health-at observe-at
   reconcile-needed generation-change cached-at observed-at connection-error (status-stale t)
@@ -136,7 +136,7 @@
      (when (getf response :ok)
        (dolist (key '(:world :package :busy :features))
          (unless (mcp-v1-present-p response key) (mcp-v1-error "Incomplete status")))))
-    (:request-status
+    ((:request-status :interrupt)
      (when (getf response :ok)
        (unless (and (equal (getf request :target-id) (getf response :target-id))
                     (mcp-v1-present-p response :request-state)
@@ -144,6 +144,9 @@
                         (not (null (member (getf response :request-state)
                                            '(:completed :failed :interrupted))))))
          (mcp-v1-error "Incomplete or mismatched request status")))))
+  (when (and (eq (getf request :op) :interrupt) (getf response :ok)
+             (not (eq (getf response :request-state) :interrupted)))
+    (mcp-v1-error "Interrupt success requires a terminal interrupted result"))
   response)
 
 (defun genera-session-deliver (session text)
@@ -251,7 +254,9 @@
                (setf socket (usocket:socket-connect
                             (genera-session-host session) (genera-session-port session)
                             :element-type '(unsigned-byte 8)
-                            :timeout connect-bound))))
+                            ;; One deadline covers DNS and connect. A second
+                            ;; usocket timeout can fire during error unwinding.
+                            :timeout nil))))
               (sb-thread:with-mutex ((genera-session-lock session))
                 (setf (genera-session-phase session) :hello)
                 (when (genera-session-stop session)
@@ -311,6 +316,8 @@
                         (genera-session-state session) :ready
                         (genera-session-phase session) :ready)
                   (sb-thread:condition-broadcast (genera-session-changed session)))
+                (when (genera-session-features-changed session)
+                  (funcall (genera-session-features-changed session) (getf greeting :features)))
                 (loop
                   (let ((request
                           (sb-thread:with-mutex ((genera-session-lock session))
@@ -397,7 +404,7 @@
 
 (defun genera-begin-session (&key (host *genera-host*) (port *genera-port*) token
                                 expected-world (io-timeout 5) (connect-timeout 5) reconnect
-                                runtime startup-managed (boot-timeout 300)
+                                runtime startup-managed (boot-timeout 300) features-changed
                                 (retry-min .25) (retry-max 5) (health-interval 30) (observe-interval .5))
   "Start the I/O owner without waiting for connection or hello."
   (dolist (value (list io-timeout connect-timeout boot-timeout retry-min retry-max health-interval observe-interval))
@@ -407,6 +414,7 @@
                                      :expected-world expected-world :io-timeout io-timeout
                                      :connect-timeout connect-timeout :reconnect reconnect
                                      :runtime runtime :startup-managed startup-managed :boot-timeout boot-timeout
+                                     :features-changed features-changed
                                      :retry-min retry-min :retry-max retry-max
                                      :health-interval health-interval :observe-interval observe-interval)))
     (mcp-v1-encode (genera-session-hello-envelope session) :request)
@@ -441,10 +449,13 @@
       (error (or (genera-session-failure session)
                  (make-condition 'genera-session-error :kind :closed
                                  :format-control "Genera session is closed"))))
-    (unless (member operation '(:eval :status :request-status))
+    (unless (member operation '(:eval :status :request-status :interrupt))
       (genera-session-error :unsupported "Unsupported session operation"))
     (unless (member operation (getf (genera-session-hello session) :features))
       (genera-session-error :unsupported "Listener does not advertise this operation"))
+    (let ((expected (getf fields :expected-generation)))
+      (when expected (apply #'genera-check-generation session expected))
+      (remf fields :expected-generation))
     (let* ((execution (eq operation :eval))
            (idle-only (getf fields :idle-only))
            (idle-option (remf fields :idle-only))
@@ -611,17 +622,15 @@
     (sb-thread:condition-broadcast (genera-session-changed session))))
 
 (defun genera-finish-startup (session cycle &optional failure)
-  ;; Publish failure before making the ticket retryable. Capture only its owner.
+  ;; Publish failure before making the ticket retryable. The I/O owner's
+  ;; connect/hello waits already end at this cycle's deadline; do not race
+  ;; their timeout unwind with a second asynchronous interruption.
   (when failure (genera-session-fail session failure))
-  (let ((owner nil))
-    (sb-thread:with-mutex ((genera-session-lock session))
-      (setf owner (genera-session-owner session)
-            (genera-startup-cycle-failure cycle) failure
-            (genera-startup-cycle-phase cycle) (if failure :failed :ready)
-            (genera-startup-cycle-done cycle) t)
-      (sb-thread:condition-broadcast (genera-session-changed session)))
-    (when (and failure owner (sb-thread:thread-alive-p owner) (genera-session-blocking session))
-      (ignore-errors (sb-thread:interrupt-thread owner (lambda () (error failure)))))))
+  (sb-thread:with-mutex ((genera-session-lock session))
+    (setf (genera-startup-cycle-failure cycle) failure
+          (genera-startup-cycle-phase cycle) (if failure :failed :ready)
+          (genera-startup-cycle-done cycle) t)
+    (sb-thread:condition-broadcast (genera-session-changed session))))
 
 (defun genera-startup-report-error (report)
   (let* ((check (find-if-not (lambda (row) (getf row :ok))
@@ -727,10 +736,12 @@
                (equal service (getf (genera-session-hello session) :service-id)))
     (genera-session-error :generation-changed "Requested generation differs; prior history is unavailable")))
 
-(defun genera-lookup-request (session id boot service)
+(defun genera-lookup-request (session id boot service &key timeout)
   (genera-control-connection session)
   (genera-check-generation session boot service)
-  (let ((response (genera-call session :request-status :target-id id)) (source :ledger))
+  (let ((response (genera-call session :request-status :target-id id
+                   :expected-generation (list boot service)
+                   :host-timeout (or timeout (genera-session-io-timeout session)))) (source :ledger))
     (when (getf response :ok)
       (sb-thread:with-mutex ((genera-session-lock session))
         (let* ((work (genera-session-execution session))
@@ -775,6 +786,34 @@
                          (genera-session-execution session) known))))
           (sb-thread:condition-broadcast (genera-session-changed session)))))
     (values response source)))
+
+(defun genera-interrupt-request (session id boot service &optional (timeout 5))
+  "Signal once, then require a committed interrupted result within TIMEOUT."
+  (unless (and (realp timeout) (< 0 timeout) (<= timeout 5))
+    (genera-session-error :invalid-request "Interrupt wait must be in (0,5] seconds"))
+  (genera-control-connection session)
+  (genera-check-generation session boot service)
+  (let* ((end (+ (genera-now) timeout))
+         (response (genera-call session :interrupt :target-id id :host-timeout timeout
+                      :expected-generation (list boot service))))
+    (loop
+      (cond ((and (getf response :ok) (getf response :result)
+                  (eq (getf response :request-state) :interrupted))
+             (return response))
+            ((or (eq (getf response :interrupt-state) :refused)
+                 (and (not (getf response :ok))
+                      (not (eq (getf (getf response :error) :code) :interrupt-pending))))
+             (genera-session-error (or (getf (getf response :error) :code) :interrupt-refused)
+                                   "Target interruption was refused" response))
+            ((getf response :result)
+             (genera-session-error :request-not-active "Target finished without a confirmed interruption" response)))
+      (let ((remaining (- end (genera-now))))
+        (when (<= remaining .01)
+          (genera-session-error :interrupt-pending
+            "No terminal interruption recorded; work may continue or require debugger recovery" response))
+        (sleep (min .02 (/ remaining 2)))
+        (setf response (genera-lookup-request session id boot service
+                                             :timeout (max .001 (- end (genera-now)))))))))
 
 (defun genera-recover-request (session id boot service expected-boot expected-service acknowledge)
   (unless acknowledge (genera-session-error :acknowledgement-required "Acknowledge the specific unknown outcome"))

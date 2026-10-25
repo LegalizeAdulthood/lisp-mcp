@@ -270,7 +270,9 @@ does not recognize."
         (unless (eq (read stream nil eof) eof) (error "Expected exactly one form"))
         form))))
 
-(defun mcp-v1-eval (request service)
+(defvar *mcp-interruptible-job* nil)
+
+(defun mcp-v1-eval (request service &optional job)
   "Read, evaluate, and print one authorized form with bounded retained output."
   (when (mcp-v1-present-p request :timeout-ms)
     (return-from mcp-v1-eval
@@ -313,16 +315,19 @@ does not recognize."
                         (ansi-common-lisp:muffle-warning condition))))
                  (setf printed
                        (mapcar (lambda (value) (mcp-render value budget))
-                               (multiple-value-list (eval form)))))))))
+                               (multiple-value-list
+                                (let ((*mcp-interruptible-job* job)) (eval form))))))))))
       (let* ((diagnostics (make-mcp-budget :remaining 4096))
+             (interrupted (and (not success) (getf job :interrupt-delivered)
+                               (typep outcome 'sys:abort)))
              (result-package (mcp-render package-name diagnostics nil))
              (failure (unless success
-                        (list :code phase
+                        (list :code (if interrupted :interrupted phase)
                               :condition-type (mcp-render (type-of outcome) diagnostics)
                               :message (mcp-render outcome diagnostics nil)))))
         (append (list :version 1 :id (getf request :id) :ok success)
                 (mcp-v1-generation service)
-                (list :request-state (if success :completed :failed)
+                (list :request-state (cond (success :completed) (interrupted :interrupted) (t :failed))
                       :values printed :value-count (length printed)
                       :stdout (mcp-capture-text stdout)
                       :stderr (mcp-capture-text stderr)
@@ -418,6 +423,9 @@ does not recognize."
                 (list :target-id (if lookup (getf request :target-id)
                                     (getf request :id))
                       :request-state (if entry (getf entry :state) :unknown))
+                (when (and entry (eq entry (getf *mcp-worker-busy* :entry))
+                           (getf *mcp-worker-busy* :interrupt-state))
+                  (list :interrupt-state (getf *mcp-worker-busy* :interrupt-state)))
                 (when result (list :result result))))))
 
 (defun mcp-finish-job (job result)
@@ -476,7 +484,8 @@ does not recognize."
               (append (mcp-v1-failure request code "Execution was not accepted" service)
                       (when active (list :active-request-id active))))))
       (let ((job (list :request request :service service :client client
-                       :legacy legacy :state :pending :result nil)))
+                       :legacy legacy :state :pending :result nil
+                       :interrupt-state nil :interrupt-delivered nil)))
         (unless legacy
           (let ((entry (list :id (getf request :id)
                              :identity (mcp-request-identity request)
@@ -486,6 +495,36 @@ does not recognize."
             (setf (getf job :entry) entry (getf service :active) entry)))
         (setf (getf client :execution) job *mcp-worker-busy* job)
         nil))))
+
+(defun mcp-request-interrupt (request service)
+  "Schedule once for this job; only its committed interruption is success."
+  (unless (mcp-interrupt-supported-p)
+    (return-from mcp-request-interrupt
+      (mcp-v1-failure request :unsupported-operation "Targeted interruption is unavailable" service)))
+  (mcp-with-state-lock
+    (let* ((id (getf request :target-id)) (entry (mcp-find-request service id))
+           (job *mcp-worker-busy*))
+      (when (and entry (eq (getf entry :state) :interrupted) (getf entry :result))
+        (return-from mcp-request-interrupt (mcp-request-response request service entry t)))
+      (unless (and (consp job) (not (getf job :legacy)) (eq service (getf job :service))
+                   (equal id (getf (getf job :request) :id))
+                   (eq entry (getf job :entry)) (eq (getf entry :state) :running))
+        (return-from mcp-request-interrupt
+          (mcp-v1-failure request :request-not-active "Target is not the active request" service)))
+      (unless (mcp-worker-live-p)
+        (return-from mcp-request-interrupt
+          (mcp-v1-failure request :worker-unavailable "Execution worker is unavailable" service)))
+      (unless (getf job :interrupt-state)
+        (setf (getf job :interrupt-state) :pending)
+        (mcp-schedule-interrupt job))
+      (mcp-v1-failure request
+        (if (eq (getf job :interrupt-state) :refused) :interrupt-refused :interrupt-pending)
+        "No terminal interruption recorded; inspect request status or debugger recovery" service))))
+
+(defun mcp-interrupt-target-p (job current-worker)
+  (and current-worker (eq job *mcp-worker-busy*) (eq job *mcp-interruptible-job*)
+       (eq (getf job :service) *mcp-service*)
+       (eq (getf job :interrupt-state) :pending)))
 
 (defun mcp-write-envelope (stream response)
   "Write one raw-ASCII data envelope, without diagnostic replacement."
@@ -515,7 +554,8 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features '(:status :request-status :eval)
+                :features (append '(:status :request-status :eval)
+                                  (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
                 :history-count (length (getf service :history))
@@ -559,6 +599,7 @@ does not recognize."
     ((eq (getf request :op) :request-status)
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
+    ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
     ((eq (getf request :op) :eval)
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
@@ -643,6 +684,36 @@ does not recognize."
 
 ;;; --- Genera service adapters ---
 
+(defun mcp-interrupt-supported-p ()
+  (every (lambda (name) (let ((symbol (find-symbol name "SCL")))
+                         (and symbol (fboundp symbol))))
+         '("PROCESS-INTERRUPT" "PROCESS-ABORT")))
+
+(defun mcp-deliver-interrupt (job)
+  ;; Runs in the target's environment. Never abort bookkeeping or a successor.
+  (if (mcp-interrupt-target-p job (eq scl:*current-process* *mcp-worker*))
+      (progn
+        (setf (getf job :interrupt-delivered) t (getf job :interrupt-state) :delivered)
+        ;; No query, reset, forced unwind, or deferred abort of a later job.
+        (funcall (find-symbol "PROCESS-ABORT" "SCL") scl:*current-process*
+                 :all nil :query nil :time-out 0)
+        (setf (getf job :interrupt-delivered) nil (getf job :interrupt-state) :refused))
+      (setf (getf job :interrupt-state) :refused)))
+
+(defun mcp-schedule-interrupt (job)
+  ;; Dispatch holds the state lock. The native API must run outside that lock;
+  ;; even PROCESS-INTERRUPT can wait on unusual stack-group states.
+  (let ((worker *mcp-worker*))
+    (scl:process-run-function
+     '(:name "MCP interrupt" :warm-boot-action :flush)
+     (lambda ()
+       (unless (mcp-call-contained
+                (lambda ()
+                  (funcall (find-symbol "PROCESS-INTERRUPT" "SCL") worker
+                           #'mcp-deliver-interrupt job)
+                  t))
+         (setf (getf job :interrupt-state) :refused))))))
+
 (defvar *mcp-state-lock* (process:make-lock "MCP state" :recursive t))
 (defvar *mcp-lifecycle-lock* (process:make-lock "MCP lifecycle" :recursive t))
 
@@ -695,7 +766,7 @@ does not recognize."
          (lambda ()
            (if (getf job :legacy)
                (multiple-value-list (mcp-eval (getf (getf job :request) :form)))
-               (mcp-v1-eval (getf job :request) (getf job :service)))))
+               (mcp-v1-eval (getf job :request) (getf job :service) job))))
       (unless success
         (setf result (mcp-worker-failure job result))
         (unless (getf job :legacy)
@@ -881,6 +952,7 @@ does not recognize."
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
+        mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service
         mcp-ensure-worker mcp-execute-job mcp-run-job mcp-worker-loop
         mcp-close-connection mcp-client-writer mcp-handle-client))

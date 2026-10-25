@@ -58,7 +58,7 @@ def wire(value):
         return str(value)
     if isinstance(value, dict):
         def field(key, item):
-            if key in [":op", ":request-state", ":code"]:
+            if key in [":op", ":request-state", ":interrupt-state", ":code"]:
                 return item if isinstance(item, str) and item.startswith(":") else wire(item)
             if key == ":features":
                 return "(" + " ".join(item) + ")"

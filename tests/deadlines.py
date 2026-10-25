@@ -113,7 +113,7 @@ class DeadlineChecks(unittest.TestCase):
                 mcp.receive(timeout=.1)
             mcp.call("genera_eval", "next", form="43")
             self.assertEqual(structured(mcp.receive())["values"], ["43"])
-            self.assertEqual(sum(p["id"] == "once" for p in mcp.received), 1)
+            self.assertEqual(sum(p.get("id") == "once" for p in mcp.received), 1)
         self.assertEqual([r[":form"] for r in evaluations], ["side-effect", "43"])
 
     def test_ledger_result_releases_block_before_original_reply(self):

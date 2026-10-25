@@ -11,6 +11,8 @@ The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
 `genera_recover_session`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
+It additionally exposes `genera_interrupt` after a validated listener
+hello advertises targeted interruption.
 
 ## Prerequisites
 
@@ -398,6 +400,52 @@ generation change, explicit recovery records `history_lost: true`.
 Successful recovery records `acknowledged: true` while preserving the
 outcome as `unknown`. It never retries or cancels work. Another client's
 later admission can still cause a subsequent eval to receive busy.
+
+### Targeted interruption
+
+The optional `genera_interrupt` tool requires `request_id`, `boot_id`,
+and `service_id` for the exact target. Obtain these from an eval result,
+an unresolved request, or cached status's `active_request_id` and
+generation fields. `timeout_ms` optionally bounds the confirmation wait
+to 1..5000 milliseconds, default 5000. It does not impose a remote
+execution deadline.
+
+The tool appears only after the listener advertises `:interrupt` in a
+verified hello. The Genera profile advertises changing tool lists and
+sends `notifications/tools/list_changed` when support changes. Refresh
+`tools/list` after that notification. Older listeners retain the six
+base tools; generic host/Swank discovery is unchanged.
+See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
+
+The wire operation is `:interrupt` with `:target-id` and the current
+generation. It schedules at most one delivery for that job. Delivery
+rechecks the actual worker, job object, service, and dynamic evaluation
+scope. A callback arriving during bookkeeping or a successor request
+cannot abort that request. Stale generations and inactive targets are
+explicit errors. A repeated interrupt of a retained interrupted request
+returns that outcome without signalling again.
+
+Native delivery uses `PROCESS-INTERRUPT` and a non-forcing
+`PROCESS-ABORT` with `:all nil`, `:query nil`, and `:time-out 0`.
+Protected regions can refuse the abort. Neither the worker nor the VLM
+is killed, reset, or restarted. Control operations remain available
+while the worker evaluates or unwinds cleanup.
+Confirmation has a separate bounded work queue, so live status refresh
+and request lookup also remain available during that wait.
+
+Success requires a committed ledger entry with request state
+`interrupted` and its complete retained result. The original eval is a
+tool error with code `interrupted`; captured output and warnings remain
+available. An abort request, client timeout, or lost reply never proves
+that execution stopped. A short confirmation wait can end while cleanup
+continues. Retain the target identity and use `genera_request_status`
+before attempting further work; the lookup reconciles a terminal result.
+
+Explicit `BREAK` can enter Genera's debugger while status stays live.
+Targeted abort can unwind that request through the same result path.
+If no terminal outcome is recorded, the tool reports pending, refusal,
+or a transport/deadline error. Inspect status and the native debugger;
+do not treat a missing result as cancellation or force a worker reset.
 
 Local history retains up to 32 records, with its limit and eviction count
 in session status; unresolved records are retained ahead of terminal or
@@ -835,6 +883,7 @@ python3 tests/preflight.py
 python3 tests/launch.py
 python3 tests/detached.py
 python3 tests/startup.py
+python3 tests/interrupt.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -973,6 +1022,19 @@ history, then checks a changed service ID, retained boot/state, and
 reported history loss. Use a disposable test world with no other work.
 Older `--live-genera` runners below require legacy mode and restore it;
 do not run them against a v1 deployment.
+
+After installing the updated listener in a disposable running v1 world,
+check targeted interruption separately:
+
+```sh
+GENERA_HOST=genera.example LISP_MCP_PROFILE=genera GENERA_PROTOCOL=v1 \
+  python3 tests/interrupt.py --live-v1
+```
+
+Set `GENERA_TOKEN` when configured. This runner leaves v1 selected and
+does not reload sources, restart Genera, or save a world. Native checks
+cover cleanup, protected-region refusal, explicit debugger recovery,
+delayed callbacks, worker survival, and an unrelated Lisp process.
 
 To check structured evaluation and recovery on a running legacy listener:
 

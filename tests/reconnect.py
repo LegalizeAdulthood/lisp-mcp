@@ -393,7 +393,7 @@ class ReconnectChecks(unittest.TestCase):
                     self.assertEqual(structured(mcp.receive())["values"], ["1"])
                     with self.assertRaises(queue.Empty):
                         mcp.receive(timeout=.1)
-                    self.assertEqual(sum(p["id"] == "once" for p in mcp.received), 1)
+                    self.assertEqual(sum(p.get("id") == "once" for p in mcp.received), 1)
             finally:
                 legacy(control, '(setf (getf *mcp-service* :protocol) :legacy *mcp-protocol* :legacy)')
             self.assertEqual(legacy(control, '*mcp-reconnect-check*'), "1")

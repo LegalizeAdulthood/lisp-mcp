@@ -11,6 +11,7 @@
 (defvar *fixture-world* "fixture.vlod")
 (defvar *fixture-worker-live* t)
 (defvar *fixture-worker-owner* nil)
+(defvar *mcp-interruptible-job* nil)
 
 (defun send (stream operation)
   (ecase operation (:tyi (read-char stream nil nil))))
@@ -28,6 +29,9 @@
 (defun mcp-worker-live-p () *fixture-worker-live*)
 (defun mcp-legacy-worker-owner-p () *fixture-worker-owner*)
 (defun mcp-ensure-worker () nil)
+(defun mcp-interrupt-supported-p () nil)
+(defun mcp-schedule-interrupt (job) (declare (ignore job))
+  (error "Native interruption requires a live Genera acceptance check"))
 (defun mcp-v1-eval (request service)
   (declare (ignore request service))
   (error "Native evaluation requires the live Genera acceptance check"))

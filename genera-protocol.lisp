@@ -8,12 +8,13 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
     :stale-generation :service-unavailable :package-not-found :reader-error
-    :evaluation-error :busy :worker-unavailable :request-id-conflict))
+    :evaluation-error :busy :worker-unavailable :request-id-conflict
+    :interrupted :interrupt-pending :interrupt-refused :request-not-active))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -22,7 +23,9 @@
     :active-request-id :worker-unavailable
     :result :history-limit :history-count :history-byte-limit :history-bytes
     :history-evictions :request-id-conflict
-    :hello :status :eval :request-status :running :completed :failed
+    :hello :status :eval :request-status :interrupt :running :completed :failed
+    :interrupt-pending :interrupt-refused :request-not-active
+    :interrupt-state :pending :delivered :refused
     :interrupted :unknown :unsupported-operation :invalid-request
     :unsupported-version :expected-world :authentication-failed
     :world-mismatch :handshake-required :stale-generation :service-unavailable
@@ -174,6 +177,7 @@
     (:features (and (listp value)
                     (every (lambda (item) (member item *mcp-v1-operations*)) value)))
     (:state (member value '(:running :completed :failed :interrupted :unknown)))
+    (:interrupt-state (member value '(:pending :delivered :refused)))
     (otherwise nil)))
 
 (defun mcp-v1-properties (object types)
@@ -197,13 +201,13 @@
              (:status '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
-             (:request-status '(:boot-id :service-id :target-id))))
+             ((:request-status :interrupt) '(:boot-id :service-id :target-id))))
          (response-keys
            '(:boot-id :service-id :world :package :busy :active-request-id :features :ok
              :request-state :values :value-count :stdout :stderr :warnings
              :elapsed-ms :truncated :replaced :error :target-id :result
              :history-limit :history-count :history-byte-limit :history-bytes
-             :history-evictions)))
+             :history-evictions :interrupt-state)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -215,7 +219,7 @@
            (unless (getf object key) (mcp-v1-error "Missing generation identity"))))
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
-       (when (and (eq (getf object :op) :request-status)
+       (when (and (member (getf object :op) '(:request-status :interrupt))
                   (null (getf object :target-id)))
          (mcp-v1-error "Missing target request identity")))
       (:response
@@ -226,7 +230,7 @@
            (mcp-v1-validate result :response)
            (unless (and (getf object :ok) (getf object :target-id)
                         (not (mcp-v1-present-p result :result))
-                        (member (getf object :request-state) '(:completed :failed))
+                        (member (getf object :request-state) '(:completed :failed :interrupted))
                         (eq (getf object :request-state) (getf result :request-state))
                         (every (lambda (key) (equal (getf object key) (getf result key)))
                                '(:boot-id :service-id))
@@ -268,6 +272,7 @@
               (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
               (:print-level . :print-limit) (:print-length . :print-limit)
               (:target-id . :id) (:request-state . :state) (:values . :strings)
+              (:interrupt-state . :interrupt-state)
               (:value-count . :nonnegative) (:stdout . :text) (:stderr . :text)
               (:warnings . :strings) (:elapsed-ms . :nonnegative)
               (:history-limit . :nonnegative) (:history-count . :nonnegative)
@@ -309,7 +314,9 @@
       (unless (mcp-v1-present-p response key)
         (mcp-v1-error "Incomplete eval response")))
     (unless (eq (getf response :request-state)
-                (if (getf response :ok) :completed :failed))
+                (cond ((getf response :ok) :completed)
+                      ((eq (getf (getf response :error) :code) :interrupted) :interrupted)
+                      (t :failed)))
       (mcp-v1-error "Invalid terminal eval state"))
     (when (and (not (getf response :ok))
                (not (mcp-v1-present-p (getf response :error) :condition-type)))

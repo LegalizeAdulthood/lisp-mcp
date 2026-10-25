@@ -2,11 +2,11 @@
 
 (in-package #:lisp-mcp)
 
-(defstruct rpc-runtime input output diagnostic writer worker control-worker session
+(defstruct rpc-runtime input output diagnostic writer worker control-worker interrupt-worker session
   (lock (sb-thread:make-mutex :name "MCP runtime"))
   (changed (sb-thread:make-waitqueue :name "MCP runtime"))
   (version "2024-11-05") initialized input-closed stop writer-stop failed
-  replies work control-work (calls (make-hash-table :test 'equal)))
+  replies work control-work interrupt-work interrupt-supported tools-dirty (calls (make-hash-table :test 'equal)))
 (defvar *rpc-runtime* nil)
 (defconstant +rpc-work-limit+ 16)
 (defconstant +rpc-reply-limit+ 32)
@@ -154,6 +154,15 @@
               (nconc (rpc-runtime-replies runtime) (list response)))
         (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
 
+(defun rpc-note-features (runtime features)
+  ;; The socket owner must not wait for room in the response queue.
+  (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+    (let ((supported (not (null (member :interrupt features)))))
+      (unless (eq supported (rpc-runtime-interrupt-supported runtime))
+        (setf (rpc-runtime-interrupt-supported runtime) supported
+              (rpc-runtime-tools-dirty runtime) t)
+        (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
+
 (defun rpc-write-loop (runtime)
   (handler-case
       (let ((*standard-output* (rpc-runtime-output runtime)))
@@ -161,11 +170,15 @@
           (let ((response
                   (sb-thread:with-mutex ((rpc-runtime-lock runtime))
                     (loop while (and (null (rpc-runtime-replies runtime))
+                                     (not (rpc-runtime-tools-dirty runtime))
                                      (not (rpc-runtime-writer-stop runtime)))
                           do (sb-thread:condition-wait (rpc-runtime-changed runtime)
                                                        (rpc-runtime-lock runtime)))
-                    (when (null (rpc-runtime-replies runtime)) (return))
-                    (prog1 (pop (rpc-runtime-replies runtime))
+                    (when (and (null (rpc-runtime-replies runtime))
+                               (not (rpc-runtime-tools-dirty runtime))) (return))
+                    (prog1 (if (rpc-runtime-replies runtime) (pop (rpc-runtime-replies runtime))
+                               (progn (setf (rpc-runtime-tools-dirty runtime) nil)
+                                      (jso "jsonrpc" "2.0" "method" "notifications/tools/list_changed")))
                       (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
             (write-json-rpc response)
             (sb-thread:with-mutex ((rpc-runtime-lock runtime))
@@ -190,6 +203,12 @@
              (let ((response (genera-call session :status)))
                (if (getf response :ok) (rpc-structured-result id (rpc-session-status))
                    (rpc-structured-result id (rpc-bridge-json response) t)))))
+          ((string= name "genera_interrupt")
+           (let ((response (genera-interrupt-request (rpc-runtime-session *rpc-runtime*)
+                             (gethash "request_id" expression) (gethash "boot_id" expression)
+                             (gethash "service_id" expression)
+                             (/ (gethash "timeout_ms" expression 5000) 1000))))
+             (rpc-structured-result id (rpc-bridge-json response))))
           ((member name '("genera_request_status" "genera_recover_session") :test #'equal)
            (let* ((session (rpc-runtime-session *rpc-runtime*))
                   (arguments expression)
@@ -226,10 +245,31 @@
                       (t (eval-genera expression)))
               (rpc-tool-result id text failed))))
       (genera-session-error (condition)
+        (if (string= name "genera_interrupt")
+            (let ((object (jso "ok" 'yason:false
+                              "error" (jso "code" (rpc-name (genera-session-error-kind condition))
+                                           "message" (princ-to-string condition))
+                              "session" (rpc-session-status))))
+              (dolist (key '("request_id" "boot_id" "service_id"))
+                (setf (gethash key object) (gethash key expression)))
+              (when (genera-session-error-response condition)
+                (setf (gethash "observation" object)
+                      (rpc-bridge-json (genera-session-error-response condition))))
+              (rpc-structured-result id object t))
         (rpc-tool-failure id (rpc-name (or (getf (getf (genera-session-error-response condition) :error) :code)
                                           (genera-session-error-kind condition)))
-                          (princ-to-string condition) request))
+                          (princ-to-string condition) request)))
       (error () (rpc-tool-failure id "internal-error" "Tool execution failed" request)))))
+
+(defun rpc-pending-work (runtime control)
+  (cond ((eq control :interrupt) (rpc-runtime-interrupt-work runtime))
+        (control (rpc-runtime-control-work runtime))
+        (t (rpc-runtime-work runtime))))
+
+(defun rpc-pop-work (runtime control)
+  (cond ((eq control :interrupt) (pop (rpc-runtime-interrupt-work runtime)))
+        (control (pop (rpc-runtime-control-work runtime)))
+        (t (pop (rpc-runtime-work runtime)))))
 
 (defun rpc-work-loop (runtime &optional control)
   ;; Preserve generic host/Swank ordering while the reader handles other RPCs.
@@ -242,26 +282,25 @@
     (loop
       (let ((task
               (sb-thread:with-mutex ((rpc-runtime-lock runtime))
-                (loop while (and (null (if control (rpc-runtime-control-work runtime)
-                                           (rpc-runtime-work runtime)))
+                (loop while (and (null (rpc-pending-work runtime control))
                                  (not (rpc-runtime-input-closed runtime))
                                  (not (rpc-runtime-stop runtime)))
                       do (sb-thread:condition-wait (rpc-runtime-changed runtime)
                                                    (rpc-runtime-lock runtime)))
                 (when (or (rpc-runtime-stop runtime)
-                          (null (if control (rpc-runtime-control-work runtime) (rpc-runtime-work runtime)))) (return))
-                (if control (pop (rpc-runtime-control-work runtime)) (pop (rpc-runtime-work runtime))))))
+                          (null (rpc-pending-work runtime control))) (return))
+                (rpc-pop-work runtime control))))
         (rpc-emit runtime (rpc-run-work task))))))
 
 (defun rpc-queue-work (id name expression request &key control)
   (let ((runtime *rpc-runtime*))
     (sb-thread:with-mutex ((rpc-runtime-lock runtime))
       (setf (gethash id (rpc-runtime-calls runtime)) t)
-      (if control
-          (setf (rpc-runtime-control-work runtime)
-                (nconc (rpc-runtime-control-work runtime) (list (list id name expression request))))
-          (setf (rpc-runtime-work runtime)
-                (nconc (rpc-runtime-work runtime) (list (list id name expression request)))))
+      (let ((entry (list (list id name expression request))))
+        (cond ((eq control :interrupt)
+               (setf (rpc-runtime-interrupt-work runtime) (nconc (rpc-runtime-interrupt-work runtime) entry)))
+              (control (setf (rpc-runtime-control-work runtime) (nconc (rpc-runtime-control-work runtime) entry)))
+              (t (setf (rpc-runtime-work runtime) (nconc (rpc-runtime-work runtime) entry)))))
       (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))
   nil)
 
@@ -284,6 +323,14 @@
 
 (defun rpc-tools ()
   (if (string= *profile* "generic") (generic-tools)
+      (append (when (sb-thread:with-mutex ((rpc-runtime-lock *rpc-runtime*))
+                       (rpc-runtime-interrupt-supported *rpc-runtime*))
+                (list (rpc-versioned-tool "genera_interrupt"
+                        "Interrupt one request; success requires its terminal interrupted outcome."
+                        (let ((properties (rpc-identity-schema)))
+                          (setf (gethash "timeout_ms" properties)
+                                (jso "type" "integer" "minimum" 1 "maximum" 5000))
+                          properties) #("request_id" "boot_id" "service_id"))))
       (list (rpc-versioned-tool "genera_session_status" "Return cached Genera status, with optional bounded live refresh."
                                  (jso "refresh" (jso "type" "boolean")) #() t)
             (rpc-versioned-tool "genera_ensure_session" "Join startup or retry one bounded start-or-attach cycle."
@@ -303,7 +350,7 @@
                       (gethash "expected_service_id" properties) (jso "type" "string" "minLength" 1)
                       (gethash "acknowledge_unknown" properties) (jso "type" "boolean" "const" 'yason:true))
                 properties)
-              #("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id" "acknowledge_unknown")))))
+              #("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id" "acknowledge_unknown"))))))
 
 (defun handle-initialize (id params)
   (multiple-value-bind (version present) (gethash "protocolVersion" params)
@@ -314,18 +361,20 @@
                 (t "2025-06-18"))
           (rpc-runtime-initialized *rpc-runtime*) t)
     (make-response id (jso "protocolVersion" (rpc-runtime-version *rpc-runtime*)
-                          "capabilities" (jso "tools" (jso "listChanged" 'yason:false))
+                          "capabilities" (jso "tools" (jso "listChanged" (rpc-boolean (string= *profile* "genera"))))
                           "serverInfo" (jso "name" "lisp-mcp" "version" "1.0.0")))))
 
 (defun rpc-start-session ()
   (when (and (string= *profile* "genera") (null (rpc-runtime-session *rpc-runtime*)))
+    (let ((runtime *rpc-runtime*))
     (setf (rpc-runtime-session *rpc-runtime*)
           (genera-begin-session :host *genera-host* :port *genera-port*
                                 :token *genera-token*
                                 :expected-world *genera-expected-world*
                                 :connect-timeout *genera-connect-timeout* :boot-timeout *genera-boot-timeout*
                                 :runtime *genera-runtime* :startup-managed (genera-local-autostart-p *genera-runtime*)
-                                :reconnect t))))
+                                :features-changed (lambda (features) (rpc-note-features runtime features))
+                                :reconnect t)))))
 
 (defun rpc-validate-arguments (name arguments)
   (unless (hash-table-p arguments) (rpc-invalid "Tool arguments must be an object"))
@@ -334,8 +383,10 @@
          (ensure (string= name "genera_ensure_session"))
          (lookup (string= name "genera_request_status"))
          (recover (string= name "genera_recover_session"))
-         (allowed (cond ((or lookup recover)
+         (interrupt (string= name "genera_interrupt"))
+         (allowed (cond ((or lookup recover interrupt)
                          (append '("request_id" "boot_id" "service_id")
+                                 (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
                         (ensure nil) (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
@@ -346,7 +397,7 @@
     (multiple-value-bind (refresh present) (gethash "refresh" arguments)
       (when (and present (not (member refresh '(yason:true yason:false))))
         (rpc-invalid "refresh must be a boolean")))
-    (when (or lookup recover)
+    (when (or lookup recover interrupt)
       (dolist (key (if recover '("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id")
                               '("request_id" "boot_id" "service_id")))
         (let ((value (gethash key arguments)))
@@ -354,7 +405,10 @@
             (rpc-invalid "Request and generation identities must be nonempty text"))))
       (when (and recover (not (eq (gethash "acknowledge_unknown" arguments) 'yason:true)))
         (rpc-invalid "acknowledge_unknown must be true")))
-    (unless (or status lookup recover ensure)
+    (when (and interrupt (integerp (gethash "timeout_ms" arguments 5000))
+               (> (gethash "timeout_ms" arguments 5000) 5000))
+      (rpc-invalid "Interrupt timeout_ms must be at most 5000"))
+    (unless (or status lookup recover ensure interrupt)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -387,9 +441,9 @@
               (if session
                   (rpc-queue-work id name (genera-start-cycle session) nil)
                   (rpc-tool-failure id "not-ready" "Send notifications/initialized before ensuring Genera"))))
-          (when (member name '("genera_request_status" "genera_recover_session" "genera_session_status") :test #'equal)
+          (when (member name '("genera_request_status" "genera_recover_session" "genera_session_status" "genera_interrupt") :test #'equal)
             (return-from handle-tools-call
-              (if session (rpc-queue-work id name arguments nil :control t)
+              (if session (rpc-queue-work id name arguments nil :control (if (string= name "genera_interrupt") :interrupt t))
                   (rpc-tool-failure id "not-ready" "Genera session has not started"))))
           (unless (and session (eq (genera-session-state session) :ready))
             (return-from handle-tools-call
@@ -452,6 +506,7 @@
   ;; Generic stdin batches retain their previous ordered drain behavior.
   (sb-thread:join-thread (rpc-runtime-worker runtime))
   (sb-thread:join-thread (rpc-runtime-control-worker runtime))
+  (sb-thread:join-thread (rpc-runtime-interrupt-worker runtime))
   (sb-thread:with-mutex ((rpc-runtime-lock runtime))
     (setf (rpc-runtime-writer-stop runtime) t)
     (sb-thread:condition-broadcast (rpc-runtime-changed runtime)))
@@ -475,7 +530,9 @@
           (rpc-runtime-worker runtime)
           (sb-thread:make-thread (lambda () (rpc-work-loop runtime)) :name "MCP tools")
           (rpc-runtime-control-worker runtime)
-          (sb-thread:make-thread (lambda () (rpc-work-loop runtime t)) :name "MCP controls"))
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime t)) :name "MCP controls")
+          (rpc-runtime-interrupt-worker runtime)
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime :interrupt)) :name "MCP interrupt confirmation"))
     (unwind-protect
         (loop
           (let ((message (handler-case (read-json-rpc)
