@@ -15,7 +15,7 @@
     :stale-generation :service-unavailable :package-not-found :reader-error
     :evaluation-error :busy :worker-unavailable :request-id-conflict
     :interrupted :interrupt-pending :interrupt-refused :request-not-active
-    :file-error :load-error :compile-error :source-mismatch))
+    :file-error :load-error :compile-error :source-mismatch :transfer-error))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -28,6 +28,7 @@
     :original-path :path-kind :host-path :path :source-root :resolved-path :resolved-root
     :source-size :source-hash :file-error :load-error :source-mismatch
     :compile-file :output-path :compile-completed :warnings-p :failure-p :loaded :compile-error
+    :source-transfer :transfer :source-text :temporary-path :cleanup :transfer-error
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
     :interrupted :unknown :unsupported-operation :invalid-request
@@ -173,6 +174,9 @@
     (:text (stringp value))
     (:nonempty-text (and (stringp value) (plusp (length value))))
     (:source-path (and (stringp value) (<= 1 (length value) 4096)))
+    (:transfer-text (and (stringp value) (<= (length value) 65536)
+                         (every (lambda (ch) (or (<= 32 (char-code ch) 126)
+                                                 (member (char-code ch) '(9 10)))) value)))
     (:id (and (stringp value) (<= 1 (length value) 128)))
     (:boolean (or (null value) (eq value t)))
     (:nonnegative (and (mcp-v1-integer-p value) (>= value 0)))
@@ -180,7 +184,7 @@
     (:print-limit (or (null value) (mcp-v1-type-p value :nonnegative)))
     (:strings (and (listp value) (every #'stringp value)))
     (:features (and (listp value)
-                    (every (lambda (item) (member item *mcp-v1-operations*)) value)))
+                    (every (lambda (item) (or (eq item :source-transfer) (member item *mcp-v1-operations*))) value)))
     (:state (member value '(:running :completed :failed :interrupted :unknown)))
     (:interrupt-state (member value '(:pending :delivered :refused)))
     (otherwise nil)))
@@ -207,9 +211,11 @@
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
              (:load '(:boot-id :service-id :package :timeout-ms :print-level :print-length
-                      :original-path :path-kind :host-path :path :source-root :source-size :source-hash))
+                      :original-path :path-kind :host-path :path :source-root :source-size :source-hash
+                      :transfer :source-text))
              (:compile-file '(:boot-id :service-id :package :timeout-ms :print-level :print-length
-                              :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load))
+                              :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load
+                              :transfer :source-text))
              ((:request-status :interrupt) '(:boot-id :service-id :target-id))))
          (response-keys
            '(:boot-id :service-id :world :package :busy :active-request-id :features :ok
@@ -217,7 +223,8 @@
              :elapsed-ms :truncated :replaced :error :target-id :result
              :history-limit :history-count :history-byte-limit :history-bytes
              :history-evictions :interrupt-state :original-path :path-kind :host-path :path :source-root
-             :resolved-path :resolved-root :load :output-path :compile-completed :warnings-p :failure-p :loaded)))
+             :resolved-path :resolved-root :load :output-path :compile-completed :warnings-p :failure-p :loaded
+             :transfer :temporary-path :cleanup)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -230,6 +237,12 @@
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
        (when (member (getf object :op) '(:load :compile-file))
+         (when (or (getf object :transfer) (mcp-v1-present-p object :source-text))
+           (unless (and (eq (getf object :transfer) t)
+                        (member (getf object :path-kind) '("host" "relative") :test #'equal)
+                        (mcp-v1-type-p (getf object :source-text) :transfer-text)
+                        (eql (getf object :source-size) (length (getf object :source-text))))
+             (mcp-v1-error "Transfer requires bounded normalized host source text and size")))
          (dolist (key '(:original-path :path-kind :path :source-root))
            (unless (getf object key) (mcp-v1-error "Incomplete load path")))
          (unless (member (getf object :path-kind) '("genera" "host" "relative") :test #'equal)
@@ -258,6 +271,13 @@
            (mcp-v1-error "Invalid load result path kind"))
          (when (and (getf object :ok) (not (and (getf object :resolved-path) (getf object :resolved-root))))
            (mcp-v1-error "Load success requires canonical paths")))
+       (when (some (lambda (key) (mcp-v1-present-p object key))
+                   '(:transfer :temporary-path :cleanup))
+         (unless (and (eq (getf object :transfer) t) (equal (getf object :cleanup) "retained")
+                      (getf object :original-path)
+                      (or (not (getf object :ok))
+                          (equal (getf object :temporary-path) (getf object :resolved-path))))
+           (mcp-v1-error "Invalid transfer outcome")))
        (when (some (lambda (key) (mcp-v1-present-p object key))
                    '(:load :output-path :compile-completed :warnings-p :failure-p :loaded))
          (dolist (key '(:load :compile-completed :warnings-p :failure-p :loaded :original-path))
@@ -318,6 +338,7 @@
               (:host-path . :source-path) (:path . :source-path) (:source-root . :source-path)
               (:resolved-path . :source-path) (:resolved-root . :source-path)
               (:output-path . :source-path) (:load . :boolean) (:compile-completed . :boolean)
+              (:transfer . :boolean) (:source-text . :transfer-text) (:temporary-path . :source-path) (:cleanup . :text)
               (:warnings-p . :boolean) (:failure-p . :boolean) (:loaded . :boolean)
               (:features . :features)
               (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
@@ -370,6 +391,8 @@
                       (t :failed)))
       (mcp-v1-error "Invalid terminal eval state"))
     (when (member (getf request :op) '(:load :compile-file))
+      (unless (equal (getf request :transfer) (getf response :transfer))
+        (mcp-v1-error "Transfer response option mismatch"))
       (dolist (key '(:original-path :path-kind :host-path :path :source-root))
         (unless (equal (getf request key) (getf response key))
           (mcp-v1-error "Load response path mismatch")))

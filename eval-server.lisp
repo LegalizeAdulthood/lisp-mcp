@@ -314,6 +314,26 @@ does not recognize."
 (defun mcp-probe-source (root target)
   (mcp-call-with-source root target))
 
+(defun mcp-transfer-source (request metadata)
+  "Write bounded source only under the separately enabled native root."
+  (unless *mcp-transfer-root* (error "Source transfer is disabled in this listener"))
+  (let* ((root (namestring (send (fs:parse-pathname *mcp-transfer-root*) :translated-pathname)))
+         (requested (namestring (send (fs:parse-pathname (getf request :source-root)) :translated-pathname)))
+         (text (getf request :source-text)))
+    (unless (and (<= 1 (length root) 4096) (find (char root (1- (length root))) "/>;")
+                 (if (find #\/ root) (string= root requested) (string-equal root requested))
+                 (mcp-v1-type-p text :transfer-text))
+      (error "Transfer requires supported text and the configured native destination root"))
+    (let* ((file (concatenate 'string root (mcp-new-generation-id "mcp-transfer") ".lisp"))
+           (path (send (fs:parse-pathname file) :translated-pathname)))
+      (unless (<= (length (namestring path)) 4096) (error "Transfer pathname exceeds 4096 characters"))
+      (with-open-file (out path :direction :output :if-exists :error :if-does-not-exist :create)
+        (setf (getf metadata :temporary-path) (namestring (truename out)))
+        (map nil (lambda (ch)
+                   (if (= (char-code ch) 10) (terpri out)
+                       (write-char (ascii-to-char (char-code ch)) out))) text))
+      (getf metadata :temporary-path))))
+
 (defun mcp-compile-source (stream proof compilation)
   "Compile the verified stream into a fresh sibling file; never load here."
   (let* ((root (first proof))
@@ -365,6 +385,7 @@ does not recognize."
          (loading (member (getf request :op) '(:load :compile-file)))
          (compiling (eq (getf request :op) :compile-file))
          (compilation (list :compile-completed nil :warnings-p nil :failure-p t :loaded nil :output-path nil))
+         (transfer (list :temporary-path nil))
          (resolved nil)
          (package-name (if reset (package-name *mcp-default-package*)
                            (or (getf request :package) (package-name *mcp-eval-package*))))
@@ -394,14 +415,18 @@ does not recognize."
                         (if (< (length warnings) +mcp-warning-limit+)
                             (push (mcp-render condition budget nil) warnings)
                             (setf (mcp-budget-truncated budget) t))
-                        (ansi-common-lisp:muffle-warning condition))))
+                        (when (ansi-common-lisp:find-restart 'ansi-common-lisp:muffle-warning condition)
+                          (ansi-common-lisp:muffle-warning condition)))))
                  (setf printed
                        (mapcar (lambda (value) (mcp-render value budget))
                                (multiple-value-list
                                 (cond
                                   (reset (setf *mcp-eval-package* *package*) package-name)
                                   (loading
-                                   (mcp-call-with-source (getf request :source-root) (getf request :path)
+                                   (mcp-call-with-source (getf request :source-root)
+                                    (if (getf request :transfer)
+                                        (progn (setf phase :transfer-error) (mcp-transfer-source request transfer))
+                                        (getf request :path))
                                     (lambda (stream proof)
                                       (setf resolved proof)
                                       (when (and (mcp-v1-present-p request :source-size)
@@ -442,7 +467,7 @@ does not recognize."
                                      (mcp-budget-truncated diagnostics))
                       :replaced (or (mcp-budget-replaced budget)
                                     (mcp-budget-replaced diagnostics)))
-                (mcp-load-metadata request resolved compilation)
+                (mcp-load-metadata request resolved compilation transfer)
                 (when failure (list :error failure)))))))
 
 ;;; --- Server ---
@@ -451,6 +476,8 @@ does not recognize."
 
 (defvar *mcp-protocol* :legacy
   "Explicit listener mode: :LEGACY eval or :V1 data envelopes.")
+(defvar *mcp-transfer-root* nil
+  "Explicit existing native directory for optional source transfer; NIL disables it.")
 (defconstant +mcp-listener-source-version+ 1)
 (defvar *mcp-autostart* t
   "Bind NIL while loading definitions without starting runtime resources.")
@@ -501,14 +528,19 @@ does not recognize."
 (defun mcp-request-identity (request)
   ;; Property order is irrelevant; omission and an explicit default differ.
   (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
-                    :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load)
+                    :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load
+                    :transfer :source-text)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
 
-(defun mcp-load-metadata (request &optional proof compilation)
+(defun mcp-load-metadata (request &optional proof compilation transfer)
   (when (member (getf request :op) '(:load :compile-file))
     (append (loop for key in '(:original-path :path-kind :host-path :path :source-root)
                   when (mcp-v1-present-p request key) append (list key (getf request key)))
             (when proof (list :resolved-root (first proof) :resolved-path (second proof)))
+            (when (getf request :transfer)
+              (append (list :transfer t :cleanup "retained")
+                      (when (getf transfer :temporary-path)
+                        (list :temporary-path (getf transfer :temporary-path)))))
             (when (eq (getf request :op) :compile-file)
               (append (list :load (getf request :load))
                       (loop for key in '(:compile-completed :warnings-p :failure-p :loaded)
@@ -672,6 +704,7 @@ does not recognize."
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
                 :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file)
+                                  (when *mcp-transfer-root* '(:source-transfer))
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
@@ -1069,7 +1102,7 @@ does not recognize."
 ;; them. Native process/lock machinery must not depend on interpreter frames.
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
-        mcp-call-with-source mcp-probe-source mcp-compile-source
+        mcp-call-with-source mcp-probe-source mcp-compile-source mcp-transfer-source
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

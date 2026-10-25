@@ -24,7 +24,7 @@
     (loop for (key value) on envelope by #'cddr
           do (setf (gethash (rpc-key key) object)
                    (cond ((member key '(:ok :busy :truncated :replaced :world-state-lost :history-lost
-                                        :load :compile-completed :warnings-p :failure-p :loaded))
+                                        :load :compile-completed :warnings-p :failure-p :loaded :transfer))
                           (rpc-boolean value))
                          ((member key '(:values :warnings)) (coerce value 'vector))
                          ((eq key :features) (map 'vector #'rpc-name value))
@@ -155,6 +155,8 @@
                        when value append (list key value)))))
     (setf (gethash "original_path" object) (gethash "path" arguments)
           (gethash "path_kind" object) (gethash "path_kind" arguments))
+    (multiple-value-bind (transfer present) (gethash "transfer" arguments)
+      (when present (setf (gethash "transfer" object) transfer)))
     (when path
       (setf (gethash "host_path" object) (genera-source-path-host-path path)
             (gethash "path" object) (genera-source-path-genera-path path)))
@@ -256,7 +258,8 @@
                        (when (rpc-file-tool-p name)
                          (let ((fields
                                  (sb-ext:with-timeout (max .001 (- (genera-request-deadline request) (genera-now)))
-                                  (append (genera-load-fields (gethash "path_kind" expression) (gethash "path" expression))
+                                  (append (genera-load-fields (gethash "path_kind" expression) (gethash "path" expression)
+                                                             *genera-source-mapping* (eq (gethash "transfer" expression) 'yason:true))
                                      (when (string= name "genera_compile_file")
                                        (list :load (eq (gethash "load" expression) 'yason:true)))
                                      (list :print-level (gethash "print_level" expression 6)
@@ -395,6 +398,7 @@
                                  (jso "expression" (jso "type" "string")) #("expression"))
             (rpc-versioned-tool "genera_load" "Verify and load one source file without replay."
               (jso "path" (jso "type" "string" "minLength" 1)
+                   "transfer" (jso "type" "boolean" "default" 'yason:false)
                    "path_kind" (jso "type" "string" "enum" #("genera" "host" "relative"))
                    "package" (jso "type" "string" "minLength" 1)
                    "timeout_ms" (jso "type" "integer" "minimum" 1)
@@ -402,6 +406,7 @@
                    "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("path" "path_kind"))
             (rpc-versioned-tool "genera_compile_file" "Compile a verified source file; optionally load successful output."
               (jso "path" (jso "type" "string" "minLength" 1)
+                   "transfer" (jso "type" "boolean" "default" 'yason:false)
                    "path_kind" (jso "type" "string" "enum" #("genera" "host" "relative"))
                    "load" (jso "type" "boolean" "default" 'yason:false)
                    "package" (jso "type" "string" "minLength" 1)
@@ -461,7 +466,7 @@
                          (append '("request_id" "boot_id" "service_id")
                                  (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
-                        (loading (append '("path" "path_kind" "package" "timeout_ms" "print_level" "print_length")
+                        (loading (append '("path" "path_kind" "package" "timeout_ms" "print_level" "print_length" "transfer")
                                          (when (string= name "genera_compile_file") '("load"))))
                         (reset '("boot_id" "service_id" "timeout_ms"))
                         (ensure nil) (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
@@ -476,6 +481,11 @@
     (multiple-value-bind (load present) (gethash "load" arguments)
       (when (and present (not (member load '(yason:true yason:false))))
         (rpc-invalid "load must be a boolean")))
+    (multiple-value-bind (transfer present) (gethash "transfer" arguments)
+      (when (and present (not (member transfer '(yason:true yason:false))))
+        (rpc-invalid "transfer must be a boolean"))
+      (when (and (eq transfer 'yason:true) (equal (gethash "path_kind" arguments) "genera"))
+        (rpc-invalid "Transfer requires path_kind host or relative")))
     (when (or lookup recover interrupt reset)
       (dolist (key (if recover '("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id")
                               (if reset '("boot_id" "service_id") '("request_id" "boot_id" "service_id"))))

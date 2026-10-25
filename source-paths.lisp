@@ -3,7 +3,8 @@
 #+linux (eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-posix))
 
 (defconstant +genera-source-limit+ 16777216)
-(defstruct genera-source-mapping host-root windows-root genera-root)
+(defconstant +genera-transfer-limit+ 65536)
+(defstruct genera-source-mapping host-root windows-root genera-root transfer-root)
 (defstruct genera-source-path original kind host-path genera-path
   canonical-root canonical-path boot-id service-id proof-request-id)
 
@@ -52,12 +53,16 @@
   "Read mapping syntax only; discovery does not inspect files or Genera."
   (let ((host (configuration-text "GENERA_SOURCE_ROOT"))
         (windows (configuration-text "GENERA_SOURCE_WINDOWS_ROOT"))
-        (native (configuration-text "GENERA_SOURCE_GENERA_ROOT")))
-    (when (or host windows native)
+        (native (configuration-text "GENERA_SOURCE_GENERA_ROOT"))
+        (transfer (configuration-text "GENERA_SOURCE_TRANSFER_ROOT")))
+    (when (or host windows native transfer)
       (unless (and (equal profile "genera") (equal protocol "v1"))
         (configuration-error "GENERA_SOURCE_GENERA_ROOT" "requires the genera profile and v1"))
-      (unless (and native (genera-source-native-root-p native))
+      (unless (or (and native (genera-source-native-root-p native))
+                  (and (null native) transfer))
         (configuration-error "GENERA_SOURCE_GENERA_ROOT" "requires a literal host-qualified directory ending in /, >, or ;"))
+      (when (and transfer (not (and host (genera-source-native-root-p transfer))))
+        (configuration-error "GENERA_SOURCE_TRANSFER_ROOT" "requires a host source root and a literal native directory"))
       (when host
         (unless (and (char= (char host 0) #\/) (not (find #\\ host))
                      (genera-source-parts (string-trim "/" host) #\/))
@@ -68,7 +73,7 @@
                        (genera-source-parts (string-right-trim "/" (subseq normalized 3)) #\/))
             (configuration-error "GENERA_SOURCE_WINDOWS_ROOT" "requires a drive-qualified source directory and GENERA_SOURCE_ROOT"))
           (setf windows (concatenate 'string (string-right-trim "/" normalized) "/"))))
-      (make-genera-source-mapping :host-root host :windows-root windows :genera-root native))))
+      (make-genera-source-mapping :host-root host :windows-root windows :genera-root native :transfer-root transfer))))
 
 (defun genera-source-native-file-p (text)
   (let ((separator (position-if (lambda (ch) (find ch "/>;")) text :from-end t)))
@@ -83,16 +88,19 @@
 (defun genera-source-native-case-p (root)
   (not (char= (char root (1+ (position #\: root))) #\/)))
 
-(defun genera-map-source (kind original &optional (mapping *genera-source-mapping*))
+(defun genera-map-source (kind original &optional (mapping *genera-source-mapping*) transfer)
   "Validate local paths and construct an explicit, still-unverified target."
   (let* ((path (make-genera-source-path :original original :kind kind))
          (root (and mapping (genera-source-mapping-host-root mapping)))
-         (native (and mapping (genera-source-mapping-genera-root mapping)))
+         (native (and mapping (if transfer (genera-source-mapping-transfer-root mapping)
+                                 (genera-source-mapping-genera-root mapping))))
          (relative nil))
     (unless (and (member kind '("genera" "host" "relative") :test #'equal)
                  (stringp original) (<= 1 (length original) 4096))
       (genera-path-fail path :invalid-path "Expected a pathname and explicit genera, host, or relative kind"))
-    (unless native (genera-path-fail path :mapping-missing "No Genera source root is configured"))
+    (when (and transfer (equal kind "genera"))
+      (genera-path-fail path :invalid-path "Transfer requires a host or relative source path"))
+    (unless native (genera-path-fail path :mapping-missing "No native root is configured for the selected source mode"))
     (cond
       ((equal kind "genera")
        (setf (genera-source-path-genera-path path) original)
@@ -129,33 +137,49 @@
            (setf (genera-source-path-host-path path) canonical)))))
     path))
 
-(defun genera-source-fingerprint (file)
+(defun genera-source-fingerprint (file &optional capture-limit capture-root)
   "Adler-32 of ASCII text with CR, LF, and CRLF normalized to LF."
   (with-open-file (in file :element-type '(unsigned-byte 8))
-    (when (> (file-length in) +genera-source-limit+) (error "Source exceeds 16 MiB"))
-    (let ((a 1) (b 0) (size 0) (raw 0) (cr nil))
+    (when capture-limit
+      #+linux
+      (let* ((fd (sb-sys:fd-stream-fd in))
+             (opened (sb-posix:readlink (format nil "/proc/self/fd/~D" fd)))
+             (root (namestring (truename (uiop:ensure-directory-pathname capture-root)))))
+        (unless (and (genera-source-under-p opened root)
+                     (sb-posix:s-isreg (sb-posix:stat-mode (sb-posix:fstat fd))))
+          (error "Opened transfer source is not a regular file within the source root")))
+      #-linux (error "Source transfer requires the Linux host adapter"))
+    (let* ((limit (or capture-limit +genera-source-limit+))
+           (a 1) (b 0) (size 0) (raw 0) (cr nil)
+           (text (when capture-limit (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))))
+      (when (> (file-length in) limit) (error "Source exceeds ~D bytes" limit))
       (loop for code = (read-byte in nil nil) while code
-            do (when (> (incf raw) +genera-source-limit+) (error "Source exceeds 16 MiB"))
+            do (when (> (incf raw) limit) (error "Source exceeds ~D bytes" limit))
                (unless (or (<= 32 code 126) (member code '(9 10 13)))
                  (error "Source requires unsupported character conversion"))
                (unless (and cr (= code 10))
                  (incf size)
+                 (when text (vector-push-extend (code-char (if (= code 13) 10 code)) text))
                  (setf a (mod (+ a (if (= code 13) 10 code)) 65521) b (mod (+ b a) 65521)))
                (setf cr (= code 13)))
-      (list size (+ (ash b 16) a)))))
+      (values (list size (+ (ash b 16) a)) (when text (coerce text 'simple-string))))))
 
-(defun genera-load-fields (kind original &optional (mapping *genera-source-mapping*))
+(defun genera-load-fields (kind original &optional (mapping *genera-source-mapping*) transfer)
   "Prepare local mapping and fingerprint; native verification stays in LOAD."
-  (let* ((path (genera-map-source kind original mapping))
-         (host (genera-source-path-host-path path))
-         (fingerprint (when host
-                        (handler-case (genera-source-fingerprint host)
-                          (error (e) (genera-path-fail path :source-unreadable (princ-to-string e)))))))
-    (values (append (list :original-path original :path-kind kind
-                          :path (genera-source-path-genera-path path)
-                          :source-root (genera-source-mapping-genera-root mapping))
-                    (when host (list :host-path host :source-size (first fingerprint)
-                                     :source-hash (second fingerprint)))) path)))
+  (let* ((path (genera-map-source kind original mapping transfer))
+         (host (genera-source-path-host-path path)))
+    (multiple-value-bind (fingerprint text)
+        (when host
+          (handler-case (genera-source-fingerprint host (when transfer +genera-transfer-limit+)
+                                                  (when transfer (genera-source-mapping-host-root mapping)))
+            (error (e) (genera-path-fail path :source-unreadable (princ-to-string e)))))
+      (values (append (list :original-path original :path-kind kind
+                            :path (genera-source-path-genera-path path)
+                            :source-root (if transfer (genera-source-mapping-transfer-root mapping)
+                                             (genera-source-mapping-genera-root mapping)))
+                      (when transfer (list :transfer t :source-text text))
+                      (when host (list :host-path host :source-size (first fingerprint)
+                                       :source-hash (second fingerprint)))) path))))
 
 (defun genera-resolve-source (session kind original &optional (mapping *genera-source-mapping*))
   "Require a tracked native probe before returning a verified pathname."

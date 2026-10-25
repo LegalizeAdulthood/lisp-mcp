@@ -411,9 +411,11 @@ Source directories are configured independently of `GENERA_VLM_ROOT`:
 | `GENERA_SOURCE_ROOT` | Absolute Unix/WSL source directory; no default. |
 | `GENERA_SOURCE_WINDOWS_ROOT` | Optional drive-qualified alias for that directory. |
 | `GENERA_SOURCE_GENERA_ROOT` | Explicit Genera directory, such as `SYS:PROJECT;`, `HOST:>project>`, or `HOST:/srv/project/`. |
+| `GENERA_SOURCE_TRANSFER_ROOT` | Optional existing native directory for explicit bounded transfer; disabled when unset. |
 
 Source settings require profile `genera` and protocol `v1`. A host root
-requires a Genera root; a Windows alias also requires a host root. A
+requires a Genera mapping root or an explicit transfer root; a Windows
+alias also requires a host root. A
 Genera root alone supports native files. Configuration validates syntax
 without touching files or connecting during discovery. No source root
 defaults to the VLM directory, process directory, or Windows drive mount.
@@ -533,6 +535,54 @@ A load error returns `load-error`, preserving successful compilation data
 and `loaded: false`. Loading may have partial effects before failing.
 Compilation itself can execute compile-time forms and change world state,
 even with `load: false`.
+
+### Explicit source transfer
+
+When sharing is unavailable, `genera_load` and `genera_compile_file` accept
+optional boolean `transfer: true` for `path_kind: host` or `relative`.
+Transfer defaults to false and never follows a failed mapping or load
+automatically. Configure both endpoints explicitly:
+
+- Host: `GENERA_SOURCE_ROOT` and `GENERA_SOURCE_TRANSFER_ROOT`; the Windows
+  alias remains optional. A shared-file mapping root is not required.
+- Genera: set `*mcp-transfer-root*` in `COMMON-LISP-USER` to the same
+  existing writable native directory before starting or using the service.
+  Its default is NIL. New hello responses advertise `:source-transfer`
+  only while enabled; reconnect clients after changing that configuration.
+
+For example, set the native variable to `"SYS:TRANSFER;"` and the host
+transfer-root setting to `SYS:TRANSFER;`, after creating that directory
+through the image's normal filesystem setup. Filesystem credentials must
+already exist. Neither endpoint creates directories or starts file servers.
+The saved client configuration is not modified by a tool call.
+
+The Linux/WSL host reads at most 65,536 bytes from a regular file within
+its canonical source root. The opened file descriptor is rechecked for
+containment, rejecting a symlink substituted after pathname validation.
+Only ASCII printing characters, tab, CR, and LF
+are supported. CR/LF/CRLF normalize to LF in transit; Genera writes native
+line endings and verifies the resulting source fingerprint before use.
+Unsupported text, oversized files, traversal, and escaping symlinks fail
+before transmission. A single bounded data envelope carries the text;
+source text is never constructed as an eval form or echoed in path metadata.
+
+The listener checks its configured destination root, generates a fresh
+`mcp-transfer-...lisp` name, and opens it with overwrite rejection.
+The same job then verifies and loads or compiles that file. Request IDs,
+generation checks, host deadlines, ledger reconciliation, and optional
+interruption follow the existing file-execution rules. A lost reply never
+copies or executes the source again automatically. Transfer creation is
+bounded preparation within the worker; interruption covers execution.
+
+Results add `transfer: true`, actual `temporary_path` when created, and
+`cleanup: "retained"`. The temporary source remains after success or
+failure, as do any compiled output files. Remove reported files explicitly
+through normal Genera filesystem tools when no longer needed. Existing
+files and saved worlds are never selected as transfer destinations.
+`path` describes the mapped attempt; `resolved_path` and `temporary_path`
+identify the actual generated native source. Transfer setup/write errors
+return `transfer-error`; subsequent verification, load, and compile errors
+retain their usual codes and common diagnostic data.
 
 ### Listener context reset
 
@@ -1046,6 +1096,7 @@ python3 tests/context.py
 python3 tests/paths.py
 python3 tests/loading.py
 python3 tests/compiling.py
+python3 tests/transfer.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1244,6 +1295,17 @@ GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
 
 This runner likewise requires filesystem credentials and leaves new
 source/output files and test definitions in the disposable runtime.
+
+To validate explicit transfer without shared files:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_TRANSFER_ROOT='SYS:TRANSFER;' \
+  python3 tests/transfer.py --live-v1
+```
+
+The native test requires transfer initially disabled and temporarily sets
+the listener root to the supplied existing directory, restoring NIL on
+exit. It leaves uniquely named native fixture files for explicit cleanup.
 
 To check structured evaluation and recovery on a running legacy listener:
 

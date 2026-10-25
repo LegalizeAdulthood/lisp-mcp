@@ -517,6 +517,9 @@
     (let* ((old (genera-request-envelope request))
            (envelope (append old fields)))
       (genera-check-generation session (getf old :boot-id) (getf old :service-id))
+      (when (and (getf envelope :transfer)
+                 (not (member :source-transfer (getf (genera-session-hello session) :features))))
+        (genera-session-error :unsupported "Listener does not advertise source transfer"))
       (setf (genera-request-payload request) (string-to-octets (mcp-v1-encode envelope :request))
             (genera-request-envelope request) envelope (genera-request-state request) :queued
             (genera-session-queue session) (nconc (genera-session-queue session) (list request)))
