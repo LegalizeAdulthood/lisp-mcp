@@ -13,6 +13,8 @@
 (defvar *fixture-worker-live* t)
 (defvar *fixture-worker-owner* nil)
 (defvar *mcp-interruptible-job* nil)
+(defvar *fixture-definition-function* nil)
+(defun mcp-native-definition-function () *fixture-definition-function*)
 
 (defun send (stream operation)
   (ecase operation (:tyi (read-char stream nil nil))))

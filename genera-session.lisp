@@ -131,7 +131,7 @@
                  '(:id :boot-id :service-id))
     (mcp-v1-error "Response identity does not match its request"))
   (case (getf request :op)
-    ((:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos) (mcp-v1-check-eval-response request response))
+    ((:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition) (mcp-v1-check-eval-response request response))
     (:status
      (when (getf response :ok)
        (dolist (key '(:world :package :busy :features))
@@ -449,17 +449,21 @@
       (error (or (genera-session-failure session)
                  (make-condition 'genera-session-error :kind :closed
                                  :format-control "Genera session is closed"))))
-    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos))
+    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition))
       (genera-session-error :unsupported "Unsupported session operation"))
     (unless (member operation (getf (genera-session-hello session) :features))
       (genera-session-error :unsupported "Listener does not advertise this operation"))
     (when (and (eq operation :run-tests)
                (not (member (getf fields :runner) (getf (genera-session-hello session) :test-runners) :test #'equal)))
       (genera-session-error :unsupported-runner "Test runner is not in the verified listener catalogue"))
+    (when (and (eq operation :find-definition)
+               (not (member (getf fields :definition-kind) (getf (genera-session-hello session) :definition-kinds)
+                            :test #'equal)))
+      (genera-session-error :unsupported-kind "Definition kind is not in the verified listener catalogue"))
     (let ((expected (getf fields :expected-generation)))
       (when expected (apply #'genera-check-generation session expected))
       (remf fields :expected-generation))
-    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos)))))
+    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition)))))
            (deferred (getf fields :defer))
            (defer-option (remf fields :defer))
            (idle-only (getf fields :idle-only))
@@ -790,7 +794,7 @@
                                    (genera-session-history session))))
                (result (getf response :result)))
           (cond (result
-                 (when (and known (member (getf (genera-request-envelope known) :op) '(:load :compile-file :run-tests)))
+                 (when (and known (member (getf (genera-request-envelope known) :op) '(:load :compile-file :run-tests :find-definition)))
                    (genera-session-checked
                     (lambda () (mcp-v1-check-eval-response (genera-request-envelope known) result))))
                  (if known

@@ -256,7 +256,32 @@ does not recognize."
                   (nreverse matches))
           :scanned scanned :search-complete complete)))
 
+(defun mcp-find-definition (name package kind function)
+  "Return recorded file-level source metadata; never infer a line or version."
+  (multiple-value-bind (symbol status) (find-symbol name package)
+    (if (null status) (list :lookup-status "symbol-not-found")
+        (multiple-value-bind (path type)
+            (funcall function symbol (if (equal kind "function") 'defun 'defvar) nil nil)
+          (if (null path) (list :lookup-status "source-unavailable")
+              (progn
+                (unless (and (pathnamep path) (symbolp type)
+                             (eq type (if (equal kind "function") 'defun 'defvar)))
+                  (error "Native lookup returned an unsupported source location"))
+                (let ((text (namestring path)))
+                  (unless (and (<= 1 (length text) 4096)
+                               (every (lambda (ch) (<= 32 (char-code ch) 126)) text))
+                    (error "Recorded source pathname is not bounded printable ASCII"))
+                  (list :lookup-status "found" :source-path text
+                        :source-type (symbol-name type) :location-kind "file"))))))))
+
 ;;; --- Native evaluation adapters ---
+
+(defun mcp-native-definition-function ()
+  (let* ((package (find-package "SI"))
+         (symbol (and package (find-symbol "GET-SOURCE-FILE-NAME" package))))
+    (when (and symbol (fboundp symbol))
+      (let ((function (symbol-function symbol)))
+        (when (and (not (symbolp function)) (functionp function)) function)))))
 
 (defflavor mcp-output-stream (capture) (si:output-stream)
   (:initable-instance-variables capture))
@@ -428,6 +453,8 @@ does not recognize."
          (compiling (eq (getf request :op) :compile-file))
          (testing (eq (getf request :op) :run-tests))
          (inspecting (member (getf request :op) '(:describe :apropos)))
+         (locating (eq (getf request :op) :find-definition))
+         (location nil)
          (test-result (list :test-status :unknown :counts-known nil :passed-count nil :failed-count nil))
          (compilation (list :compile-completed nil :warnings-p nil :failure-p t :loaded nil :output-path nil))
          (transfer (list :temporary-path nil))
@@ -452,9 +479,9 @@ does not recognize."
            (let ((*package* (or (find-package package-name)
                                (error "No package named ~A" package-name))))
              (setf package-name (package-name *package*) phase :reader-error)
-             (let ((form (unless (or reset loading inspecting (and testing (not (equal (getf request :runner) "form"))))
+             (let ((form (unless (or reset loading inspecting locating (and testing (not (equal (getf request :runner) "form"))))
                            (mcp-read-eval-form (getf request :form)))))
-               (setf phase (cond (inspecting :inspection-error) (loading :file-error) (testing :test-runner-error) (t :evaluation-error)))
+               (setf phase (cond (locating :lookup-error) (inspecting :inspection-error) (loading :file-error) (testing :test-runner-error) (t :evaluation-error)))
                (ansi-common-lisp:handler-bind
                    ((ansi-common-lisp:warning
                       (lambda (condition)
@@ -468,6 +495,11 @@ does not recognize."
                                (multiple-value-list
                                 (cond
                                   (reset (setf *mcp-eval-package* *package*) package-name)
+                                  (locating
+                                   (let ((*mcp-interruptible-job* job))
+                                     (setf location (mcp-find-definition (getf request :form) *package*
+                                                        (getf request :definition-kind) (getf job :definition-function)))
+                                     (values)))
                                   (inspecting
                                    (let ((*mcp-interruptible-job* job))
                                      (if (eq (getf request :op) :describe)
@@ -533,6 +565,7 @@ does not recognize."
                                     (mcp-budget-replaced diagnostics)))
                 (mcp-load-metadata request resolved compilation transfer)
                 (mcp-test-metadata request test-result)
+                (mcp-definition-metadata request (when success location))
                 (when failure (list :error failure)))))))
 
 ;;; --- Server ---
@@ -596,8 +629,16 @@ does not recognize."
   ;; Property order is irrelevant; omission and an explicit default differ.
   (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
                     :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load
-                    :transfer :source-text :runner :limit)
+                    :transfer :source-text :runner :limit :definition-kind)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
+
+(defun mcp-definition-kinds ()
+  (when (mcp-native-definition-function) '("function" "variable")))
+
+(defun mcp-definition-metadata (request &optional location)
+  (when (eq (getf request :op) :find-definition)
+    (append (list :symbol-name (getf request :form) :definition-kind (getf request :definition-kind))
+            (or location (list :lookup-status "not-completed")))))
 
 (defun mcp-test-runner (name)
   (if (equal name "form") :form
@@ -725,6 +766,7 @@ does not recognize."
           (mcp-v1-failure request :unsupported-operation
                           "Remote execution deadlines are not available" service))))
     (let ((test-function (when (eq (getf request :op) :run-tests) (mcp-test-runner (getf request :runner))))
+          (definition-function (when (eq (getf request :op) :find-definition) (mcp-native-definition-function)))
           (active (or (mcp-active-request-id)
                       (getf (getf (getf client :execution) :request) :id)))
           (code (cond ((or *mcp-worker-failed* (not (mcp-worker-live-p)))
@@ -735,6 +777,13 @@ does not recognize."
       (when (and (eq (getf request :op) :run-tests) (null test-function))
         (return-from mcp-submit-eval
           (mcp-v1-failure request :unsupported-runner "Test runner is not configured" service)))
+      (when (eq (getf request :op) :find-definition)
+        (unless definition-function
+          (return-from mcp-submit-eval
+            (mcp-v1-failure request :unsupported-operation "Native source lookup is unavailable" service)))
+        (unless (member (getf request :definition-kind) '("function" "variable") :test #'equal)
+          (return-from mcp-submit-eval
+            (mcp-v1-failure request :unsupported-kind "Definition kind is not supported" service))))
       (when code
         (return-from mcp-submit-eval
           (if legacy
@@ -744,6 +793,7 @@ does not recognize."
                       (when active (list :active-request-id active))))))
       (let ((job (list :request request :service service :client client
                        :legacy legacy :state :pending :result nil :test-function test-function
+                       :definition-function definition-function
                        :interrupt-state nil :interrupt-delivered nil)))
         (unless legacy
           (let ((entry (list :id (getf request :id)
@@ -815,8 +865,10 @@ does not recognize."
                 :busy (not (null (mcp-execution-busy-p)))
                 :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests :describe :apropos)
                                   (when *mcp-transfer-root* '(:source-transfer))
+                                  (when (mcp-definition-kinds) '(:find-definition))
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :test-runners (mcp-test-runner-names)
+                :definition-kinds (mcp-definition-kinds)
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
                 :history-count (length (getf service :history))
@@ -861,7 +913,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos))
+    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
@@ -1015,6 +1067,7 @@ does not recognize."
                                 (mcp-render condition budget nil) (getf job :service))
                 (mcp-load-metadata request)
                 (mcp-test-metadata request)
+                (mcp-definition-metadata request)
                 (list :request-state :failed :values nil :value-count 0
                       :stdout "" :stderr "" :warnings nil :package ""
                       :elapsed-ms 0 :truncated (mcp-budget-truncated budget)
@@ -1216,6 +1269,7 @@ does not recognize."
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
         mcp-call-with-source mcp-probe-source mcp-compile-source mcp-transfer-source
         mcp-inspection-text mcp-inspect-symbol mcp-inspect-apropos
+        mcp-native-definition-function mcp-definition-kinds mcp-find-definition
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

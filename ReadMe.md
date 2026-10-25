@@ -13,8 +13,8 @@ The explicit `genera` profile provides `genera_session_status`,
 `genera_compile_file`, `genera_run_tests`, `genera_describe`,
 `genera_apropos`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
-It additionally exposes `genera_interrupt` after a validated listener
-hello advertises targeted interruption.
+Verified listener capabilities additionally enable `genera_interrupt`
+and `genera_find_definition`.
 
 ## Prerequisites
 
@@ -687,6 +687,50 @@ submission before allocating execution work. The wire operations reuse
 ```json
 {"name":"genera_describe","arguments":{"symbol":"CAR","package":"USER"}}
 {"name":"genera_apropos","arguments":{"pattern":"string","package":"USER","limit":10}}
+```
+
+### Recorded definition locations
+
+`genera_find_definition` appears only after verified listener capability
+`:find-definition`. Its supported `definition_kinds` are returned in
+session status. Refresh `tools/list` after a tool-list notification;
+reconnecting to a listener without this capability removes the tool.
+
+The tool requires a literal `symbol` and accepts optional `package`,
+`kind` (default `function`), and `timeout_ms`. Symbol/package rules
+match bounded inspection: exact names, 1 through 256 printable ASCII
+characters, existing packages and symbols, and no reader or interning.
+Supported kinds are `function`, including macros recorded under DEFUN,
+and `variable` for DEFVAR source records. Other kinds return
+`unsupported-kind` before submission.
+
+The verified adapter calls Genera's SI:GET-SOURCE-FILE-NAME with parent
+chasing and patch selection disabled. A successful result includes
+`symbol_name`, `definition_kind`, and `lookup_status`:
+
+- `found`: includes `source_path`, `source_type` (DEFUN or DEFVAR), and
+  `location_kind: "file"`.
+- `symbol-not-found`: no existing accessible symbol has that name.
+- `source-unavailable`: the symbol has no source record for that kind.
+
+`source_path` preserves the recorded native pathname, bounded to 4096
+printable ASCII characters. It may omit file type or version. The API
+provides file-level metadata; line, character offset, exact version,
+on-disk availability, and current file contents remain unverified.
+No editor command is invoked. Native lookup errors return `lookup-error`;
+package errors return `package-not-found`. Failed execution carries
+`lookup_status: "not-completed"` with no source location.
+
+Lookup has read-only annotations and shares the execution worker,
+generation checks, request identity, deadlines, and retained ledger.
+Busy or uncertain work blocks lookup. Timeout or disconnect never replays
+the operation; reconcile the original identity with request status.
+The listener captures the verified API function before accepting work.
+The wire operation uses `:form` for the literal symbol name and requires
+`:definition-kind`.
+
+```json
+{"name":"genera_find_definition","arguments":{"symbol":"CAR","kind":"function","package":"USER"}}
 ```
 
 ### Listener context reset
@@ -1435,6 +1479,19 @@ Without `--live-v1`, the runner uses portable listener and host fixtures.
 It checks literal lookup without interning, bounded metadata/search,
 schemas, annotations, capability gates, worker admission, uncertainty,
 request identity, and retained results.
+
+Check optional definition lookup against an updated versioned listener.
+The native fixture creates fresh source files under an explicitly
+selected writable Genera directory and leaves them for inspection:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:SITE;' \
+  python3 tests/definitions.py --live-v1 -v
+```
+
+Without `--live-v1`, checks use portable adapter and host fixtures.
+They cover capability discovery/loss, kind admission, bounded recorded
+paths, malformed replies, missing source, and recovery without replay.
 
 To check structured evaluation and recovery on a running legacy listener:
 

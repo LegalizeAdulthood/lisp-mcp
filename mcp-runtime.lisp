@@ -6,7 +6,7 @@
   (lock (sb-thread:make-mutex :name "MCP runtime"))
   (changed (sb-thread:make-waitqueue :name "MCP runtime"))
   (version "2024-11-05") initialized input-closed stop writer-stop failed
-  replies work control-work interrupt-work interrupt-supported tools-dirty (calls (make-hash-table :test 'equal)))
+  replies work control-work interrupt-work interrupt-supported definition-supported tools-dirty (calls (make-hash-table :test 'equal)))
 (defvar *rpc-runtime* nil)
 (defconstant +rpc-work-limit+ 16)
 (defconstant +rpc-reply-limit+ 32)
@@ -26,7 +26,7 @@
                    (cond ((member key '(:ok :busy :truncated :replaced :world-state-lost :history-lost
                                         :load :compile-completed :warnings-p :failure-p :loaded :transfer))
                           (rpc-boolean value))
-                         ((member key '(:values :warnings :test-runners)) (coerce value 'vector))
+                         ((member key '(:values :warnings :test-runners :definition-kinds)) (coerce value 'vector))
                          ((eq key :features) (map 'vector #'rpc-name value))
                          ((member key '(:error :result)) (rpc-bridge-json value))
                          ((keywordp value) (rpc-name value))
@@ -110,6 +110,8 @@
                                   entry)) (genera-session-history session)))))
             (dolist (key '(:boot-id :service-id :world :package))
               (when (getf hello key) (setf (gethash (rpc-key key) status) (getf hello key))))
+            (when (mcp-v1-present-p hello :definition-kinds)
+              (setf (gethash "definition_kinds" status) (coerce (getf hello :definition-kinds) 'vector)))
             (when (mcp-v1-present-p hello :test-runners)
               (setf (gethash "test_runners" status) (coerce (getf hello :test-runners) 'vector)))
             (when cycle (setf (gethash "startup" status) (rpc-startup-status cycle)))
@@ -178,9 +180,12 @@
 (defun rpc-note-features (runtime features)
   ;; The socket owner must not wait for room in the response queue.
   (sb-thread:with-mutex ((rpc-runtime-lock runtime))
-    (let ((supported (not (null (member :interrupt features)))))
-      (unless (eq supported (rpc-runtime-interrupt-supported runtime))
+    (let ((supported (not (null (member :interrupt features))))
+          (definition (not (null (member :find-definition features)))))
+      (unless (and (eq supported (rpc-runtime-interrupt-supported runtime))
+                   (eq definition (rpc-runtime-definition-supported runtime)))
         (setf (rpc-runtime-interrupt-supported runtime) supported
+              (rpc-runtime-definition-supported runtime) definition
               (rpc-runtime-tools-dirty runtime) t)
         (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
 
@@ -387,6 +392,14 @@
                           (setf (gethash "timeout_ms" properties)
                                 (jso "type" "integer" "minimum" 1 "maximum" 5000))
                           properties) #("request_id" "boot_id" "service_id"))))
+      (when (sb-thread:with-mutex ((rpc-runtime-lock *rpc-runtime*))
+              (rpc-runtime-definition-supported *rpc-runtime*))
+        (list (rpc-versioned-tool "genera_find_definition"
+                "Return recorded file-level source for an existing symbol; no inferred line or version. See definition_kinds in session status."
+                (jso "symbol" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                     "kind" (jso "type" "string" "minLength" 1 "maxLength" 128 "default" "function")
+                     "package" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                     "timeout_ms" (jso "type" "integer" "minimum" 1)) #("symbol") t)))
       (list (rpc-versioned-tool "genera_session_status" "Return cached Genera status, with optional bounded live refresh."
                                  (jso "refresh" (jso "type" "boolean")) #() t)
             (rpc-versioned-tool "genera_ensure_session" "Join startup or retry one bounded start-or-attach cycle."
@@ -479,12 +492,14 @@
          (interrupt (string= name "genera_interrupt"))
          (reset (string= name "genera_reset_listener_context"))
          (testing (string= name "genera_run_tests"))
-         (inspecting (member name '("genera_describe" "genera_apropos") :test #'equal))
+         (locating (equal name "genera_find_definition"))
+         (inspecting (member name '("genera_describe" "genera_apropos" "genera_find_definition") :test #'equal))
          (loading (rpc-file-tool-p name))
          (allowed (cond ((or lookup recover interrupt)
                          (append '("request_id" "boot_id" "service_id")
                                  (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
+                        (locating '("symbol" "kind" "package" "timeout_ms"))
                         (inspecting (append '("package" "timeout_ms")
                                             (if (equal name "genera_describe") '("symbol") '("pattern" "limit"))))
                         (testing '("runner" "form" "package" "timeout_ms" "print_level" "print_length"))
@@ -523,8 +538,11 @@
       (unless (and (stringp (gethash "path" arguments)) (<= 1 (length (gethash "path" arguments)) 4096)
                    (member (gethash "path_kind" arguments) '("genera" "host" "relative") :test #'equal))
         (rpc-invalid "File execution requires a nonempty path and explicit path_kind")))
+    (when locating
+      (unless (mcp-v1-type-p (gethash "kind" arguments "function") :runner)
+        (rpc-invalid "Definition kind must be bounded printable text")))
     (when inspecting
-      (unless (and (mcp-v1-type-p (gethash (if (equal name "genera_describe") "symbol" "pattern") arguments)
+      (unless (and (mcp-v1-type-p (gethash (if (equal name "genera_apropos") "pattern" "symbol") arguments)
                                   :inspection-text)
                    (or (not (nth-value 1 (gethash "package" arguments)))
                        (mcp-v1-type-p (gethash "package" arguments) :inspection-text))
@@ -583,14 +601,16 @@
           (handler-case
               (let* ((reset (string= name "genera_reset_listener_context"))
                      (testing (string= name "genera_run_tests"))
-                     (inspecting (member name '("genera_describe" "genera_apropos") :test #'equal))
+                     (locating (equal name "genera_find_definition"))
+                     (inspecting (member name '("genera_describe" "genera_apropos" "genera_find_definition") :test #'equal))
                      (loading (rpc-file-tool-p name))
                      (form (gethash (if (or testing (string= name "genera_eval")) "form" "expression") arguments))
                      (fields (append
                                (list :host-timeout (/ (gethash "timeout_ms" arguments
                                                               (* 1000 *genera-timeout*)) 1000))
                                (cond (inspecting
-                                      (append (list :form (gethash (if (equal name "genera_describe") "symbol" "pattern") arguments))
+                                      (append (list :form (gethash (if (equal name "genera_apropos") "pattern" "symbol") arguments))
+                                              (when locating (list :definition-kind (gethash "kind" arguments "function")))
                                               (when (equal name "genera_apropos") (list :limit (gethash "limit" arguments 50)))
                                               (when (gethash "package" arguments) (list :package (gethash "package" arguments)))))
                                  (loading (list :defer t))
@@ -604,7 +624,8 @@
                                            (when (gethash "package" arguments)
                                              (list :package (gethash "package" arguments))))))))
                      (request (apply #'genera-submit-request session
-                                     (cond (inspecting (if (equal name "genera_describe") :describe :apropos))
+                                     (cond (locating :find-definition)
+                                           (inspecting (if (equal name "genera_describe") :describe :apropos))
                                            (testing :run-tests) ((string= name "genera_compile_file") :compile-file)
                                            (loading :load) (reset :reset-listener-context) (t :eval)) fields)))
                 (rpc-queue-work id name (if loading arguments form) request))

@@ -8,7 +8,7 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
@@ -16,7 +16,7 @@
     :evaluation-error :busy :worker-unavailable :request-id-conflict
     :interrupted :interrupt-pending :interrupt-refused :request-not-active
     :file-error :load-error :compile-error :source-mismatch :transfer-error
-    :unsupported-runner :test-runner-error :test-report-error :test-failure :inspection-error))
+    :unsupported-runner :test-runner-error :test-report-error :test-failure :inspection-error :lookup-error :unsupported-kind))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -32,6 +32,8 @@
     :source-transfer :transfer :source-text :temporary-path :cleanup :transfer-error
     :run-tests :runner :test-runners :test-status :passed :passed-count :failed-count
     :describe :apropos :limit :inspection-error
+    :find-definition :definition-kind :definition-kinds :symbol-name :lookup-status
+    :source-path :source-type :location-kind :lookup-error :unsupported-kind
     :unsupported-runner :test-runner-error :test-report-error :test-failure
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
@@ -178,6 +180,8 @@
     (:text (stringp value))
     (:nonempty-text (and (stringp value) (plusp (length value))))
     (:source-path (and (stringp value) (<= 1 (length value) 4096)))
+    (:recorded-source-path (and (mcp-v1-type-p value :source-path)
+                               (every (lambda (ch) (<= 32 (char-code ch) 126)) value)))
     (:runner (and (stringp value) (<= 1 (length value) 128)
                   (every (lambda (ch) (<= 33 (char-code ch) 126)) value)))
     (:runner-names (and (listp value) (<= 1 (length value) 32)
@@ -185,6 +189,10 @@
                         (= (length value) (length (remove-duplicates value :test #'equal)))
                         (every (lambda (name) (mcp-v1-type-p name :runner)) value)))
     (:test-status (member value '(:passed :failed :unknown)))
+    (:definition-kinds (and (listp value) (<= (length value) 2)
+                            (= (length value) (length (remove-duplicates value :test #'equal)))
+                            (every (lambda (kind) (member kind '("function" "variable") :test #'equal)) value)))
+    (:lookup-status (member value '("found" "symbol-not-found" "source-unavailable" "not-completed") :test #'equal))
     (:inspection-text (and (stringp value) (<= 1 (length value) 256)
                            (every (lambda (ch) (<= 32 (char-code ch) 126)) value)))
     (:match-limit (and (integerp value) (<= 1 value 100)))
@@ -224,6 +232,7 @@
              ((:status :reset-listener-context) '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
+             (:find-definition '(:boot-id :service-id :package :form :definition-kind))
              ((:describe :apropos) '(:boot-id :service-id :package :form :limit))
              (:run-tests '(:boot-id :service-id :package :runner :form :timeout-ms :print-level :print-length))
              (:load '(:boot-id :service-id :package :timeout-ms :print-level :print-length
@@ -240,7 +249,8 @@
              :history-limit :history-count :history-byte-limit :history-bytes
              :history-evictions :interrupt-state :original-path :path-kind :host-path :path :source-root
              :resolved-path :resolved-root :load :output-path :compile-completed :warnings-p :failure-p :loaded
-             :transfer :temporary-path :cleanup :runner :test-runners :test-status :passed-count :failed-count)))
+             :transfer :temporary-path :cleanup :runner :test-runners :test-status :passed-count :failed-count
+             :definition-kind :definition-kinds :symbol-name :lookup-status :source-path :source-type :location-kind)))
     (case direction
       (:request
        (mcp-v1-plist object (append '(:version :id :op) request-keys)
@@ -252,7 +262,7 @@
            (unless (getf object key) (mcp-v1-error "Missing generation identity"))))
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
-       (when (member (getf object :op) '(:describe :apropos))
+       (when (member (getf object :op) '(:describe :apropos :find-definition))
          (unless (and (mcp-v1-type-p (getf object :form) :inspection-text)
                       (or (not (mcp-v1-present-p object :package))
                           (mcp-v1-type-p (getf object :package) :inspection-text))
@@ -260,6 +270,9 @@
                           (mcp-v1-type-p (getf object :limit 50) :match-limit)
                           (not (mcp-v1-present-p object :limit))))
            (mcp-v1-error "Inspection requires bounded literal text and search limit")))
+       (when (and (eq (getf object :op) :find-definition)
+                  (not (mcp-v1-type-p (getf object :definition-kind) :runner)))
+         (mcp-v1-error "Lookup requires a definition kind"))
        (when (eq (getf object :op) :run-tests)
          (unless (and (mcp-v1-type-p (getf object :runner) :runner)
                       (if (equal (getf object :runner) "form")
@@ -292,6 +305,23 @@
       (:response
        (mcp-v1-plist object (append '(:version :id) response-keys)
                      '(:version :id :ok))
+       (when (some (lambda (key) (mcp-v1-present-p object key))
+                   '(:symbol-name :definition-kind :lookup-status :source-path :source-type :location-kind))
+         (unless (and (mcp-v1-type-p (getf object :symbol-name) :inspection-text)
+                      (member (getf object :definition-kind) '("function" "variable") :test #'equal)
+                      (mcp-v1-type-p (getf object :lookup-status) :lookup-status)
+                      (eq (not (null (getf object :ok)))
+                          (not (equal (getf object :lookup-status) "not-completed"))))
+           (mcp-v1-error "Incomplete lookup outcome"))
+         (if (equal (getf object :lookup-status) "found")
+             (unless (and (mcp-v1-type-p (getf object :source-path) :recorded-source-path)
+                          (equal (getf object :location-kind) "file")
+                          (equal (getf object :source-type)
+                                 (cond ((equal (getf object :definition-kind) "function") "DEFUN")
+                                       ((equal (getf object :definition-kind) "variable") "DEFVAR"))))
+               (mcp-v1-error "Invalid recorded source location"))
+             (when (some (lambda (key) (mcp-v1-present-p object key)) '(:source-path :source-type :location-kind))
+               (mcp-v1-error "Missing source must not include a location"))))
        (when (some (lambda (key) (mcp-v1-present-p object key)) '(:runner :test-status :passed-count :failed-count))
          (unless (and (mcp-v1-type-p (getf object :runner) :runner)
                       (mcp-v1-type-p (getf object :test-status) :test-status)
@@ -377,6 +407,9 @@
               (:boot-id . :id) (:service-id . :id) (:world . :nonempty-text)
               (:expected-world . :nonempty-text)
               (:package . :text) (:busy . :boolean) (:active-request-id . :id)
+              (:definition-kind . :runner) (:definition-kinds . :definition-kinds)
+              (:symbol-name . :inspection-text) (:lookup-status . :lookup-status)
+              (:source-path . :recorded-source-path) (:source-type . :nonempty-text) (:location-kind . :nonempty-text)
               (:runner . :runner) (:test-runners . :runner-names) (:test-status . :test-status)
               (:passed-count . :nonnegative) (:failed-count . :nonnegative)
               (:original-path . :source-path) (:path-kind . :nonempty-text)
@@ -418,13 +451,17 @@
   (when (and (getf response :ok) (member :run-tests (getf response :features))
              (not (mcp-v1-type-p (getf response :test-runners) :runner-names)))
     (mcp-v1-error "Test capability requires an explicit runner catalogue"))
+  (when (and (getf response :ok)
+             (not (eq (not (null (member :find-definition (getf response :features))))
+                      (not (null (getf response :definition-kinds))))))
+    (mcp-v1-error "Source lookup capability requires supported definition kinds"))
   response)
 
 (defun mcp-v1-check-eval-response (request response)
   "Check execution identity and the complete terminal result contract."
   (mcp-v1-validate request :request)
   (mcp-v1-validate response :response)
-  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos))
+  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos :find-definition))
                (every (lambda (key) (equal (getf request key) (getf response key)))
                       '(:id :boot-id :service-id)))
     (mcp-v1-error "Eval response identity mismatch"))
@@ -452,6 +489,11 @@
         (unless (mcp-v1-present-p response key) (mcp-v1-error "Missing compilation outcome")))
       (unless (equal (getf request :load) (getf response :load))
         (mcp-v1-error "Compile response load option mismatch")))
+    (when (eq (getf request :op) :find-definition)
+      (unless (and (equal (getf request :form) (getf response :symbol-name))
+                   (equal (getf request :definition-kind) (getf response :definition-kind))
+                   (mcp-v1-present-p response :lookup-status))
+        (mcp-v1-error "Lookup response symbol or kind mismatch")))
     (when (eq (getf request :op) :run-tests)
       (unless (and (equal (getf request :runner) (getf response :runner))
                    (mcp-v1-present-p response :test-status))
