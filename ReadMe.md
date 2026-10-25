@@ -8,7 +8,8 @@ The default `generic` profile provides up to three tools:
 - **eval_genera** -- bridges to a Symbolics Genera machine over TCP
 
 The explicit `genera` profile provides `genera_session_status`,
-`genera_eval`, and the `eval_genera(expression)` compatibility alias.
+`genera_request_status`, `genera_recover_session`, `genera_eval`, and the
+`eval_genera(expression)` compatibility alias.
 
 ## Prerequisites
 
@@ -46,7 +47,8 @@ on stderr, leave stdout empty, and exit with status 2.
 
 - Ports must contain decimal digits only and be in `1..65535`.
 - `GENERA_TIMEOUT` must contain a positive whole number of seconds. It
-  applies to Genera, host, and Swank evaluations in the generic profile.
+  applies to evaluations in the generic profile and supplies the default
+  host wait deadline for versioned Genera evaluation.
 - Hostnames and IP addresses must be nonempty and contain no whitespace
   or control characters. `SWANK_PACKAGE` must be nonempty text without
   surrounding whitespace or control characters.
@@ -93,23 +95,57 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the three
+does not expose host or Swank tools. Tool discovery advertises the five
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
 `genera_session_status` takes no arguments and returns local state, phase,
-connection, pending request count, known generation, and error data. Its
-`remote_status_stale` field is true: cached remote metadata is not a live
-worker-idle check. Status never opens, refreshes, or restarts a connection.
+connection, pending request count, known generation, error data, and
+bounded local history. Its `remote_status_stale` field is true: cached
+remote metadata is not a live worker-idle check. Status never opens,
+refreshes, or restarts a connection.
 
-`genera_eval` requires `form` and accepts optional `package`, `print_level`,
-and `print_length`. Print limits are nonnegative integers or null, with
-defaults 6 and 100. `eval_genera` takes `expression` and uses the same
+`genera_eval` requires `form` and accepts optional `package`, `timeout_ms`,
+`print_level`, and `print_length`. Print limits are nonnegative integers
+or null, with defaults 6 and 100. `eval_genera` takes `expression` and uses the same
 session and execution tracking. One eval is admitted at a time; another
-receives a busy tool failure. The Genera profile imposes no execution
-deadline and reports `timeout_enforced_by` as `none`; `timeout_ms` is not
-an accepted argument. Transport failure retains the request identity and
-an unresolved outcome. Execution is never automatically replayed.
+receives a busy tool failure. `timeout_ms` is a positive integer specifying
+the host wait deadline, including queue time. The default is
+`GENERA_TIMEOUT` seconds (300); the alias uses this default. Results and
+failures report `timeout_enforced_by: "host"`. The deadline never stops
+Genera work and is not sent as a remote execution timeout.
+
+Timeout and transport failures retain `request_id`, `boot_id`, and
+`service_id`. Work whose send never began is `not-submitted`; a partial
+or completed send without a terminal result remains `unresolved` and
+blocks further execution. A matching late response or retained ledger
+result releases that block without a second MCP completion. Execution
+is never automatically replayed.
+
+`genera_request_status` requires those three identifiers and never
+executes the request. It can explicitly retry a failed control connection,
+repeating authentication, expected-world, and generation checks. There is
+no background reconnect. A new MCP process can retrieve a retained result
+using the original identifiers. `running` and `unknown` outcomes remain
+blocked; missing or evicted history does not prove non-delivery.
+Terminal responses appear under `result`. `source` is `ledger` or `host`;
+a retained host result survives remote cache eviction.
+
+`genera_recover_session` requires the same unknown identity, the expected
+current `expected_boot_id` and `expected_service_id`, and
+`acknowledge_unknown: true`. It checks the ledger and obtains fresh worker
+status before releasing the block. Running work, a busy worker, mismatched
+identity, or unexpected current generation prevents recovery. After a
+generation change, explicit recovery records `history_lost: true`.
+Successful recovery records `acknowledged: true` while preserving the
+outcome as `unknown`. It never retries or cancels work. Another client's
+later admission can still cause a subsequent eval to receive busy.
+
+Local history retains up to 32 records, with its limit and eviction count
+in session status; unresolved records are retained ahead of terminal or
+acknowledged records. Host memory and the remote ledger are bounded and
+not durable journals. Preserve the original identifiers outside the MCP
+process when recovery across client restarts is needed.
 
 The MCP reader remains responsive while tool work runs. One response
 writer serializes JSON-RPC output; responses may arrive out of request
@@ -177,7 +213,7 @@ Set `GENERA_HOST` in the MCP configuration to enable the tool.
 |---|---|---|
 | `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
 | `GENERA_PORT` | `8888` | TCP port of the eval server |
-| `GENERA_TIMEOUT` | `300` | Evaluation timeout in seconds in the generic profile |
+| `GENERA_TIMEOUT` | `300` | Generic evaluation timeout; default versioned host wait deadline, in seconds |
 
 #### Setting up the Genera side
 
@@ -361,7 +397,13 @@ envelopes, IDs, and generation: queued work becomes `:not-submitted`;
 work whose send began becomes `:unresolved`. The condition's
 `genera-session-error-session` accessor retains the failed session even
 for a temporary helper call. A failed session accepts no new requests.
-There is no automatic reconnect or execution replay.
+`genera-lookup-request` takes the session, request ID, boot ID, and service
+ID; it explicitly retries the control connection when needed and
+reconciles a retained result. `genera-recover-request` additionally takes
+the expected current boot/service IDs and an acknowledgement. There is no
+automatic reconnect or execution replay. `:host-timeout` on submit/call
+overrides the host wait in seconds; eval defaults to `GENERA_TIMEOUT`,
+controls to the session I/O timeout. It is never encoded on the wire.
 
 `genera-close-session` stops its owner without waiting for remote eval.
 The optional `:io-timeout` on open defaults to 5 seconds and bounds
@@ -457,6 +499,7 @@ python3 tests/concurrency.py
 python3 tests/ledger.py
 python3 tests/session.py
 python3 tests/stdio.py
+python3 tests/deadlines.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -581,3 +624,17 @@ argument validation, stdout isolation, and EOF during eval or hello.
 The native check confirms the alias, remote conditions, and completion
 of accepted work after MCP EOF. It restores legacy mode and leaves
 Genera running.
+
+To check deadline and recovery behavior against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/deadlines.py --live-genera
+```
+
+Scripted peers cover partial writes, queued deadlines, late and lost
+replies, running/unknown/evicted outcomes, generation mismatch, and
+fresh-idle recovery. The native check retrieves a result from a new MCP
+client after a timeout and lost reply, verifies the side effect ran once,
+and rejects recovery while another client occupies the worker. It
+restores legacy mode and leaves Genera running.

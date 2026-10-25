@@ -2,11 +2,11 @@
 
 (in-package #:lisp-mcp)
 
-(defstruct rpc-runtime input output diagnostic writer worker session
+(defstruct rpc-runtime input output diagnostic writer worker control-worker session
   (lock (sb-thread:make-mutex :name "MCP runtime"))
   (changed (sb-thread:make-waitqueue :name "MCP runtime"))
   (version "2024-11-05") initialized input-closed stop writer-stop failed
-  replies work (calls (make-hash-table :test 'equal)))
+  replies work control-work (calls (make-hash-table :test 'equal)))
 (defvar *rpc-runtime* nil)
 (defconstant +rpc-work-limit+ 16)
 (defconstant +rpc-reply-limit+ 32)
@@ -26,7 +26,7 @@
                    (cond ((member key '(:ok :busy :truncated :replaced)) (rpc-boolean value))
                          ((member key '(:values :warnings)) (coerce value 'vector))
                          ((eq key :features) (map 'vector #'rpc-name value))
-                         ((eq key :error) (rpc-bridge-json value))
+                         ((member key '(:error :result)) (rpc-bridge-json value))
                          ((keywordp value) (rpc-name value))
                          (t value))))
     object))
@@ -53,7 +53,9 @@
                  (failure (genera-session-failure session))
                  (connected (and (eq (genera-session-state session) :ready)
                                  (not (genera-session-stop session))))
-                 (status (jso "state" (cond ((and failure work) "outcome-unknown")
+                 (status (jso "state" (cond ((and work (or failure (genera-request-failure work)
+                                                          (eq (genera-request-state work) :unresolved)))
+                                              "outcome-unknown")
                                              (failure "disconnected")
                                              ((not connected) "connecting")
                                              (work "executing") (t "ready"))
@@ -61,12 +63,26 @@
                               "connected" (rpc-boolean connected)
                               "busy" (rpc-boolean (or work (getf hello :busy)))
                               "remote_status_stale" 'yason:true
-                              "pending_requests" (hash-table-count (genera-session-pending session)))))
+                              "pending_requests" (hash-table-count (genera-session-pending session))
+                              "history_limit" +genera-history-limit+
+                              "history_evicted" (genera-session-history-evicted session)
+                              "history" (map 'vector (lambda (item)
+                                (let ((entry (rpc-bridge-json
+                                              (loop for key in '(:id :boot-id :service-id)
+                                                    append (list key (getf (genera-request-envelope item) key))))))
+                                  (setf (gethash "request_state" entry) (rpc-name (genera-request-state item))
+                                        (gethash "acknowledged" entry) (rpc-boolean (genera-request-acknowledged item)))
+                                  entry)) (genera-session-history session)))))
             (dolist (key '(:boot-id :service-id :world :package))
               (when (getf hello key) (setf (gethash (rpc-key key) status) (getf hello key))))
             (when work
               (setf (gethash "active_request_id" status)
-                    (getf (genera-request-envelope work) :id)))
+                    (getf (genera-request-envelope work) :id)
+                    (gethash "request_state" status) (rpc-name (genera-request-state work)))
+              (when (or (genera-request-failure work) (eq (genera-request-state work) :unresolved))
+                (setf (gethash "unresolved_request" status)
+                      (rpc-bridge-json (loop for key in '(:id :boot-id :service-id)
+                                             append (list key (getf (genera-request-envelope work) key)))))))
             (when failure
               (setf (gethash "last_error" status)
                     (or (when (genera-session-error-response failure)
@@ -82,6 +98,7 @@
       (dolist (key '(:id :boot-id :service-id))
         (setf (gethash (rpc-key key) object) (getf (genera-request-envelope request) key)))
       (setf (gethash "request_state" object) (rpc-name (genera-request-state request))))
+    (when (string= *profile* "genera") (setf (gethash "timeout_enforced_by" object) "host"))
     (rpc-structured-result id object t)))
 
 (defun rpc-emit (runtime response)
@@ -119,23 +136,48 @@
 (defun rpc-run-work (task)
   (destructuring-bind (id name expression request) task
     (handler-case
-        (if request
+        (cond
+          ((member name '("genera_request_status" "genera_recover_session") :test #'equal)
+           (let* ((session (rpc-runtime-session *rpc-runtime*))
+                  (arguments expression)
+                  (identity (mapcar (lambda (key) (gethash key arguments))
+                                    '("request_id" "boot_id" "service_id")))
+                  (outcome (multiple-value-list (if (string= name "genera_request_status")
+                                (apply #'genera-lookup-request session identity)
+                                (apply #'genera-recover-request session
+                                       (append identity (list (gethash "expected_boot_id" arguments)
+                                                              (gethash "expected_service_id" arguments)
+                                                              (eq (gethash "acknowledge_unknown" arguments)
+                                                                  'yason:true)))))))
+                  (response (first outcome))
+                  (object (rpc-bridge-json response)))
+             (if (string= name "genera_request_status")
+                 (setf (gethash "source" object) (rpc-name (second outcome)))
+                 (setf (gethash "acknowledged" object) 'yason:true
+                       (gethash "history_lost" object)
+                       (rpc-boolean (not (and (equal (gethash "boot_id" arguments)
+                                                     (gethash "expected_boot_id" arguments))
+                                              (equal (gethash "service_id" arguments)
+                                                     (gethash "expected_service_id" arguments)))))))
+             (rpc-structured-result id object (not (getf response :ok)))))
+          (request
             (let* ((session (rpc-runtime-session *rpc-runtime*))
                    (response (genera-await-request session request))
                    (object (rpc-bridge-json response)))
-              (setf (gethash "timeout_enforced_by" object) "none")
-              (rpc-structured-result id object (not (getf response :ok))))
+              (setf (gethash "timeout_enforced_by" object) "host")
+              (rpc-structured-result id object (not (getf response :ok)))))
+          (t
             (multiple-value-bind (text failed)
                 (cond ((string= name "eval_host_cl") (eval-host-cl expression))
                       ((string= name "eval_swank") (eval-swank-tool expression))
                       (t (eval-genera expression)))
-              (rpc-tool-result id text failed)))
+              (rpc-tool-result id text failed))))
       (genera-session-error (condition)
         (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
                           (princ-to-string condition) request))
       (error () (rpc-tool-failure id "internal-error" "Tool execution failed" request)))))
 
-(defun rpc-work-loop (runtime)
+(defun rpc-work-loop (runtime &optional control)
   ;; Preserve generic host/Swank ordering while the reader handles other RPCs.
   (let* ((input (make-string-input-stream ""))
          (terminal (make-two-way-stream input (rpc-runtime-diagnostic runtime)))
@@ -146,21 +188,26 @@
     (loop
       (let ((task
               (sb-thread:with-mutex ((rpc-runtime-lock runtime))
-                (loop while (and (null (rpc-runtime-work runtime))
+                (loop while (and (null (if control (rpc-runtime-control-work runtime)
+                                           (rpc-runtime-work runtime)))
                                  (not (rpc-runtime-input-closed runtime))
                                  (not (rpc-runtime-stop runtime)))
                       do (sb-thread:condition-wait (rpc-runtime-changed runtime)
                                                    (rpc-runtime-lock runtime)))
-                (when (or (rpc-runtime-stop runtime) (null (rpc-runtime-work runtime))) (return))
-                (pop (rpc-runtime-work runtime)))))
+                (when (or (rpc-runtime-stop runtime)
+                          (null (if control (rpc-runtime-control-work runtime) (rpc-runtime-work runtime)))) (return))
+                (if control (pop (rpc-runtime-control-work runtime)) (pop (rpc-runtime-work runtime))))))
         (rpc-emit runtime (rpc-run-work task))))))
 
-(defun rpc-queue-work (id name expression request)
+(defun rpc-queue-work (id name expression request &key control)
   (let ((runtime *rpc-runtime*))
     (sb-thread:with-mutex ((rpc-runtime-lock runtime))
-      (setf (gethash id (rpc-runtime-calls runtime)) t
-            (rpc-runtime-work runtime)
-            (nconc (rpc-runtime-work runtime) (list (list id name expression request))))
+      (setf (gethash id (rpc-runtime-calls runtime)) t)
+      (if control
+          (setf (rpc-runtime-control-work runtime)
+                (nconc (rpc-runtime-control-work runtime) (list (list id name expression request))))
+          (setf (rpc-runtime-work runtime)
+                (nconc (rpc-runtime-work runtime) (list (list id name expression request)))))
       (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))
   nil)
 
@@ -176,16 +223,31 @@
                  "openWorldHint" (rpc-boolean (not read-only)))))
     tool))
 
+(defun rpc-identity-schema ()
+  (jso "request_id" (jso "type" "string" "minLength" 1)
+       "boot_id" (jso "type" "string" "minLength" 1)
+       "service_id" (jso "type" "string" "minLength" 1)))
+
 (defun rpc-tools ()
   (if (string= *profile* "generic") (generic-tools)
       (list (rpc-versioned-tool "genera_session_status" "Return a local Genera session snapshot."
                                  (jso) #() t)
             (rpc-versioned-tool "genera_eval" "Evaluate one form in the attached Genera session."
               (jso "form" (jso "type" "string") "package" (jso "type" "string" "minLength" 1)
+                   "timeout_ms" (jso "type" "integer" "minimum" 1)
                    "print_level" (jso "type" #("integer" "null") "minimum" 0)
                    "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("form"))
             (rpc-versioned-tool "eval_genera" "Compatibility alias for genera_eval."
-                                 (jso "expression" (jso "type" "string")) #("expression")))))
+                                 (jso "expression" (jso "type" "string")) #("expression"))
+            (rpc-versioned-tool "genera_request_status" "Look up a request without replay; retry control connection if needed."
+              (rpc-identity-schema) #("request_id" "boot_id" "service_id") t)
+            (rpc-versioned-tool "genera_recover_session" "Acknowledge a specific unknown outcome after fresh idle verification."
+              (let ((properties (rpc-identity-schema)))
+                (setf (gethash "expected_boot_id" properties) (jso "type" "string" "minLength" 1)
+                      (gethash "expected_service_id" properties) (jso "type" "string" "minLength" 1)
+                      (gethash "acknowledge_unknown" properties) (jso "type" "boolean" "const" 'yason:true))
+                properties)
+              #("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id" "acknowledge_unknown")))))
 
 (defun handle-initialize (id params)
   (multiple-value-bind (version present) (gethash "protocolVersion" params)
@@ -209,13 +271,26 @@
   (unless (hash-table-p arguments) (rpc-invalid "Tool arguments must be an object"))
   (let* ((structured (and (string= *profile* "genera") (string= name "genera_eval")))
          (status (string= name "genera_session_status"))
-         (allowed (cond (status nil) (structured '("form" "package" "print_level" "print_length"))
+         (lookup (string= name "genera_request_status"))
+         (recover (string= name "genera_recover_session"))
+         (allowed (cond ((or lookup recover)
+                         (append '("request_id" "boot_id" "service_id")
+                                 (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
+                        (status nil) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
          (form-key (if structured "form" "expression")))
     (maphash (lambda (key value)
                (declare (ignore value))
                (unless (member key allowed :test #'equal) (rpc-invalid "Unknown tool argument"))) arguments)
-    (unless status
+    (when (or lookup recover)
+      (dolist (key (if recover '("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id")
+                              '("request_id" "boot_id" "service_id")))
+        (let ((value (gethash key arguments)))
+          (unless (and (stringp value) (<= 1 (length value) 4096))
+            (rpc-invalid "Request and generation identities must be nonempty text"))))
+      (when (and recover (not (eq (gethash "acknowledge_unknown" arguments) 'yason:true)))
+        (rpc-invalid "acknowledge_unknown must be true")))
+    (unless (or status lookup recover)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -223,7 +298,10 @@
     (dolist (key '("print_level" "print_length"))
       (let ((value (gethash key arguments)))
         (unless (or (null value) (and (integerp value) (>= value 0)))
-          (rpc-invalid "Print limits must be nonnegative integers or null"))))))
+          (rpc-invalid "Print limits must be nonnegative integers or null")))))
+  (multiple-value-bind (timeout present) (gethash "timeout_ms" arguments)
+    (when (and present (not (and (integerp timeout) (> timeout 0))))
+      (rpc-invalid "timeout_ms must be a positive integer"))))
 
 (defun handle-tools-call (id params)
   (let* ((name (gethash "name" params)) (arguments (gethash "arguments" params (jso))))
@@ -239,6 +317,10 @@
     (if (string= *profile* "generic")
         (rpc-queue-work id name (gethash "expression" arguments) nil)
         (let ((session (rpc-runtime-session *rpc-runtime*)))
+          (when (member name '("genera_request_status" "genera_recover_session") :test #'equal)
+            (return-from handle-tools-call
+              (if session (rpc-queue-work id name arguments nil :control t)
+                  (rpc-tool-failure id "not-ready" "Genera session has not started"))))
           (unless (and session (eq (genera-session-state session) :ready))
             (return-from handle-tools-call
               (let ((failure (and session (genera-session-failure session))))
@@ -250,6 +332,8 @@
           (handler-case
               (let* ((form (gethash (if (string= name "genera_eval") "form" "expression") arguments))
                      (fields (append (list :form form
+                                           :host-timeout (/ (gethash "timeout_ms" arguments
+                                                                                    (* 1000 *genera-timeout*)) 1000)
                                            :print-level (gethash "print_level" arguments 6)
                                            :print-length (gethash "print_length" arguments 100))
                                      (when (gethash "package" arguments)
@@ -297,6 +381,7 @@
     (genera-close-session (rpc-runtime-session runtime) :interrupt-io t))
   ;; Generic stdin batches retain their previous ordered drain behavior.
   (sb-thread:join-thread (rpc-runtime-worker runtime))
+  (sb-thread:join-thread (rpc-runtime-control-worker runtime))
   (sb-thread:with-mutex ((rpc-runtime-lock runtime))
     (setf (rpc-runtime-writer-stop runtime) t)
     (sb-thread:condition-broadcast (rpc-runtime-changed runtime)))
@@ -318,7 +403,9 @@
     (setf (rpc-runtime-writer runtime)
           (sb-thread:make-thread (lambda () (rpc-write-loop runtime)) :name "MCP response")
           (rpc-runtime-worker runtime)
-          (sb-thread:make-thread (lambda () (rpc-work-loop runtime)) :name "MCP tools"))
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime)) :name "MCP tools")
+          (rpc-runtime-control-worker runtime)
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime t)) :name "MCP controls"))
     (unwind-protect
         (loop
           (let ((message (handler-case (read-json-rpc)

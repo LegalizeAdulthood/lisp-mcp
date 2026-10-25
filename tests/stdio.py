@@ -57,8 +57,8 @@ class Bridge:
         self.process.stdin.write(json.dumps(message) + "\n")
         self.process.stdin.flush()
 
-    def call(self, name, request_id, **arguments):
-        self.send(request("tools/call", request_id, name=name, arguments=arguments))
+    def call(self, name, rpc_id, **arguments):
+        self.send(request("tools/call", rpc_id, name=name, arguments=arguments))
 
     def receive(self, timeout=4):
         packet = self.output.get(timeout=timeout)
@@ -140,7 +140,8 @@ class StdioChecks(unittest.TestCase):
                 mcp.send(request("tools/list", "list"))
                 tools = mcp.receive()["result"]["tools"]
                 self.assertEqual({t["name"] for t in tools},
-                                 {"genera_eval", "eval_genera", "genera_session_status"})
+                                 {"genera_eval", "eval_genera", "genera_session_status",
+                                  "genera_request_status", "genera_recover_session"})
                 self.assertTrue(tools[0]["annotations"]["readOnlyHint"])
                 mcp.call("genera_session_status", "status")
                 self.assertEqual(structured(mcp.receive())["phase"], "not-started")
@@ -203,7 +204,7 @@ class StdioChecks(unittest.TestCase):
             self.assertIn("structuredContent", done["result"])
             self.assertEqual(structured(done)["values"], ["42"])
             self.assertEqual(structured(done)["warnings"], [])
-            self.assertEqual(structured(done)["timeout_enforced_by"], "none")
+            self.assertEqual(structured(done)["timeout_enforced_by"], "host")
             mcp.call("eval_genera", "alias", expression="(values :alias)")
             self.assertEqual(structured(mcp.receive())["values"], [":ALIAS"])
         self.assertEqual(requests[0][":package"], "USER")
@@ -269,7 +270,8 @@ class StdioChecks(unittest.TestCase):
             for arguments in [{"form": 1}, {"form": "42", "print_level": False},
                               {"form": "42", "print_length": -1},
                               {"form": "42", "package": ""},
-                              {"form": "42", "timeout_ms": 10}]:
+                              {"form": "42", "timeout_ms": 0},
+                              {"form": "42", "timeout_ms": True}]:
                 mcp.send(request("tools/call", "bad", name="genera_eval", arguments=arguments))
                 self.assertEqual(mcp.receive()["error"]["code"], -32602)
 
