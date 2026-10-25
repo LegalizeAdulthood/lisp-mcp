@@ -1,0 +1,330 @@
+;;; MCP reader, serialized tool worker, and single JSON-RPC response writer.
+
+(in-package #:lisp-mcp)
+
+(defstruct rpc-runtime input output diagnostic writer worker session
+  (lock (sb-thread:make-mutex :name "MCP runtime"))
+  (changed (sb-thread:make-waitqueue :name "MCP runtime"))
+  (version "2024-11-05") initialized input-closed stop writer-stop failed
+  replies work (calls (make-hash-table :test 'equal)))
+(defvar *rpc-runtime* nil)
+(defconstant +rpc-work-limit+ 16)
+(defconstant +rpc-reply-limit+ 32)
+
+(define-condition rpc-argument-error (simple-error) ())
+(defun rpc-invalid (message)
+  (error 'rpc-argument-error :format-control "~A" :format-arguments (list message)))
+(defun rpc-boolean (value) (if value 'yason:true 'yason:false))
+(defun rpc-name (value) (string-downcase (symbol-name value)))
+(defun rpc-key (value)
+  (if (eq value :id) "request_id" (substitute #\_ #\- (rpc-name value))))
+
+(defun rpc-bridge-json (envelope)
+  (let ((object (jso)))
+    (loop for (key value) on envelope by #'cddr
+          do (setf (gethash (rpc-key key) object)
+                   (cond ((member key '(:ok :busy :truncated :replaced)) (rpc-boolean value))
+                         ((member key '(:values :warnings)) (coerce value 'vector))
+                         ((eq key :features) (map 'vector #'rpc-name value))
+                         ((eq key :error) (rpc-bridge-json value))
+                         ((keywordp value) (rpc-name value))
+                         (t value))))
+    object))
+
+(defun rpc-tool-result (id text failed &optional structured)
+  (let ((result (jso "content" (vector (jso "type" "text" "text" text))
+                     "isError" (rpc-boolean failed))))
+    (when (and structured (string= (rpc-runtime-version *rpc-runtime*) "2025-06-18"))
+      (setf (gethash "structuredContent" result) structured))
+    (make-response id result)))
+
+(defun rpc-structured-result (id object &optional failed)
+  (rpc-tool-result id (with-output-to-string (out) (yason:encode object out)) failed object))
+
+(defun rpc-session-status ()
+  "Local facts only; this function never opens or refreshes a connection."
+  (let ((session (rpc-runtime-session *rpc-runtime*)))
+    (if (null session)
+        (jso "state" "disconnected" "phase" "not-started" "connected" 'yason:false
+             "busy" 'yason:false "remote_status_stale" 'yason:true "pending_requests" 0)
+        (sb-thread:with-mutex ((genera-session-lock session))
+          (let* ((hello (genera-session-hello session))
+                 (work (genera-session-execution session))
+                 (failure (genera-session-failure session))
+                 (connected (and (eq (genera-session-state session) :ready)
+                                 (not (genera-session-stop session))))
+                 (status (jso "state" (cond ((and failure work) "outcome-unknown")
+                                             (failure "disconnected")
+                                             ((not connected) "connecting")
+                                             (work "executing") (t "ready"))
+                              "phase" (rpc-name (genera-session-phase session))
+                              "connected" (rpc-boolean connected)
+                              "busy" (rpc-boolean (or work (getf hello :busy)))
+                              "remote_status_stale" 'yason:true
+                              "pending_requests" (hash-table-count (genera-session-pending session)))))
+            (dolist (key '(:boot-id :service-id :world :package))
+              (when (getf hello key) (setf (gethash (rpc-key key) status) (getf hello key))))
+            (when work
+              (setf (gethash "active_request_id" status)
+                    (getf (genera-request-envelope work) :id)))
+            (when failure
+              (setf (gethash "last_error" status)
+                    (or (when (genera-session-error-response failure)
+                          (rpc-bridge-json (getf (genera-session-error-response failure) :error)))
+                        (jso "code" (rpc-name (genera-session-error-kind failure))
+                             "message" (princ-to-string failure)))))
+            status)))))
+
+(defun rpc-tool-failure (id code message &optional request)
+  (let ((object (jso "ok" 'yason:false "error" (jso "code" code "message" message)
+                     "session" (rpc-session-status))))
+    (when request
+      (dolist (key '(:id :boot-id :service-id))
+        (setf (gethash (rpc-key key) object) (getf (genera-request-envelope request) key)))
+      (setf (gethash "request_state" object) (rpc-name (genera-request-state request))))
+    (rpc-structured-result id object t)))
+
+(defun rpc-emit (runtime response)
+  (when response
+    (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+      (loop while (and (>= (length (rpc-runtime-replies runtime)) +rpc-reply-limit+)
+                       (not (rpc-runtime-stop runtime)) (not (rpc-runtime-failed runtime)))
+            do (sb-thread:condition-wait (rpc-runtime-changed runtime) (rpc-runtime-lock runtime)))
+      (unless (or (rpc-runtime-stop runtime) (rpc-runtime-failed runtime))
+        (setf (rpc-runtime-replies runtime)
+              (nconc (rpc-runtime-replies runtime) (list response)))
+        (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
+
+(defun rpc-write-loop (runtime)
+  (handler-case
+      (let ((*standard-output* (rpc-runtime-output runtime)))
+        (loop
+          (let ((response
+                  (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+                    (loop while (and (null (rpc-runtime-replies runtime))
+                                     (not (rpc-runtime-writer-stop runtime)))
+                          do (sb-thread:condition-wait (rpc-runtime-changed runtime)
+                                                       (rpc-runtime-lock runtime)))
+                    (when (null (rpc-runtime-replies runtime)) (return))
+                    (prog1 (pop (rpc-runtime-replies runtime))
+                      (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
+            (write-json-rpc response)
+            (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+              (remhash (gethash "id" response) (rpc-runtime-calls runtime))))))
+    (error ()
+      (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+        (setf (rpc-runtime-failed runtime) t)
+        (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))))
+
+(defun rpc-run-work (task)
+  (destructuring-bind (id name expression request) task
+    (handler-case
+        (if request
+            (let* ((session (rpc-runtime-session *rpc-runtime*))
+                   (response (genera-await-request session request))
+                   (object (rpc-bridge-json response)))
+              (setf (gethash "timeout_enforced_by" object) "none")
+              (rpc-structured-result id object (not (getf response :ok))))
+            (multiple-value-bind (text failed)
+                (cond ((string= name "eval_host_cl") (eval-host-cl expression))
+                      ((string= name "eval_swank") (eval-swank-tool expression))
+                      (t (eval-genera expression)))
+              (rpc-tool-result id text failed)))
+      (genera-session-error (condition)
+        (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
+                          (princ-to-string condition) request))
+      (error () (rpc-tool-failure id "internal-error" "Tool execution failed" request)))))
+
+(defun rpc-work-loop (runtime)
+  ;; Preserve generic host/Swank ordering while the reader handles other RPCs.
+  (let* ((input (make-string-input-stream ""))
+         (terminal (make-two-way-stream input (rpc-runtime-diagnostic runtime)))
+         (*standard-input* input) (*terminal-io* terminal) (*query-io* terminal) (*debug-io* terminal)
+         (*rpc-runtime* runtime) (*standard-output* (rpc-runtime-diagnostic runtime))
+        (*error-output* (rpc-runtime-diagnostic runtime))
+        (*trace-output* (rpc-runtime-diagnostic runtime)))
+    (loop
+      (let ((task
+              (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+                (loop while (and (null (rpc-runtime-work runtime))
+                                 (not (rpc-runtime-input-closed runtime))
+                                 (not (rpc-runtime-stop runtime)))
+                      do (sb-thread:condition-wait (rpc-runtime-changed runtime)
+                                                   (rpc-runtime-lock runtime)))
+                (when (or (rpc-runtime-stop runtime) (null (rpc-runtime-work runtime))) (return))
+                (pop (rpc-runtime-work runtime)))))
+        (rpc-emit runtime (rpc-run-work task))))))
+
+(defun rpc-queue-work (id name expression request)
+  (let ((runtime *rpc-runtime*))
+    (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+      (setf (gethash id (rpc-runtime-calls runtime)) t
+            (rpc-runtime-work runtime)
+            (nconc (rpc-runtime-work runtime) (list (list id name expression request))))
+      (sb-thread:condition-broadcast (rpc-runtime-changed runtime))))
+  nil)
+
+(defun rpc-versioned-tool (name description properties required &optional read-only)
+  (let ((tool (jso "name" name "description" description
+                   "inputSchema" (jso "type" "object" "properties" properties
+                                      "required" required "additionalProperties" 'yason:false))))
+    (when (string= (rpc-runtime-version *rpc-runtime*) "2025-06-18")
+      (setf (gethash "annotations" tool)
+            (jso "readOnlyHint" (rpc-boolean read-only)
+                 "destructiveHint" (rpc-boolean (not read-only))
+                 "idempotentHint" (rpc-boolean read-only)
+                 "openWorldHint" (rpc-boolean (not read-only)))))
+    tool))
+
+(defun rpc-tools ()
+  (if (string= *profile* "generic") (generic-tools)
+      (list (rpc-versioned-tool "genera_session_status" "Return a local Genera session snapshot."
+                                 (jso) #() t)
+            (rpc-versioned-tool "genera_eval" "Evaluate one form in the attached Genera session."
+              (jso "form" (jso "type" "string") "package" (jso "type" "string" "minLength" 1)
+                   "print_level" (jso "type" #("integer" "null") "minimum" 0)
+                   "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("form"))
+            (rpc-versioned-tool "eval_genera" "Compatibility alias for genera_eval."
+                                 (jso "expression" (jso "type" "string")) #("expression")))))
+
+(defun handle-initialize (id params)
+  (multiple-value-bind (version present) (gethash "protocolVersion" params)
+    (when (and present (not (stringp version))) (rpc-invalid "protocolVersion must be text"))
+    (setf (rpc-runtime-version *rpc-runtime*)
+          (cond ((null version) "2024-11-05")
+                ((member version '("2024-11-05" "2025-06-18") :test #'string=) version)
+                (t "2025-06-18"))
+          (rpc-runtime-initialized *rpc-runtime*) t)
+    (make-response id (jso "protocolVersion" (rpc-runtime-version *rpc-runtime*)
+                          "capabilities" (jso "tools" (jso "listChanged" 'yason:false))
+                          "serverInfo" (jso "name" "lisp-mcp" "version" "1.0.0")))))
+
+(defun rpc-start-session ()
+  (when (and (string= *profile* "genera") (null (rpc-runtime-session *rpc-runtime*)))
+    (setf (rpc-runtime-session *rpc-runtime*)
+          (genera-begin-session :host *genera-host* :port *genera-port*
+                                :token *genera-token* :expected-world *genera-expected-world*))))
+
+(defun rpc-validate-arguments (name arguments)
+  (unless (hash-table-p arguments) (rpc-invalid "Tool arguments must be an object"))
+  (let* ((structured (and (string= *profile* "genera") (string= name "genera_eval")))
+         (status (string= name "genera_session_status"))
+         (allowed (cond (status nil) (structured '("form" "package" "print_level" "print_length"))
+                        (t '("expression"))))
+         (form-key (if structured "form" "expression")))
+    (maphash (lambda (key value)
+               (declare (ignore value))
+               (unless (member key allowed :test #'equal) (rpc-invalid "Unknown tool argument"))) arguments)
+    (unless status
+      (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
+    (multiple-value-bind (package present) (gethash "package" arguments)
+      (when (and present (not (and (stringp package) (plusp (length package)))))
+        (rpc-invalid "Package must be nonempty text")))
+    (dolist (key '("print_level" "print_length"))
+      (let ((value (gethash key arguments)))
+        (unless (or (null value) (and (integerp value) (>= value 0)))
+          (rpc-invalid "Print limits must be nonnegative integers or null"))))))
+
+(defun handle-tools-call (id params)
+  (let* ((name (gethash "name" params)) (arguments (gethash "arguments" params (jso))))
+    (unless (and (stringp name) (find name (rpc-tools) :key (lambda (tool) (gethash "name" tool))
+                                                               :test #'string=))
+      (rpc-invalid "Unknown or disabled tool"))
+    (rpc-validate-arguments name arguments)
+    (when (string= name "genera_session_status")
+      (return-from handle-tools-call (rpc-structured-result id (rpc-session-status))))
+    (sb-thread:with-mutex ((rpc-runtime-lock *rpc-runtime*))
+      (when (>= (hash-table-count (rpc-runtime-calls *rpc-runtime*)) +rpc-work-limit+)
+        (return-from handle-tools-call (rpc-tool-failure id "busy" "MCP tool capacity is occupied"))))
+    (if (string= *profile* "generic")
+        (rpc-queue-work id name (gethash "expression" arguments) nil)
+        (let ((session (rpc-runtime-session *rpc-runtime*)))
+          (unless (and session (eq (genera-session-state session) :ready))
+            (return-from handle-tools-call
+              (let ((failure (and session (genera-session-failure session))))
+                (rpc-tool-failure id
+                  (if failure
+                      (rpc-name (or (getf (getf (genera-session-error-response failure) :error) :code)
+                                    (genera-session-error-kind failure))) "not-ready")
+                  (if failure (princ-to-string failure) "Genera session is not ready")))))
+          (handler-case
+              (let* ((form (gethash (if (string= name "genera_eval") "form" "expression") arguments))
+                     (fields (append (list :form form
+                                           :print-level (gethash "print_level" arguments 6)
+                                           :print-length (gethash "print_length" arguments 100))
+                                     (when (gethash "package" arguments)
+                                       (list :package (gethash "package" arguments)))))
+                     (request (apply #'genera-submit-request session :eval fields)))
+                (rpc-queue-work id name form request))
+            (genera-session-error (condition)
+              (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
+                                (princ-to-string condition)))
+            (error () (rpc-tool-failure id "invalid-source" "Source cannot be sent to Genera")))))))
+
+(defun handle-request (message)
+  (unless (hash-table-p message)
+    (return-from handle-request (make-error-response nil +invalid-request+ "Expected a request object")))
+  (let ((method (gethash "method" message)) (params (gethash "params" message (jso))))
+    (multiple-value-bind (id present) (gethash "id" message)
+      (unless (and (equal "2.0" (gethash "jsonrpc" message)) (stringp method)
+                   (or (not present) (stringp id) (integerp id)))
+        (return-from handle-request (make-error-response nil +invalid-request+ "Invalid JSON-RPC request")))
+      (unless present
+        (when (and (string= method "notifications/initialized")
+                   (rpc-runtime-initialized *rpc-runtime*)) (rpc-start-session))
+        (return-from handle-request nil))
+      (sb-thread:with-mutex ((rpc-runtime-lock *rpc-runtime*))
+        (when (gethash id (rpc-runtime-calls *rpc-runtime*))
+          (return-from handle-request
+            (make-error-response nil +invalid-request+ "Request ID is already pending"))))
+      (handler-case
+          (progn
+            (unless (hash-table-p params) (rpc-invalid "Params must be an object"))
+            (cond ((string= method "initialize") (handle-initialize id params))
+                  ((string= method "tools/list") (make-response id (jso "tools" (coerce (rpc-tools) 'vector))))
+                  ((string= method "tools/call") (handle-tools-call id params))
+                  ((string= method "ping") (make-response id (jso)))
+                  (t (make-error-response id +method-not-found+ "Method not found"))))
+        (rpc-argument-error (condition) (make-error-response id +invalid-params+ (princ-to-string condition)))
+        (error () (make-error-response id +internal-error+ "Request dispatch failed"))))))
+
+(defun rpc-shutdown (runtime)
+  (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+    (setf (rpc-runtime-input-closed runtime) t)
+    (when (string= *profile* "genera") (setf (rpc-runtime-stop runtime) t))
+    (sb-thread:condition-broadcast (rpc-runtime-changed runtime)))
+  (when (rpc-runtime-session runtime)
+    (genera-close-session (rpc-runtime-session runtime) :interrupt-io t))
+  ;; Generic stdin batches retain their previous ordered drain behavior.
+  (sb-thread:join-thread (rpc-runtime-worker runtime))
+  (sb-thread:with-mutex ((rpc-runtime-lock runtime))
+    (setf (rpc-runtime-writer-stop runtime) t)
+    (sb-thread:condition-broadcast (rpc-runtime-changed runtime)))
+  (if (string= *profile* "generic")
+      (sb-thread:join-thread (rpc-runtime-writer runtime))
+      (let ((writer (rpc-runtime-writer runtime)))
+        (sb-thread:join-thread writer :timeout .25 :default nil)
+        (when (sb-thread:thread-alive-p writer)
+          ;; Genera's socket and the tool worker are already closed. Avoid
+          ;; SBCL's exit-time stdout flush waiting on a non-reading client.
+          (sb-ext:exit :code 0 :abort t)))))
+
+(defun main ()
+  (handler-case (configure)
+    (configuration-error (condition) (log-message "~A" condition) (uiop:quit 2)))
+  (log-message "lisp-mcp server starting (profile ~A)" *profile*)
+  (let* ((runtime (make-rpc-runtime :input *standard-input* :output *standard-output*
+                                   :diagnostic *error-output*)) (*rpc-runtime* runtime))
+    (setf (rpc-runtime-writer runtime)
+          (sb-thread:make-thread (lambda () (rpc-write-loop runtime)) :name "MCP response")
+          (rpc-runtime-worker runtime)
+          (sb-thread:make-thread (lambda () (rpc-work-loop runtime)) :name "MCP tools"))
+    (unwind-protect
+        (loop
+          (let ((message (handler-case (read-json-rpc)
+                           (error () :parse-error))))
+            (when (eq message :eof) (return))
+            (rpc-emit runtime (if (eq message :parse-error)
+                                  (make-error-response nil +parse-error+ "Invalid JSON")
+                                  (handle-request message)))))
+      (rpc-shutdown runtime))))

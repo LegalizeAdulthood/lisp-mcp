@@ -37,6 +37,8 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 (defvar *genera-port* 8888)
 (defvar *genera-timeout* 300)
 (defvar *genera-enabled* nil)
+(defvar *genera-token* nil)
+(defvar *genera-expected-world* nil)
 
 (defvar *swank-host* "127.0.0.1")
 (defvar *swank-port* 4005)
@@ -95,20 +97,37 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 
 (defun configure ()
   "Validate all consumed settings before entering the MCP loop or doing I/O."
-  (let ((profile (configuration-choice "LISP_MCP_PROFILE" "generic" '("generic")))
-        (protocol (configuration-choice "GENERA_PROTOCOL" "legacy" '("legacy")))
+  (let ((profile (configuration-choice "LISP_MCP_PROFILE" "generic" '("generic" "genera")))
+        (protocol (configuration-choice "GENERA_PROTOCOL" "legacy" '("legacy" "v1")))
         (genera-host (configuration-host "GENERA_HOST"))
         (genera-port (configuration-integer "GENERA_PORT" 8888 1 65535))
         (timeout (configuration-integer "GENERA_TIMEOUT" 300 1))
         (swank-host (configuration-host "SWANK_HOST" "127.0.0.1"))
         (swank-port (configuration-integer "SWANK_PORT" 4005 1 65535))
-        (swank-package (configuration-text "SWANK_PACKAGE" "COMMON-LISP-USER")))
+        (swank-package (configuration-text "SWANK_PACKAGE" "COMMON-LISP-USER"))
+        (token (configuration-text "GENERA_TOKEN"))
+        (world (configuration-text "GENERA_EXPECTED_WORLD")))
+    (when (and (string= profile "genera") (not (string= protocol "v1")))
+      (configuration-error "LISP_MCP_PROFILE" "genera requires explicit GENERA_PROTOCOL=v1"))
+    (when (and (string= protocol "v1") (not (string= profile "genera")))
+      (configuration-error "GENERA_PROTOCOL" "v1 requires LISP_MCP_PROFILE=genera"))
+    (when (and (string= profile "genera") (null genera-host))
+      (configuration-error "GENERA_HOST" "is required by the genera profile"))
+    (dolist (setting (list (cons "GENERA_TOKEN" token) (cons "GENERA_EXPECTED_WORLD" world)))
+      (when (and (cdr setting)
+                 (or (> (length (cdr setting)) 4096)
+                     (some (lambda (ch) (> (char-code ch) 126)) (cdr setting))))
+        (configuration-error (car setting) "must contain at most 4096 printable ASCII characters")))
+    (when (and (or token world) (not (string= profile "genera")))
+      (configuration-error (if token "GENERA_TOKEN" "GENERA_EXPECTED_WORLD")
+                           "requires the genera profile and protocol v1"))
     (setf *profile* profile
           *genera-protocol* protocol
           *genera-host* genera-host
           *genera-port* genera-port
           *genera-timeout* timeout
           *genera-enabled* (not (null genera-host))
+          *genera-token* token *genera-expected-world* world
           *swank-host* swank-host
           *swank-port* swank-port
           *swank-package* swank-package
@@ -401,9 +420,9 @@ Returns (values result-string output-string)."
                                                    (nreverse (cons stdout output-parts)))))))
                          (:abort
                           (return (values "" (or error-message
-                                                 (format nil "Aborted: ~A" (second value))))))
+                                                 (format nil "Aborted: ~A" (second value))) t)))
                          (otherwise
-                          (return (values "" (format nil "Unexpected return: ~S" value))))))))
+                          (return (values "" (format nil "Unexpected return: ~S" value) t)))))))
                   (:debug
                    ;; (:debug thread level (desc ...) restarts ...)
                    ;; Extract error description and find the *ABORT restart index.
@@ -474,10 +493,18 @@ Returns (values result-string output-string)."
   (force-output *error-output*))
 
 (defun read-json-rpc ()
-  "Read one JSON-RPC message from stdin. Returns NIL on EOF."
-  (let ((line (read-line *standard-input* nil nil)))
-    (when (and line (plusp (length line)))
-      (yason:parse line))))
+  "Read one JSON-RPC message from stdin. Returns :EOF at end of input."
+  (loop for line = (read-line *standard-input* nil nil)
+        do (unless line (return :eof))
+        unless (every (lambda (ch) (find ch '(#\Space #\Tab #\Return))) line)
+          do (return
+               (with-input-from-string (input line)
+                 (let ((value (yason:parse input :json-arrays-as-vectors t
+                                                :json-booleans-as-symbols t)))
+                   (unless (loop for ch = (read-char input nil nil) while ch
+                                 always (find ch '(#\Space #\Tab #\Return)))
+                     (error "Trailing JSON data"))
+                   value)))))
 
 (defun write-json-rpc (response)
   "Write a JSON-RPC response as a single line to stdout."
@@ -496,12 +523,6 @@ Returns (values result-string output-string)."
        "error" (jso "code" code "message" message)))
 
 ;;; --- MCP protocol handlers ---
-
-(defun handle-initialize (id)
-  (make-response id
-    (jso "protocolVersion" "2024-11-05"
-         "capabilities" (jso "tools" (jso "listChanged" 'yason:false))
-         "serverInfo"   (jso "name" "lisp-mcp" "version" "1.0.0"))))
 
 (defun make-genera-tool ()
   (jso "name" "eval_genera"
@@ -530,13 +551,13 @@ Returns (values result-string output-string)."
                                                  "description" "A Common Lisp expression to evaluate on the Swank-connected Lisp."))
                           "required" '("expression"))))
 
-(defun handle-tools-list (id)
+(defun generic-tools ()
   (let ((tools (list (make-host-cl-tool))))
     (when *swank-enabled*
       (push (make-swank-tool) tools))
     (when *genera-enabled*
       (push (make-genera-tool) tools))
-    (make-response id (jso "tools" tools))))
+    tools))
 
 (defun eval-genera (expression)
   "Evaluate EXPRESSION on the remote Genera machine. Returns a formatted string."
@@ -544,27 +565,28 @@ Returns (values result-string output-string)."
       (sb-ext:with-timeout *genera-timeout*
         (multiple-value-bind (result stdout stderr)
             (genera-send expression)
-          (format-response result stdout stderr)))
+          (values (format-response result stdout stderr)
+                  (and (zerop (length result)) (plusp (length stderr))))))
     (sb-ext:timeout ()
-      (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*))
+      (values (format nil "Timeout: Genera did not respond within ~Ds" *genera-timeout*) t))
     (framing-error (e)
-      (format nil "Protocol error: ~A" e))
+      (values (format nil "Protocol error: ~A" e) t))
     (error (e)
-      (format nil "Connection error: ~A" e))))
+      (values (format nil "Connection error: ~A" e) t))))
 
 (defun eval-swank-tool (expression)
   "Evaluate EXPRESSION via a remote Swank server. Returns a formatted string."
   (handler-case
       (sb-ext:with-timeout *genera-timeout*
-        (multiple-value-bind (result output)
+        (multiple-value-bind (result output failed)
             (swank-eval expression)
-          (format-response result output "")))
+          (values (format-response result output "") failed)))
     (sb-ext:timeout ()
-      (format nil "Timeout: Swank did not respond within ~Ds" *genera-timeout*))
+      (values (format nil "Timeout: Swank did not respond within ~Ds" *genera-timeout*) t))
     (framing-error (e)
-      (format nil "Protocol error: ~A" e))
+      (values (format nil "Protocol error: ~A" e) t))
     (error (e)
-      (format nil "Connection error: ~A" e))))
+      (values (format nil "Connection error: ~A" e) t))))
 
 (defun eval-host-cl (expression)
   "Evaluate EXPRESSION locally in the host Common Lisp. Returns a formatted string."
@@ -580,61 +602,10 @@ Returns (values result-string output-string)."
                            (get-output-stream-string *standard-output*)
                            (get-output-stream-string *error-output*))))
     (sb-ext:timeout ()
-      (format nil "Timeout: evaluation did not complete within ~Ds" *genera-timeout*))
+      (values (format nil "Timeout: evaluation did not complete within ~Ds" *genera-timeout*) t))
     (error (e)
-      (format nil "Error: ~A" e))))
+      (values (format nil "Error: ~A" e) t))))
 
-(defun handle-tools-call (id params)
-  (let* ((name (gethash "name" params))
-         (arguments (gethash "arguments" params))
-         (expression (gethash "expression" arguments)))
-    (let ((text (cond
-                  ((string= name "eval_genera") (eval-genera expression))
-                  ((string= name "eval_host_cl") (eval-host-cl expression))
-                  ((string= name "eval_swank")   (eval-swank-tool expression))
-                  (t (return-from handle-tools-call
-                       (make-error-response id +invalid-params+
-                                            (format nil "Unknown tool: ~A" name)))))))
-      (make-response id
-                     (jso "content" (list (jso "type" "text" "text" text)))))))
-
-;;; --- Main loop ---
-
-(defun handle-request (msg)
-  "Dispatch a JSON-RPC request and return a response (or NIL for notifications)."
-  (let ((method (gethash "method" msg))
-        (id (gethash "id" msg))
-        (params (gethash "params" msg)))
-    (cond
-      ((string= method "initialize")
-       (handle-initialize id))
-      ((string= method "notifications/initialized")
-       nil)
-      ((string= method "tools/list")
-       (handle-tools-list id))
-      ((string= method "tools/call")
-       (handle-tools-call id params))
-      ((string= method "ping")
-       (make-response id (jso)))
-      (id
-       (make-error-response id +method-not-found+ (format nil "Method not found: ~A" method)))
-      (t nil))))
-
-(defun main ()
-  "MCP stdio server main loop."
-  (handler-case (configure)
-    (configuration-error (e)
-      (log-message "~A" e)
-      (uiop:quit 2)))
-  (log-message "lisp-mcp server starting (SBCL~@[, Genera at ~A:~D~]~@[, Swank at ~A:~D~])"
-                (when *genera-enabled* *genera-host*)
-                (when *genera-enabled* *genera-port*)
-                (when *swank-enabled* *swank-host*)
-                (when *swank-enabled* *swank-port*))
-  (loop for msg = (read-json-rpc)
-        while msg
-        do (let ((response (handle-request msg)))
-             (when response
-               (write-json-rpc response)))))
+(load (merge-pathnames "mcp-runtime.lisp" *load-truename*))
 
 ;;; Run via: sbcl --noinform --non-interactive --load lisp-mcp.lisp --eval '(lisp-mcp:main)'

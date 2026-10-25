@@ -44,11 +44,11 @@ def reply(stream, result):
 
 
 @contextmanager
-def peer(behavior, hello_change=None):
+def peer(behavior, hello_change=None, accept_timeout=5):
     with socket.socket() as listener, ThreadPoolExecutor(1) as pool:
         listener.bind(("127.0.0.2", 0))
         listener.listen(2)
-        listener.settimeout(5)
+        listener.settimeout(accept_timeout)
 
         def serve():
             with listener.accept()[0] as stream:

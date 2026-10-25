@@ -1,10 +1,14 @@
 # lisp-mcp
 
-An MCP (Model Context Protocol) server that gives LLMs the ability to evaluate Common Lisp expressions. It provides up to three tools depending on configuration:
+An MCP (Model Context Protocol) server for Common Lisp evaluation.
+The default `generic` profile provides up to three tools:
 
-- **eval_host_cl** -- always available; evaluates expressions in the MCP server's own SBCL process
+- **eval_host_cl** -- available in the generic profile; evaluates expressions in the MCP server's own SBCL process
 - **eval_swank** -- connects to a running Lisp via the Swank protocol (the backend used by SLIME and Sly)
 - **eval_genera** -- bridges to a Symbolics Genera machine over TCP
+
+The explicit `genera` profile provides `genera_session_status`,
+`genera_eval`, and the `eval_genera(expression)` compatibility alias.
 
 ## Prerequisites
 
@@ -42,7 +46,7 @@ on stderr, leave stdout empty, and exit with status 2.
 
 - Ports must contain decimal digits only and be in `1..65535`.
 - `GENERA_TIMEOUT` must contain a positive whole number of seconds. It
-  retains its existing use for Genera, host, and Swank evaluations.
+  applies to Genera, host, and Swank evaluations in the generic profile.
 - Hostnames and IP addresses must be nonempty and contain no whitespace
   or control characters. `SWANK_PACKAGE` must be nonempty text without
   surrounding whitespace or control characters.
@@ -52,19 +56,86 @@ on stderr, leave stdout empty, and exit with status 2.
 
 | Variable | Default | Supported values |
 |---|---|---|
-| `LISP_MCP_PROFILE` | `generic` | `generic`, with the existing host and optional Swank/Genera tools |
-| `GENERA_PROTOCOL` | `legacy` | `legacy`, using expression requests and three response fields |
+| `LISP_MCP_PROFILE` | `generic` | `generic` or `genera` |
+| `GENERA_PROTOCOL` | `legacy` | `legacy` with `generic`; explicit `v1` with `genera` |
+| `GENERA_TOKEN` | *(unset)* | Optional shared token for the Genera profile |
+| `GENERA_EXPECTED_WORLD` | *(unset)* | Optional expected world basename for the Genera profile |
 
 Unsupported profile or protocol selections fail at startup; the bridge
-never falls back to legacy after an unsupported selection. Initialization
-and discovery do not contact Genera. Run the target Lisp before
-evaluating expressions; the bridge does not start a VLM.
+never falls back to legacy. The Genera profile requires `GENERA_HOST`
+and explicit `GENERA_PROTOCOL=v1`. Token and expected-world settings
+require that profile and contain at most 4,096 printable ASCII characters
+without surrounding whitespace. Initialization, discovery, and local
+status do not contact Genera. The Genera profile starts one asynchronous
+attach after `notifications/initialized`. Run the target Lisp first; the
+bridge does not start a VLM.
+
+### Genera profile
+
+For a listener explicitly configured for version 1, use:
+
+```json
+{
+    "mcpServers": {
+        "lisp": {
+            "command": "/path/to/lisp-mcp.sh",
+            "env": {
+                "LISP_MCP_PROFILE": "genera",
+                "GENERA_PROTOCOL": "v1",
+                "GENERA_HOST": "genera.example",
+                "GENERA_PORT": "8888",
+                "GENERA_EXPECTED_WORLD": "world.vlod"
+            }
+        }
+    }
+}
+```
+
+Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
+evaluations and the alias use the same authenticated session. The profile
+does not expose host or Swank tools. Tool discovery advertises the three
+implemented tools even before the connection is ready; an eval then
+returns a structured not-ready tool failure instead of waiting in a queue.
+
+`genera_session_status` takes no arguments and returns local state, phase,
+connection, pending request count, known generation, and error data. Its
+`remote_status_stale` field is true: cached remote metadata is not a live
+worker-idle check. Status never opens, refreshes, or restarts a connection.
+
+`genera_eval` requires `form` and accepts optional `package`, `print_level`,
+and `print_length`. Print limits are nonnegative integers or null, with
+defaults 6 and 100. `eval_genera` takes `expression` and uses the same
+session and execution tracking. One eval is admitted at a time; another
+receives a busy tool failure. The Genera profile imposes no execution
+deadline and reports `timeout_enforced_by` as `none`; `timeout_ms` is not
+an accepted argument. Transport failure retains the request identity and
+an unresolved outcome. Execution is never automatically replayed.
+
+The MCP reader remains responsive while tool work runs. One response
+writer serializes JSON-RPC output; responses may arrive out of request
+order and retain their MCP IDs independently of bridge request IDs.
+Malformed calls and invalid arguments receive JSON-RPC errors. Readiness,
+connection, and evaluation failures use tool results with `isError: true`.
+The generic profile retains its text results and ordered host/Swank work.
+
+Supported MCP revisions are `2024-11-05` and `2025-06-18`. Versioned tools
+always include serialized JSON in text content. Revision `2025-06-18`
+also receives the same object as `structuredContent` and tool annotations;
+older clients receive JSON text. See the
+[MCP tools contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
+
+EOF in the Genera profile closes host resources promptly, including a
+pending handshake or eval, while accepted Genera work continues. Generic
+stdin batches drain accepted tool calls in their existing order. Logs
+use stderr; stdout contains only JSON-RPC responses.
 
 ## Tools
 
 ### eval_host_cl
 
-Evaluate a Common Lisp expression in the MCP server's own SBCL process. Always available, no configuration needed. Stdout, stderr, and the return value are captured and returned.
+Evaluate a Common Lisp expression in the MCP server's own SBCL process.
+Available in the generic profile, with no additional configuration.
+Stdout, stderr, and return values are captured and returned.
 
 ### eval_swank
 
@@ -106,7 +177,7 @@ Set `GENERA_HOST` in the MCP configuration to enable the tool.
 |---|---|---|
 | `GENERA_HOST` | *(unset)* | Hostname or IP of the Genera machine. When set, enables `eval_genera`. |
 | `GENERA_PORT` | `8888` | TCP port of the eval server |
-| `GENERA_TIMEOUT` | `300` | Timeout in seconds for each evaluation |
+| `GENERA_TIMEOUT` | `300` | Evaluation timeout in seconds in the generic profile |
 
 #### Setting up the Genera side
 
@@ -254,7 +325,7 @@ terminal fields and never retries execution or falls back to legacy.
 When borrowing a session, connection/authentication options belong to
 that session; combining `:session` with `:host`, `:port`, `:token`, or
 `:expected-world` is rejected before submission.
-The MCP environment configuration above selects the legacy tool path.
+The generic MCP profile selects the legacy tool path.
 
 ### Persistent host sessions
 
@@ -296,8 +367,8 @@ There is no automatic reconnect or execution replay.
 The optional `:io-timeout` on open defaults to 5 seconds and bounds
 connect, hello, and frame writes; it does not limit remote execution.
 Cached status is the last validated snapshot, not live evidence after a
-session fails. The API requires explicit ownership and closure; the MCP
-environment configuration above continues to use the legacy tool path.
+session fails. Direct API callers own and close their sessions. The
+Genera MCP profile owns its session from initialized notification to EOF.
 
 ### Request history
 
@@ -385,6 +456,7 @@ python3 tests/evaluation.py
 python3 tests/concurrency.py
 python3 tests/ledger.py
 python3 tests/session.py
+python3 tests/stdio.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -495,3 +567,17 @@ control requests during a pending eval, partial frames, admission limits,
 protocol faults, disconnect identity retention, and prompt close. The
 native check reuses one session for eval/status/request lookup while an
 eval sleeps. It restores legacy mode and leaves Genera running.
+
+To check MCP stdio against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/stdio.py --live-genera
+```
+
+The scripted checks cover responsive initialization/discovery/status,
+MCP and bridge ID matching, structured/text results, tool failures,
+argument validation, stdout isolation, and EOF during eval or hello.
+The native check confirms the alias, remote conditions, and completion
+of accepted work after MCP EOF. It restores legacy mode and leaves
+Genera running.

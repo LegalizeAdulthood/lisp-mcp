@@ -22,7 +22,7 @@
   (changed (sb-thread:make-waitqueue :name "Genera session"))
   (nonce (format nil "~A-~D" *genera-request-nonce*
                  (random (expt 2 64) (make-random-state t))))
-  (counter 0) (state :connecting) stop failure cached-status
+  (counter 0) (state :connecting) (phase :connect) blocking stop failure cached-status
   (pending (make-hash-table :test 'equal)) queue execution (controls 0)
   ;; Incremental framing lets queued controls pass even during a partial reply.
   (prefix :start) (digits 0) (length 0) input (position 0))
@@ -31,11 +31,21 @@
   (handler-case (funcall function)
     (error (condition) (genera-session-error :protocol (princ-to-string condition)))))
 
+(defmacro genera-with-io (session &body body)
+  `(unwind-protect
+       (progn
+         (setf (genera-session-blocking ,session) t)
+         (when (genera-session-stop ,session)
+           (genera-session-error :closed "Genera host I/O closed"))
+         ,@body)
+     (setf (genera-session-blocking ,session) nil)))
+
 (defun genera-session-fail (session condition)
   (sb-thread:with-mutex ((genera-session-lock session))
     (setf (slot-value condition 'session) session)
     (setf (genera-session-failure session) condition
           (genera-session-state session) (if (genera-session-stop session) :closed :failed)
+          (genera-session-phase session) :failed
           (genera-session-queue session) nil)
     (maphash (lambda (id request)
                (declare (ignore id))
@@ -144,17 +154,20 @@
     (handler-case
         (unwind-protect
             (progn
-              (setf socket (usocket:socket-connect
+              (genera-with-io session
+               (setf socket (usocket:socket-connect
                             (genera-session-host session) (genera-session-port session)
                             :element-type '(unsigned-byte 8)
-                            :timeout (genera-session-io-timeout session)))
+                            :timeout (genera-session-io-timeout session))))
               (sb-thread:with-mutex ((genera-session-lock session))
+                (setf (genera-session-phase session) :hello)
                 (when (genera-session-stop session)
                   (genera-session-error :closed "Genera session closed while connecting")))
               (let* ((stream (usocket:socket-stream socket))
                      (hello (genera-session-hello-envelope session))
                      (greeting
-                       (sb-ext:with-timeout (genera-session-io-timeout session)
+                       (genera-with-io session
+                        (sb-ext:with-timeout (genera-session-io-timeout session)
                          (genera-write-envelope stream hello)
                          (let* ((size (read-frame-length stream))
                                 (data (read-exactly stream
@@ -162,14 +175,15 @@
                                 (text (map 'string #'code-char data)))
                            (genera-session-checked
                             (lambda () (mcp-v1-check-hello-response
-                                        hello (mcp-v1-decode text :response))))))))
+                                        hello (mcp-v1-decode text :response)))))))))
                 (unless (getf greeting :ok)
                   (genera-session-error :handshake "Genera rejected hello" greeting))
                 (sb-thread:with-mutex ((genera-session-lock session))
                   (setf (genera-session-socket session) socket
                         (genera-session-hello session) greeting
                         (genera-session-cached-status session) greeting
-                        (genera-session-state session) :ready)
+                        (genera-session-state session) :ready
+                        (genera-session-phase session) :ready)
                   (sb-thread:condition-broadcast (genera-session-changed session)))
                 (loop
                   (let ((request
@@ -179,11 +193,12 @@
                               (when next (setf (genera-request-state next) :sending))
                               next))))
                     (when request
-                      (sb-ext:with-timeout (genera-session-io-timeout session)
+                      (genera-with-io session
+                       (sb-ext:with-timeout (genera-session-io-timeout session)
                         (let ((payload (genera-request-payload request)))
                           (write-sequence (string-to-octets (format nil "~D " (length payload))) stream)
                           (write-sequence payload stream)
-                          (force-output stream)))
+                          (force-output stream))))
                       (sb-thread:with-mutex ((genera-session-lock session))
                         (setf (genera-request-state request) :sent)))
                     (when (or (listen stream)
@@ -213,20 +228,26 @@
         (make-condition 'genera-session-error :kind :closed
                         :format-control "Genera session closed")))))
 
-(defun genera-close-session (session)
+(defun genera-close-session (session &key interrupt-io)
   "Stop the owner and close its socket; never wait for remote execution."
   (sb-thread:with-mutex ((genera-session-lock session))
     (setf (genera-session-stop session) t)
     (sb-thread:condition-broadcast (genera-session-changed session)))
+  (when interrupt-io
+    (ignore-errors
+      (sb-thread:interrupt-thread (genera-session-owner session)
+        (lambda ()
+          (when (genera-session-blocking session)
+            (genera-session-error :closed "Genera host I/O closed"))))))
   (sb-thread:join-thread (genera-session-owner session)
                          :timeout (+ (genera-session-io-timeout session) .5) :default nil)
   (when (sb-thread:thread-alive-p (genera-session-owner session))
     (genera-session-error :shutdown "Genera I/O owner did not stop within its I/O bound"))
   nil)
 
-(defun genera-open-session (&key (host *genera-host*) (port *genera-port*) token
+(defun genera-begin-session (&key (host *genera-host*) (port *genera-port*) token
                                 expected-world (io-timeout 5))
-  "Connect and authenticate once. This does not enable a new MCP profile."
+  "Start the I/O owner without waiting for connection or hello."
   (unless (and (realp io-timeout) (> io-timeout 0))
     (error "Session I/O timeout must be positive"))
   (let ((session (%make-genera-session :host host :port port :token token
@@ -234,6 +255,11 @@
     (mcp-v1-encode (genera-session-hello-envelope session) :request)
     (setf (genera-session-owner session)
           (sb-thread:make-thread (lambda () (genera-run-session session)) :name "Genera I/O"))
+    session))
+
+(defun genera-open-session (&rest options)
+  "Connect and authenticate once, waiting for the asynchronous owner."
+  (let ((session (apply #'genera-begin-session options)))
     (let ((ready nil))
       (unwind-protect
           (progn
