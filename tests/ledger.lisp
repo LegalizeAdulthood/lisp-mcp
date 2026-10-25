@@ -42,7 +42,7 @@
          (hello (mcp-v1-dispatch '(:version 1 :id "hello" :op :hello) session))
          (client (mcp-admit-client 'first *mcp-service* :v1))
          (request (lrequest "once")))
-    (lcheck '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests) (getf hello :features))
+    (lcheck '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests :describe :apropos) (getf hello :features))
     (lcheck +mcp-history-limit+ (getf hello :history-limit))
     (lcheck +mcp-history-byte-limit+ (getf hello :history-byte-limit))
     (lcheck 0 (getf hello :history-count))

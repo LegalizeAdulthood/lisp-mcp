@@ -398,6 +398,15 @@
                    "print_length" (jso "type" #("integer" "null") "minimum" 0)) #("form"))
             (rpc-versioned-tool "eval_genera" "Compatibility alias for genera_eval."
                                  (jso "expression" (jso "type" "string")) #("expression"))
+            (rpc-versioned-tool "genera_describe" "Inspect existing symbol metadata without printing its value or calling user printers."
+              (jso "symbol" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                   "package" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                   "timeout_ms" (jso "type" "integer" "minimum" 1)) #("symbol") t)
+            (rpc-versioned-tool "genera_apropos" "Search accessible symbol names in one existing package with bounded visits and matches."
+              (jso "pattern" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                   "package" (jso "type" "string" "minLength" 1 "maxLength" 256)
+                   "limit" (jso "type" "integer" "minimum" 1 "maximum" 100 "default" 50)
+                   "timeout_ms" (jso "type" "integer" "minimum" 1)) #("pattern") t)
             (rpc-versioned-tool "genera_run_tests" "Run one explicit test form or a configured named adapter without replay."
               (jso "runner" (jso "type" "string" "minLength" 1 "maxLength" 128 "default" "form")
                    "form" (jso "type" "string") "package" (jso "type" "string" "minLength" 1)
@@ -470,11 +479,14 @@
          (interrupt (string= name "genera_interrupt"))
          (reset (string= name "genera_reset_listener_context"))
          (testing (string= name "genera_run_tests"))
+         (inspecting (member name '("genera_describe" "genera_apropos") :test #'equal))
          (loading (rpc-file-tool-p name))
          (allowed (cond ((or lookup recover interrupt)
                          (append '("request_id" "boot_id" "service_id")
                                  (when interrupt '("timeout_ms"))
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
+                        (inspecting (append '("package" "timeout_ms")
+                                            (if (equal name "genera_describe") '("symbol") '("pattern" "limit"))))
                         (testing '("runner" "form" "package" "timeout_ms" "print_level" "print_length"))
                         (loading (append '("path" "path_kind" "package" "timeout_ms" "print_level" "print_length" "transfer")
                                          (when (string= name "genera_compile_file") '("load"))))
@@ -511,12 +523,19 @@
       (unless (and (stringp (gethash "path" arguments)) (<= 1 (length (gethash "path" arguments)) 4096)
                    (member (gethash "path_kind" arguments) '("genera" "host" "relative") :test #'equal))
         (rpc-invalid "File execution requires a nonempty path and explicit path_kind")))
+    (when inspecting
+      (unless (and (mcp-v1-type-p (gethash (if (equal name "genera_describe") "symbol" "pattern") arguments)
+                                  :inspection-text)
+                   (or (not (nth-value 1 (gethash "package" arguments)))
+                       (mcp-v1-type-p (gethash "package" arguments) :inspection-text))
+                   (mcp-v1-type-p (gethash "limit" arguments 50) :match-limit))
+        (rpc-invalid "Inspection requires bounded ASCII literal text and a limit from 1 to 100")))
     (when testing
       (unless (and (mcp-v1-type-p (gethash "runner" arguments "form") :runner)
                    (if (equal (gethash "runner" arguments "form") "form")
                        (stringp (gethash "form" arguments)) (not (nth-value 1 (gethash "form" arguments)))))
         (rpc-invalid "Tests require a form only for runner form; named runners take no form")))
-    (unless (or status lookup recover ensure interrupt reset loading testing)
+    (unless (or status lookup recover ensure interrupt reset loading testing inspecting)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -564,12 +583,17 @@
           (handler-case
               (let* ((reset (string= name "genera_reset_listener_context"))
                      (testing (string= name "genera_run_tests"))
+                     (inspecting (member name '("genera_describe" "genera_apropos") :test #'equal))
                      (loading (rpc-file-tool-p name))
                      (form (gethash (if (or testing (string= name "genera_eval")) "form" "expression") arguments))
                      (fields (append
                                (list :host-timeout (/ (gethash "timeout_ms" arguments
                                                               (* 1000 *genera-timeout*)) 1000))
-                               (cond (loading (list :defer t))
+                               (cond (inspecting
+                                      (append (list :form (gethash (if (equal name "genera_describe") "symbol" "pattern") arguments))
+                                              (when (equal name "genera_apropos") (list :limit (gethash "limit" arguments 50)))
+                                              (when (gethash "package" arguments) (list :package (gethash "package" arguments)))))
+                                 (loading (list :defer t))
                                  (reset
                                    (list :expected-generation (list (gethash "boot_id" arguments)
                                                                     (gethash "service_id" arguments))))
@@ -580,7 +604,8 @@
                                            (when (gethash "package" arguments)
                                              (list :package (gethash "package" arguments))))))))
                      (request (apply #'genera-submit-request session
-                                     (cond (testing :run-tests) ((string= name "genera_compile_file") :compile-file)
+                                     (cond (inspecting (if (equal name "genera_describe") :describe :apropos))
+                                           (testing :run-tests) ((string= name "genera_compile_file") :compile-file)
                                            (loading :load) (reset :reset-listener-context) (t :eval)) fields)))
                 (rpc-queue-work id name (if loading arguments form) request))
             (genera-session-error (condition)

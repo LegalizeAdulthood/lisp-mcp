@@ -131,7 +131,7 @@
                  '(:id :boot-id :service-id))
     (mcp-v1-error "Response identity does not match its request"))
   (case (getf request :op)
-    ((:eval :reset-listener-context :load :compile-file :run-tests) (mcp-v1-check-eval-response request response))
+    ((:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos) (mcp-v1-check-eval-response request response))
     (:status
      (when (getf response :ok)
        (dolist (key '(:world :package :busy :features))
@@ -449,7 +449,7 @@
       (error (or (genera-session-failure session)
                  (make-condition 'genera-session-error :kind :closed
                                  :format-control "Genera session is closed"))))
-    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load :compile-file :run-tests))
+    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos))
       (genera-session-error :unsupported "Unsupported session operation"))
     (unless (member operation (getf (genera-session-hello session) :features))
       (genera-session-error :unsupported "Listener does not advertise this operation"))
@@ -459,7 +459,7 @@
     (let ((expected (getf fields :expected-generation)))
       (when expected (apply #'genera-check-generation session expected))
       (remf fields :expected-generation))
-    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load :compile-file :run-tests)))))
+    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos)))))
            (deferred (getf fields :defer))
            (defer-option (remf fields :defer))
            (idle-only (getf fields :idle-only))

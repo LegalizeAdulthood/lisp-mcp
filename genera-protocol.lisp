@@ -8,7 +8,7 @@
 (defconstant +mcp-v1-max-integer+ 9223372036854775807)
 (defconstant +mcp-v1-min-integer+ -9223372036854775808)
 
-(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file :run-tests))
+(defparameter *mcp-v1-operations* '(:hello :status :eval :request-status :interrupt :reset-listener-context :load :compile-file :run-tests :describe :apropos))
 (defparameter *mcp-v1-error-codes*
   '(:unsupported-operation :invalid-request :unsupported-version
     :authentication-failed :world-mismatch :handshake-required
@@ -16,7 +16,7 @@
     :evaluation-error :busy :worker-unavailable :request-id-conflict
     :interrupted :interrupt-pending :interrupt-refused :request-not-active
     :file-error :load-error :compile-error :source-mismatch :transfer-error
-    :unsupported-runner :test-runner-error :test-report-error :test-failure))
+    :unsupported-runner :test-runner-error :test-report-error :test-failure :inspection-error))
 (defparameter *mcp-v1-keywords*
   '(:version :id :op :client :token :boot-id :service-id :world :package
     :busy :features :ok :form :timeout-ms :print-level :print-length
@@ -31,6 +31,7 @@
     :compile-file :output-path :compile-completed :warnings-p :failure-p :loaded :compile-error
     :source-transfer :transfer :source-text :temporary-path :cleanup :transfer-error
     :run-tests :runner :test-runners :test-status :passed :passed-count :failed-count
+    :describe :apropos :limit :inspection-error
     :unsupported-runner :test-runner-error :test-report-error :test-failure
     :interrupt-pending :interrupt-refused :request-not-active
     :interrupt-state :pending :delivered :refused
@@ -184,6 +185,9 @@
                         (= (length value) (length (remove-duplicates value :test #'equal)))
                         (every (lambda (name) (mcp-v1-type-p name :runner)) value)))
     (:test-status (member value '(:passed :failed :unknown)))
+    (:inspection-text (and (stringp value) (<= 1 (length value) 256)
+                           (every (lambda (ch) (<= 32 (char-code ch) 126)) value)))
+    (:match-limit (and (integerp value) (<= 1 value 100)))
     (:transfer-text (and (stringp value) (<= (length value) 65536)
                          (every (lambda (ch) (or (<= 32 (char-code ch) 126)
                                                  (member (char-code ch) '(9 10)))) value)))
@@ -220,6 +224,7 @@
              ((:status :reset-listener-context) '(:boot-id :service-id))
              (:eval '(:boot-id :service-id :package :form :timeout-ms
                       :print-level :print-length))
+             ((:describe :apropos) '(:boot-id :service-id :package :form :limit))
              (:run-tests '(:boot-id :service-id :package :runner :form :timeout-ms :print-level :print-length))
              (:load '(:boot-id :service-id :package :timeout-ms :print-level :print-length
                       :original-path :path-kind :host-path :path :source-root :source-size :source-hash
@@ -247,6 +252,14 @@
            (unless (getf object key) (mcp-v1-error "Missing generation identity"))))
        (when (and (eq (getf object :op) :eval) (null (getf object :form)))
          (mcp-v1-error "Missing form text"))
+       (when (member (getf object :op) '(:describe :apropos))
+         (unless (and (mcp-v1-type-p (getf object :form) :inspection-text)
+                      (or (not (mcp-v1-present-p object :package))
+                          (mcp-v1-type-p (getf object :package) :inspection-text))
+                      (if (eq (getf object :op) :apropos)
+                          (mcp-v1-type-p (getf object :limit 50) :match-limit)
+                          (not (mcp-v1-present-p object :limit))))
+           (mcp-v1-error "Inspection requires bounded literal text and search limit")))
        (when (eq (getf object :op) :run-tests)
          (unless (and (mcp-v1-type-p (getf object :runner) :runner)
                       (if (equal (getf object :runner) "form")
@@ -373,7 +386,7 @@
               (:transfer . :boolean) (:source-text . :transfer-text) (:temporary-path . :source-path) (:cleanup . :text)
               (:warnings-p . :boolean) (:failure-p . :boolean) (:loaded . :boolean)
               (:features . :features)
-              (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
+              (:limit . :match-limit) (:ok . :boolean) (:form . :text) (:timeout-ms . :positive)
               (:print-level . :print-limit) (:print-length . :print-limit)
               (:target-id . :id) (:request-state . :state) (:values . :strings)
               (:interrupt-state . :interrupt-state)
@@ -411,7 +424,7 @@
   "Check execution identity and the complete terminal result contract."
   (mcp-v1-validate request :request)
   (mcp-v1-validate response :response)
-  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests))
+  (unless (and (member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos))
                (every (lambda (key) (equal (getf request key) (getf response key)))
                       '(:id :boot-id :service-id)))
     (mcp-v1-error "Eval response identity mismatch"))

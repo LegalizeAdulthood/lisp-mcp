@@ -214,6 +214,48 @@ does not recognize."
 (defun mcp-capture-text (capture)
   (coerce (mcp-capture-data capture) 'simple-string))
 
+(defun mcp-inspection-text (text limit budget)
+  (when text
+    (if (> (length text) limit)
+        (progn (setf (mcp-budget-truncated budget) t) (subseq text 0 limit))
+        text)))
+
+(defun mcp-inspect-symbol (name package budget)
+  "Inspect existing symbol metadata without reading input or printing its value."
+  (multiple-value-bind (symbol status) (find-symbol name package)
+    (if (null status) (list :found nil :name name)
+        (list :found t :name (mcp-inspection-text (symbol-name symbol) 512 budget)
+              :home-package (when (symbol-package symbol)
+                              (mcp-inspection-text (package-name (symbol-package symbol)) 256 budget))
+              :visibility (string-downcase (symbol-name status))
+              :bound (not (null (boundp symbol))) :fbound (not (null (fboundp symbol)))
+              :function-documentation (mcp-inspection-text (documentation symbol 'function) 4096 budget)
+              :variable-documentation (mcp-inspection-text (documentation symbol 'variable) 4096 budget)))))
+
+(defun mcp-inspect-apropos (pattern package limit budget)
+  "Bound visits, compared name characters, matches, and retained text."
+  (let ((scanned 0) (count 0) (matches nil) (complete t))
+    (block search-symbols
+      (do-symbols (symbol package)
+        (when (= scanned 10000)
+          (setf complete nil) (return-from search-symbols nil))
+        (incf scanned)
+        (let ((name (symbol-name symbol)))
+          (when (> (length name) 512) (setf complete nil))
+          (when (and (search pattern name :end2 (min 512 (length name)) :test #'char-equal)
+                     (not (member symbol matches :test #'eq)))
+            (when (= count limit)
+              (setf complete nil) (return-from search-symbols nil))
+            (incf count) (push symbol matches)))))
+    (unless complete (setf (mcp-budget-truncated budget) t))
+    (list :matches
+          (mapcar (lambda (symbol)
+                    (list (mcp-inspection-text (symbol-name symbol) 512 budget)
+                          (when (symbol-package symbol)
+                            (mcp-inspection-text (package-name (symbol-package symbol)) 256 budget))))
+                  (nreverse matches))
+          :scanned scanned :search-complete complete)))
+
 ;;; --- Native evaluation adapters ---
 
 (defflavor mcp-output-stream (capture) (si:output-stream)
@@ -385,6 +427,7 @@ does not recognize."
          (loading (member (getf request :op) '(:load :compile-file)))
          (compiling (eq (getf request :op) :compile-file))
          (testing (eq (getf request :op) :run-tests))
+         (inspecting (member (getf request :op) '(:describe :apropos)))
          (test-result (list :test-status :unknown :counts-known nil :passed-count nil :failed-count nil))
          (compilation (list :compile-completed nil :warnings-p nil :failure-p t :loaded nil :output-path nil))
          (transfer (list :temporary-path nil))
@@ -398,8 +441,8 @@ does not recognize."
          (*standard-input* (make-string-input-stream ""))
          (*standard-output* out) (*error-output* err) (*trace-output* err)
          (*terminal-io* terminal) (*debug-io* terminal) (*query-io* terminal)
-         (*print-level* (getf request :print-level 6))
-         (*print-length* (getf request :print-length 100))
+         (*print-level* (if inspecting nil (getf request :print-level 6)))
+         (*print-length* (if inspecting nil (getf request :print-length 100)))
          (*print-circle* t) (*print-pretty* nil)
          (*print-base* 10) (*print-radix* nil)
          (sys:inhibit-fdefine-warnings :just-warn))
@@ -409,9 +452,9 @@ does not recognize."
            (let ((*package* (or (find-package package-name)
                                (error "No package named ~A" package-name))))
              (setf package-name (package-name *package*) phase :reader-error)
-             (let ((form (unless (or reset loading (and testing (not (equal (getf request :runner) "form"))))
+             (let ((form (unless (or reset loading inspecting (and testing (not (equal (getf request :runner) "form"))))
                            (mcp-read-eval-form (getf request :form)))))
-               (setf phase (cond (loading :file-error) (testing :test-runner-error) (t :evaluation-error)))
+               (setf phase (cond (inspecting :inspection-error) (loading :file-error) (testing :test-runner-error) (t :evaluation-error)))
                (ansi-common-lisp:handler-bind
                    ((ansi-common-lisp:warning
                       (lambda (condition)
@@ -425,6 +468,12 @@ does not recognize."
                                (multiple-value-list
                                 (cond
                                   (reset (setf *mcp-eval-package* *package*) package-name)
+                                  (inspecting
+                                   (let ((*mcp-interruptible-job* job))
+                                     (if (eq (getf request :op) :describe)
+                                         (mcp-inspect-symbol (getf request :form) *package* budget)
+                                         (mcp-inspect-apropos (getf request :form) *package*
+                                                              (getf request :limit 50) budget))))
                                   (testing
                                    (let* ((*mcp-interruptible-job* job)
                                           (results (multiple-value-list
@@ -547,7 +596,7 @@ does not recognize."
   ;; Property order is irrelevant; omission and an explicit default differ.
   (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
                     :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load
-                    :transfer :source-text :runner)
+                    :transfer :source-text :runner :limit)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
 
 (defun mcp-test-runner (name)
@@ -764,7 +813,7 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests)
+                :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file :run-tests :describe :apropos)
                                   (when *mcp-transfer-root* '(:source-transfer))
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :test-runners (mcp-test-runner-names)
@@ -812,7 +861,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests))
+    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file :run-tests :describe :apropos))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
@@ -1166,6 +1215,7 @@ does not recognize."
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
         mcp-call-with-source mcp-probe-source mcp-compile-source mcp-transfer-source
+        mcp-inspection-text mcp-inspect-symbol mcp-inspect-apropos
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

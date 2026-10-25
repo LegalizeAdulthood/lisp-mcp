@@ -10,7 +10,8 @@ The default `generic` profile provides up to three tools:
 The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
 `genera_recover_session`, `genera_reset_listener_context`, `genera_load`,
-`genera_compile_file`, `genera_run_tests`, `genera_eval`, and the
+`genera_compile_file`, `genera_run_tests`, `genera_describe`,
+`genera_apropos`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 It additionally exposes `genera_interrupt` after a validated listener
 hello advertises targeted interruption.
@@ -329,7 +330,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the ten
+does not expose host or Swank tools. Tool discovery advertises the twelve
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -643,6 +644,51 @@ IDs return the same result even after an adapter is removed. Test forms
 and adapters can change image state. Closing the client leaves accepted
 tests and Genera running.
 
+### Bounded symbol inspection
+
+`genera_describe` requires a literal `symbol` name. `genera_apropos`
+requires a literal `pattern` and accepts `limit` (default 50, range
+1 through 100). Both accept optional `package` and `timeout_ms`, using
+the bridge's current package and ordinary host deadline by default.
+Names, patterns, and explicit packages contain 1 through 256 printable
+ASCII characters. Describe uses the exact symbol name, usually uppercase;
+package qualifiers and reader syntax are treated as literal name text.
+Apropos compares names without case sensitivity within one package,
+including inherited accessible symbols. Result order is unspecified.
+
+The listener resolves existing packages with FIND-PACKAGE and existing
+symbols with FIND-SYMBOL. Input is never read, evaluated, or interned.
+Missing symbols return `:FOUND NIL`; a missing package returns the
+contained `package-not-found` error. Describe reports name, home package,
+visibility, binding flags, and function/variable documentation. It
+inspects symbol metadata without retrieving or printing the bound value,
+printing a function object, or invoking user-defined object printers.
+
+The ordinary execution envelope contains one printed metadata property
+list in `values`. Describe bounds symbol names to 512 characters, home
+package names to 256, and each documentation string to 4096. Apropos
+returns `:MATCHES` as name/home-package pairs, `:SCANNED` as the number
+of symbol visits, and `:SEARCH-COMPLETE`. It examines at most 10,000
+symbol visits and the first 512 characters of each name, deduplicates
+matches, and stops when the requested match limit would be exceeded.
+Partial searches or clipped text set the envelope's `truncated` flag;
+an empty partial search does not prove absence. The shared 65,536-character
+capture budget covers printed values, stdout, stderr, and warnings.
+
+Both tools have read-only annotations under MCP revision `2025-06-18`.
+They use the same generation checks, execution reservation, worker, and
+retained request ledger as evaluation. Busy or uncertain execution blocks
+inspection. Timeout/disconnect never triggers automatic replay; use
+`genera_request_status` with the original identity. Updated listeners
+advertise `:describe` and `:apropos`; unsupported listeners reject
+submission before allocating execution work. The wire operations reuse
+`:form` for literal lookup text; only `:apropos` accepts `:limit`.
+
+```json
+{"name":"genera_describe","arguments":{"symbol":"CAR","package":"USER"}}
+{"name":"genera_apropos","arguments":{"pattern":"string","package":"USER","limit":10}}
+```
+
 ### Listener context reset
 
 `genera_reset_listener_context` requires the current `boot_id` and
@@ -680,7 +726,7 @@ execution deadline.
 The tool appears only after the listener advertises `:interrupt` in a
 verified hello. The Genera profile advertises changing tool lists and
 sends `notifications/tools/list_changed` when support changes. Refresh
-`tools/list` after that notification. Older listeners retain the ten
+`tools/list` after that notification. Older listeners retain the twelve
 base tools; generic host/Swank discovery is unchanged.
 See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
 
@@ -1377,6 +1423,18 @@ GENERA_HOST=genera.example python3 tests/runners.py --live-v1
 This runner temporarily adds a unique adapter and restores the prior
 configuration. It preserves saved worlds and leaves harmless test state
 in the running image.
+
+Check bounded inspection against an updated running versioned listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/inspection.py --live-v1 -v
+```
+
+Without `--live-v1`, the runner uses portable listener and host fixtures.
+It checks literal lookup without interning, bounded metadata/search,
+schemas, annotations, capability gates, worker admission, uncertainty,
+request identity, and retained results.
 
 To check structured evaluation and recovery on a running legacy listener:
 
