@@ -181,6 +181,7 @@
                     :xdg-runtime-dir (uiop:getenv "XDG_RUNTIME_DIR")
                     :display-socket (and socket (genera-file-fact socket))
                     :root (genera-file-fact root)
+                    :detacher (genera-file-fact "/usr/bin/setsid")
                     :tun (genera-file-fact "/dev/net/tun")
                     :tap-flags (number "tun_flags" 16) :link-flags (number "flags" 16)
                     :tap-owner (number "owner") :tap-group (number "group")
@@ -231,6 +232,7 @@
         (file-check :world '(:read))
         (file-check :partition '(:read :write))
         (file-check :debugger '(:read :execute))
+        (file-check :detacher '(:read :execute))
         (let ((socket (getf facts :display-socket)))
           (check :display (and (getf facts :display) (eq (getf socket :kind) :socket) (getf socket :write))
                  (if (getf facts :display) :display-unavailable :missing-display)
@@ -262,9 +264,11 @@
                  (and (eq (getf parent :kind) :directory) (getf parent :write) (getf parent :execute)
                       (or (eq (getf log :error) :missing)
                           (and (eq (getf log :kind) :file) (getf log :write)
-                               (eql (getf log :uid) (getf facts :uid)))))
-                 :log-inaccessible "The log must be writable or have a writable existing ancestor"))
-        (let ((files (mapcar (lambda (key) (getf facts key)) '(:executable :world :partition :debugger :log))))
+                               (eql (getf log :uid) (getf facts :uid))
+                               (zerop (logand #o077 (getf log :mode 0))))))
+                 :log-inaccessible "Use a private writable log or a writable existing ancestor"))
+        (let ((files (mapcar (lambda (key) (getf facts key))
+                             '(:executable :world :partition :debugger :detacher :log))))
           (check :file-identities
                  (loop for (one . rest) on files always
                    (every (lambda (two)
@@ -276,7 +280,7 @@
       (list :ok ok :mode :local :autostart (genera-runtime-autostart runtime)
             :launch-permitted (and ok (genera-runtime-autostart runtime))
             :root (getf (getf facts :root) :path) :log (genera-runtime-log runtime)
-            :paths (loop for key in '(:executable :world :partition :debugger)
+            :paths (loop for key in '(:executable :world :partition :debugger :detacher)
                          append (list key (getf (getf facts key) :path)))
             :log-info (getf facts :log)
             :state-directory (genera-runtime-state-directory runtime)
@@ -321,7 +325,8 @@
            (fields (and end (uiop:split-string (subseq text (+ end 2)))))
            (start (and (>= (length fields) 20)
                        (ignore-errors (parse-integer (nth 19 fields))))))
-      (when start (list :start-time start :state (first fields)))))
+      (when start (list :start-time start :state (first fields)
+                        :parent-pid (ignore-errors (parse-integer (second fields)))))))
 
   (defun genera-process-identity (pid target)
     "Read one stable /proc identity. Never signal, launch, or trust argv[0]."
@@ -338,6 +343,7 @@
                (world nil) (partition nil) (ambiguous nil))
           (labels ((argument (flag)
                      (let ((positions (loop for arg in (rest argv) for i from 1
+                                            until (equal arg "--")
                                             when (equal arg flag) collect i)))
                        (unless (= (length positions) 1) (setf ambiguous t))
                        (let ((value (and positions (nth (1+ (first positions)) argv))))
@@ -354,6 +360,7 @@
                                      (and (first argv) (equal (file-namestring (first argv)) name)))))))
             (when after
               (list :pid pid :uid (getf owner :uid) :start-time (getf before :start-time)
+                    :parent-pid (getf before :parent-pid)
                     :linux-boot (getf target :linux-boot) :executable exe :world world :partition partition
                     :relevant (not (null relevant))
                     :unreadable (or (not (eql (getf before :start-time) (getf after :start-time)))
@@ -531,4 +538,118 @@ record the child's verified identity before returning. Never launch here."
                   (setf (getf decision :action) :blocked (getf decision :code) :identity-race))
                 (when (and (getf decision :process) (not (eq (getf decision :action) :blocked)))
                   (genera-record-launch-identity *genera-launch-context* (getf decision :process)))
-                (funcall consumer decision *genera-launch-context*)))))))))
+                (funcall consumer decision *genera-launch-context*))))))))
+
+  (defstruct genera-launch-attempt process identity target root log observer-lost)
+
+  (defun genera-launch-observation (attempt)
+    "Observe this attempt only. Never respawn, stop, or replace a VLM."
+    (let* ((process (genera-launch-attempt-process attempt))
+           (status (sb-ext:process-status process))
+           (saved (genera-launch-attempt-identity attempt))
+           (current (and saved (genera-process-identity (getf saved :pid)
+                                                       (genera-launch-attempt-target attempt))))
+           (same (and saved current (not (getf current :unreadable))
+                      (equal (genera-identity-data saved) (genera-identity-data current)))))
+      (when (and same (member status '(:exited :signaled)))
+        (setf (genera-launch-attempt-observer-lost attempt) t))
+      (append
+       (cond (same (list :state :running :code :vlm-started))
+             ((and saved current) (list :state :unknown :code :identity-changed))
+             ((member status '(:exited :signaled))
+              (let ((known (and (not (genera-launch-attempt-observer-lost attempt))
+                                (eq status :exited))))
+                (list :state :exited :code :early-exit
+                      :exit-code (and known (sb-ext:process-exit-code process)))))
+             ((and saved (not same)) (list :state :unknown :code :identity-changed))
+             (t (list :state :starting :code :identity-pending)))
+       (list :attempted t :pid (getf saved :pid) :process saved
+             :observer-lost (genera-launch-attempt-observer-lost attempt)
+             :observer-status status
+             :launcher-pid (sb-ext:process-pid process)
+             :root (genera-launch-attempt-root attempt) :log (genera-launch-attempt-log attempt)))))
+
+  (defun genera-open-launch-log (preflight context)
+    (let* ((path (getf preflight :log))
+           (parent (uiop:pathname-directory-pathname path))
+           (directory (getf context :directory))
+           (state (namestring (uiop:pathname-parent-directory-pathname directory))))
+      (unless (probe-file parent) (genera-private-directory parent))
+      (let ((canonical (namestring (merge-pathnames (file-namestring path) (truename parent)))))
+        (when (or (equal canonical (concatenate 'string state "launch.lock"))
+                  (uiop:string-prefix-p directory canonical))
+          (error "VLM log collides with launch state: ~A" path)))
+      (let ((fd (genera-private-open path (logior sb-posix:o-wronly sb-posix:o-creat sb-posix:o-append))))
+        (handler-case
+            (let ((stat (sb-posix:fstat fd)))
+              (dolist (key '(:executable :world :partition :debugger :detacher))
+                (let ((file (genera-file-fact (getf (getf preflight :paths) key))))
+                  (when (and (= (sb-posix:stat-dev stat) (getf file :device -1))
+                             (= (sb-posix:stat-ino stat) (getf file :inode -1)))
+                    (error "VLM log aliases a runtime file: ~A" path))))
+              (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8) :auto-close t))
+          (error (e) (sb-posix:close fd) (error e))))))
+
+  (defun genera-spawn-vlm (preflight context)
+    "One structured setsid --wait launch, under the existing launch locks."
+    (unless (and context (eq context *genera-launch-context*))
+      (error "VLM launch requires held launch locks"))
+    (let ((attempt nil))
+      (handler-case
+          (progn
+            (with-open-stream (log (genera-open-launch-log preflight context))
+              (setf attempt
+                    (make-genera-launch-attempt
+                     :process (sb-ext:run-program (getf (getf preflight :paths) :detacher)
+                                (append '("--wait" "--") (getf preflight :argv))
+                                :search nil :wait nil :pty nil :input nil :output log :error :output
+                                :preserve-fds nil :directory (getf preflight :root))
+                     :target (getf context :target) :root (getf preflight :root) :log (getf preflight :log))))
+            ;; setsid can fork when SBCL makes its child a process-group leader.
+            ;; --wait retains an exit-status observer; identify the actual VLM.
+            (loop with deadline = (+ (get-internal-real-time) (* 2 internal-time-units-per-second))
+                  for observation = (genera-launch-observation attempt)
+                  do (when (eq (getf observation :state) :exited) (return))
+                     (let* ((snapshot (genera-discover-processes (getf context :target)))
+                            (matches (getf snapshot :matches))
+                            (pid (sb-ext:process-pid (genera-launch-attempt-process attempt)))
+                            (identity (first matches)))
+                       (when (or (getf snapshot :conflicts) (rest matches))
+                         (error "VLM identity conflict after launch"))
+                       (when (and identity (or (eql (getf identity :pid) pid)
+                                              (eql (getf identity :parent-pid) pid)))
+                         (genera-record-launch-identity context identity)
+                         (setf (genera-launch-attempt-identity attempt) identity)
+                         (return)))
+                     (when (>= (get-internal-real-time) deadline) (return))
+                     (sleep 0.01))
+            (when (genera-launch-attempt-identity attempt) (sleep 0.2))
+            (let ((observation (genera-launch-observation attempt)))
+              (values (append (list :action (if (eq (getf observation :state) :running) :launched :failed))
+                              observation) attempt)))
+        (error (e)
+          ;; A short-lived child can exit between identity reads/recording.
+          (when attempt (sleep 0.02))
+          (let ((observation (and attempt (genera-launch-observation attempt))))
+            (values
+             (if (eq (getf observation :state) :exited)
+                 (append (list :action :failed :message (princ-to-string e)) observation)
+                 (append (list :action :failed :code :launch-failed :message (princ-to-string e)
+                               :attempted (not (null attempt)) :log (getf preflight :log))
+                         (when attempt (list :launcher-pid
+                                              (sb-ext:process-pid (genera-launch-attempt-process attempt))))))
+             attempt))))))
+
+  (defun genera-launch-vlm (runtime &key (preflight (genera-launch-preflight runtime))
+                                        (endpoint-observer #'genera-probe-launch-endpoint))
+    "Discover first; launch at most once. Return report and observation handle."
+    (let ((attempt nil))
+      (values
+       (genera-call-with-launch-decision runtime
+         (lambda (decision context)
+           (if (eq (getf decision :action) :launch)
+               (multiple-value-bind (report handle) (genera-spawn-vlm preflight context)
+                 (setf attempt handle) report)
+               decision))
+         :preflight preflight :endpoint-observer endpoint-observer)
+       attempt))))

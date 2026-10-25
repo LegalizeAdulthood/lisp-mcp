@@ -133,6 +133,8 @@ It rejects log aliases of runtime files, including hard links. A missing
 state/log directory may be reported ready when its existing ancestor is
 writable; inspection does not create it. Existing state directories must
 be private and owned by the current user.
+The Linux `setsid` utility must be installed at `/usr/bin/setsid`.
+Existing log files must also be private to the current user.
 
 `:launch-permitted` is a prerequisite verdict, not process ownership or
 an instruction to launch. Preflight starts no process, contacts no Genera
@@ -169,6 +171,39 @@ observed through its boot deadline. A reachable TCP port yields
 `:endpoint-present`; a validated versioned handshake is still required.
 Neither result permits another VLM launch. External manual launchers do
 not participate in these advisory locks.
+
+### Detached VLM launch
+
+`genera-launch-vlm` performs locked discovery and launches only for a
+`:launch` decision. It returns a report and an optional observation handle.
+It passes the verified executable and fixed argv directly to
+`/usr/bin/setsid --wait --`, with the configured runtime working directory.
+Arguments are literal strings; no shell parses them. The child inherits
+the host environment, including WSLg's `DISPLAY`, `WAYLAND_DISPLAY`, and
+`XDG_RUNTIME_DIR`.
+
+The VLM starts in its own Linux session with `/dev/null` as stdin.
+Only stdin and the log-backed stdout/stderr survive exec; MCP protocol
+streams, launch locks, and unrelated host descriptors are closed.
+The private log is opened for append without following links or replacing
+existing content. Runtime-file aliases and launch-state destinations are
+rejected. An optional `setsid` observer waits for the VLM's exit status;
+the VLM PID is identified separately and verified before recording it.
+
+The report includes `:action`, `:code`, `:attempted`, process identity,
+launcher PID, working directory, and log path. A successful spawn reports
+`:launched` and `:vlm-started`; listener readiness requires the versioned
+handshake. Immediate exit reports `:early-exit` and its exit code.
+`genera-launch-observation` checks the returned handle for later exit or
+identity changes. Neither function respawns or stops an existing VLM.
+If the observer exits first, a verified live VLM remains `:running`.
+Later VLM exit has an unknown exit code when its observer was lost.
+
+Closing the launching SBCL/MCP process releases its resources while the
+VLM and its log remain independent. WSL shutdown, Windows shutdown, or
+explicit VLM termination still ends the live world. Verify client
+close/reopen in the installed WSL environment; systemd unit existence
+alone does not establish that lifetime behavior.
 
 ### Genera profile
 
@@ -699,6 +734,7 @@ python3 tests/reconnect.py
 python3 tests/boot.py
 python3 tests/preflight.py
 python3 tests/launch.py
+python3 tests/detached.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -794,6 +830,12 @@ advisory locks. It checks manual discovery, canonical paths and aliases,
 PID reuse and stale metadata, conflicting resources, concurrent clients,
 bounded endpoint probes, and lock release after callback errors or host
 death. Its stand-in processes read no Genera worlds or FEP partitions.
+
+The detached runner requires Linux and `cc` to build its disposable C
+executable. It checks literal argv, cwd, WSLg settings, null stdin,
+descriptor isolation, private append logging after parent exit, duplicate
+launch prevention, and early/later exit reporting without respawn. It
+never starts Genera or writes its runtime files.
 
 To check structured evaluation and recovery on a running legacy listener:
 
