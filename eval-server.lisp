@@ -222,6 +222,12 @@ does not recognize."
 (defmethod (:tyo mcp-output-stream) (character)
   (mcp-capture-character capture character))
 
+(defmethod (:fresh-line mcp-output-stream) ()
+  (let ((data (mcp-capture-data capture)))
+    (unless (or (zerop (length data)) (member (char-code (char data (1- (length data)))) '(10 13)))
+      (mcp-capture-character capture (ascii-to-char 10))
+      t)))
+
 (defun mcp-capture-stream (capture)
   (make-instance 'mcp-output-stream :capture capture))
 
@@ -308,6 +314,41 @@ does not recognize."
 (defun mcp-probe-source (root target)
   (mcp-call-with-source root target))
 
+(defun mcp-compile-source (stream proof compilation)
+  "Compile the verified stream into a fresh sibling file; never load here."
+  (let* ((root (first proof))
+         (output (send (ansi-common-lisp:compile-file-pathname
+                        (send (fs:parse-pathname (second proof)) :new-name
+                              (mcp-new-generation-id "mcp-compile"))) :translated-pathname))
+         (planned (namestring output))
+         (failure nil))
+    (unless (and (<= (length planned) 4096) (< (length root) (length planned))
+                 (if (find #\/ root) (string= root planned :end2 (length root))
+                     (string-equal root planned :end2 (length root)))
+                 (not (probe-file output)))
+      (error "Compiler output must be a new file under the verified source root"))
+    ;; This Genera compiler returns only a pathname, even for invalid forms.
+    ;; Apply ANSI's failure rule: errors or any non-style warning forbid load.
+    (let ((result
+            (ansi-common-lisp:handler-bind
+                ((ansi-common-lisp:warning
+                   (lambda (condition)
+                     (setf (getf compilation :warnings-p) t)
+                     (unless (typep condition 'ansi-common-lisp:style-warning) (setf failure t)))))
+              (compile-file stream :output-file output :verbose nil :print nil
+                            :load nil :set-default-pathname nil))))
+      (setf (getf compilation :compile-completed) t)
+      (unless result (error "Compiler returned no output pathname"))
+      (let ((actual (namestring (truename result))))
+        (unless (and (<= (length actual) 4096)
+                     (if (find #\/ root) (string= root actual :end2 (length root))
+                         (string-equal root actual :end2 (length root))))
+          (error "Compiler returned output outside the verified source root"))
+        (setf (getf compilation :output-path) actual
+              (getf compilation :failure-p) failure)
+        (when failure (error "Compiler reported a non-style warning; output was not loaded"))
+        actual))))
+
 (defun mcp-v1-eval (request service &optional job)
   "Read, evaluate, and print one authorized form with bounded retained output."
   (when (mcp-v1-present-p request :timeout-ms)
@@ -321,7 +362,9 @@ does not recognize."
          (err (mcp-capture-stream stderr))
          (terminal (make-two-way-stream (make-string-input-stream "") err))
          (reset (eq (getf request :op) :reset-listener-context))
-         (loading (eq (getf request :op) :load))
+         (loading (member (getf request :op) '(:load :compile-file)))
+         (compiling (eq (getf request :op) :compile-file))
+         (compilation (list :compile-completed nil :warnings-p nil :failure-p t :loaded nil :output-path nil))
          (resolved nil)
          (package-name (if reset (package-name *mcp-default-package*)
                            (or (getf request :package) (package-name *mcp-eval-package*))))
@@ -366,9 +409,16 @@ does not recognize."
                                                        (list (getf request :source-size) (getf request :source-hash)))))
                                         (setf phase :source-mismatch)
                                         (error "Host and Genera source fingerprints differ"))
-                                      (setf phase :load-error)
+                                      (setf phase (if compiling :compile-error :load-error))
                                       (let ((*mcp-interruptible-job* job))
-                                        (load stream :verbose nil :print nil :set-default-pathname nil)))))
+                                        (if compiling
+                                            (let ((output (mcp-compile-source stream proof compilation)))
+                                              (when (getf request :load)
+                                                (setf phase :load-error)
+                                                (load output :verbose nil :print nil :set-default-pathname nil)
+                                                (setf (getf compilation :loaded) t))
+                                              output)
+                                            (load stream :verbose nil :print nil :set-default-pathname nil))))))
                                   (t (let ((*mcp-interruptible-job* job)) (eval form))))))))))))
       (let* ((diagnostics (make-mcp-budget :remaining 4096))
              (interrupted (and (not success) (getf job :interrupt-delivered)
@@ -392,7 +442,7 @@ does not recognize."
                                      (mcp-budget-truncated diagnostics))
                       :replaced (or (mcp-budget-replaced budget)
                                     (mcp-budget-replaced diagnostics)))
-                (mcp-load-metadata request resolved)
+                (mcp-load-metadata request resolved compilation)
                 (when failure (list :error failure)))))))
 
 ;;; --- Server ---
@@ -451,14 +501,20 @@ does not recognize."
 (defun mcp-request-identity (request)
   ;; Property order is irrelevant; omission and an explicit default differ.
   (loop for key in '(:op :form :package :timeout-ms :print-level :print-length
-                    :original-path :path-kind :host-path :path :source-root :source-size :source-hash)
+                    :original-path :path-kind :host-path :path :source-root :source-size :source-hash :load)
         collect (list key (mcp-v1-present-p request key) (getf request key))))
 
-(defun mcp-load-metadata (request &optional proof)
-  (when (eq (getf request :op) :load)
+(defun mcp-load-metadata (request &optional proof compilation)
+  (when (member (getf request :op) '(:load :compile-file))
     (append (loop for key in '(:original-path :path-kind :host-path :path :source-root)
                   when (mcp-v1-present-p request key) append (list key (getf request key)))
-            (when proof (list :resolved-root (first proof) :resolved-path (second proof))))))
+            (when proof (list :resolved-root (first proof) :resolved-path (second proof)))
+            (when (eq (getf request :op) :compile-file)
+              (append (list :load (getf request :load))
+                      (loop for key in '(:compile-completed :warnings-p :failure-p :loaded)
+                            append (list key (if compilation (getf compilation key) (eq key :failure-p))))
+                      (when (getf compilation :output-path)
+                        (list :output-path (getf compilation :output-path))))))))
 
 (defun mcp-ensure-ledger (service)
   ;; Extend an older live service in place; readers retain this same plist.
@@ -615,7 +671,7 @@ does not recognize."
           (list :world (getf service :world)
                 :package (package-name *mcp-eval-package*)
                 :busy (not (null (mcp-execution-busy-p)))
-                :features (append '(:status :request-status :eval :reset-listener-context :load)
+                :features (append '(:status :request-status :eval :reset-listener-context :load :compile-file)
                                   (when (mcp-interrupt-supported-p) '(:interrupt)))
                 :history-limit (getf service :history-limit +mcp-history-limit+)
                 :history-byte-limit (getf service :history-byte-limit +mcp-history-byte-limit+)
@@ -661,7 +717,7 @@ does not recognize."
      (mcp-request-response request service
                            (mcp-find-request service (getf request :target-id)) t))
     ((eq (getf request :op) :interrupt) (mcp-request-interrupt request service))
-    ((member (getf request :op) '(:eval :reset-listener-context :load))
+    ((member (getf request :op) '(:eval :reset-listener-context :load :compile-file))
      (mcp-submit-eval request service *mcp-current-connection*))
     (t (mcp-v1-failure request :unsupported-operation "Operation is not available"
                        service))))
@@ -1013,7 +1069,7 @@ does not recognize."
 ;; them. Native process/lock machinery must not depend on interpreter frames.
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
-        mcp-call-with-source mcp-probe-source
+        mcp-call-with-source mcp-probe-source mcp-compile-source
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

@@ -10,7 +10,7 @@ The default `generic` profile provides up to three tools:
 The explicit `genera` profile provides `genera_session_status`,
 `genera_ensure_session`, `genera_request_status`,
 `genera_recover_session`, `genera_reset_listener_context`, `genera_load`,
-`genera_eval`, and the
+`genera_compile_file`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 It additionally exposes `genera_interrupt` after a validated listener
 hello advertises targeted interruption.
@@ -329,7 +329,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the eight
+does not expose host or Swank tools. Tool discovery advertises the nine
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -420,7 +420,8 @@ defaults to the VLM directory, process directory, or Windows drive mount.
 
 The internal `genera-resolve-source` API accepts a persistent session,
 `path_kind` (`genera`, `host`, or `relative`), and a path. `genera_load`
-uses the same mapping rules and verifies inside its one load request.
+and `genera_compile_file` use the same mapping rules and verify within
+their single execution request.
 `host` accepts absolute Unix paths or the configured Windows drive alias.
 `relative` uses forward slashes beneath the host source root. `genera`
 accepts a literal host-qualified logical or native pathname; Genera
@@ -497,6 +498,42 @@ lookup, nor a duplicate retained request automatically reloads a file.
 The optional targeted interrupt also covers the actual load; timeout
 alone does not cancel it.
 
+### Verified file compilation
+
+`genera_compile_file` takes the same path, package, print controls, and
+host deadline as `genera_load`. Optional boolean `load` defaults to false.
+The listener must advertise `:compile-file`. Mapping, fingerprints,
+canonical containment, execution admission, and retained request identity
+follow the loading contract above. Compilation and optional loading use
+one worker job and one request ID; neither timeout nor disconnect repeats
+either operation.
+
+The compiler reads the same verified, rewound source stream. Output uses
+a fresh generated sibling name and the native compiled-file type. Existing
+output is rejected before compilation. `output_path` reports the actual
+versioned output file when available. New compiled files remain in the
+source directory; the bridge does not delete them automatically. No
+caller-supplied output pathname or implicit source transfer is supported.
+
+Results add boolean `compile_completed`, `warnings_p`, `failure_p`, `load`,
+and `loaded`. `compile_completed` means the compiler returned normally;
+it does not by itself prove success. This Genera compiler returns only a
+pathname, including after some invalid forms. The bridge therefore derives
+the ANSI failure rule from signaled conditions: errors and any non-style
+warning forbid loading. Style warnings set `warnings_p` while allowing
+successful compilation. Warning text and bounded compiler output remain
+in the common result. A missing or unverifiable output also fails.
+
+`failure_p` stays true until successful compilation and an actual output
+file are verified. Compile failure returns `compile-error`; earlier file
+or fingerprint failures retain their usual codes. Output can exist after
+failed compilation and is reported when known, but is never loaded.
+Only explicit `load: true` after verified success loads that exact output.
+A load error returns `load-error`, preserving successful compilation data
+and `loaded: false`. Loading may have partial effects before failing.
+Compilation itself can execute compile-time forms and change world state,
+even with `load: false`.
+
 ### Listener context reset
 
 `genera_reset_listener_context` requires the current `boot_id` and
@@ -534,7 +571,7 @@ execution deadline.
 The tool appears only after the listener advertises `:interrupt` in a
 verified hello. The Genera profile advertises changing tool lists and
 sends `notifications/tools/list_changed` when support changes. Refresh
-`tools/list` after that notification. Older listeners retain the eight
+`tools/list` after that notification. Older listeners retain the nine
 base tools; generic host/Swank discovery is unchanged.
 See the [MCP tool-list notification contract](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#list-changed-notification).
 
@@ -1008,6 +1045,7 @@ python3 tests/interrupt.py
 python3 tests/context.py
 python3 tests/paths.py
 python3 tests/loading.py
+python3 tests/compiling.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1195,6 +1233,17 @@ checks definitions, output, warnings, missing files, load errors, stale
 fingerprints, retained duplicate IDs, and a timed-out load completing
 once. It leaves the new fixture files and definitions in the disposable
 runtime; it does not save a world or overwrite an existing file.
+
+For actual compiler success, warnings, failures, optional loading, retained
+duplicate IDs, and timeout/disconnect completion without replay:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' \
+  python3 tests/compiling.py --live-v1
+```
+
+This runner likewise requires filesystem credentials and leaves new
+source/output files and test definitions in the disposable runtime.
 
 To check structured evaluation and recovery on a running legacy listener:
 

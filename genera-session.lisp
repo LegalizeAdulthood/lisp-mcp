@@ -131,7 +131,7 @@
                  '(:id :boot-id :service-id))
     (mcp-v1-error "Response identity does not match its request"))
   (case (getf request :op)
-    ((:eval :reset-listener-context :load) (mcp-v1-check-eval-response request response))
+    ((:eval :reset-listener-context :load :compile-file) (mcp-v1-check-eval-response request response))
     (:status
      (when (getf response :ok)
        (dolist (key '(:world :package :busy :features))
@@ -449,14 +449,14 @@
       (error (or (genera-session-failure session)
                  (make-condition 'genera-session-error :kind :closed
                                  :format-control "Genera session is closed"))))
-    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load))
+    (unless (member operation '(:eval :status :request-status :interrupt :reset-listener-context :load :compile-file))
       (genera-session-error :unsupported "Unsupported session operation"))
     (unless (member operation (getf (genera-session-hello session) :features))
       (genera-session-error :unsupported "Listener does not advertise this operation"))
     (let ((expected (getf fields :expected-generation)))
       (when expected (apply #'genera-check-generation session expected))
       (remf fields :expected-generation))
-    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load)))))
+    (let* ((execution (not (null (member operation '(:eval :reset-listener-context :load :compile-file)))))
            (deferred (getf fields :defer))
            (defer-option (remf fields :defer))
            (idle-only (getf fields :idle-only))
@@ -472,7 +472,8 @@
                                    :service-id (getf hello :service-id)) fields))
            (payload (unless deferred (string-to-octets (mcp-v1-encode envelope :request)))))
       (declare (ignore ignored idle-option defer-option))
-      (when (and deferred (not (eq operation :load))) (error "Only file execution can be prepared"))
+      (when (and deferred (not (member operation '(:load :compile-file))))
+        (error "Only file execution can be prepared"))
       (unless (and (realp timeout) (> timeout 0)) (error "Host timeout must be positive"))
       (when (and idle-only
                  (or (genera-session-execution session)
@@ -783,7 +784,7 @@
                                    (genera-session-history session))))
                (result (getf response :result)))
           (cond (result
-                 (when (and known (eq (getf (genera-request-envelope known) :op) :load))
+                 (when (and known (member (getf (genera-request-envelope known) :op) '(:load :compile-file)))
                    (genera-session-checked
                     (lambda () (mcp-v1-check-eval-response (genera-request-envelope known) result))))
                  (if known
