@@ -273,6 +273,31 @@ does not recognize."
 
 (defvar *mcp-interruptible-job* nil)
 
+(defun mcp-probe-source (root target)
+  "Read a source file only after canonical native containment is checked."
+  (let* ((directory (namestring (send (fs:parse-pathname root) :translated-pathname)))
+         (file (namestring (truename (send (fs:parse-pathname target) :translated-pathname))))
+         (unix (find #\/ directory))
+         (a 1) (b 0) (size 0) (raw 0) (cr nil))
+    (unless (and (plusp (length directory)) (find (char directory (1- (length directory))) "/>;")
+                 (< (length directory) (length file))
+                 (if unix (string= directory file :end2 (length directory))
+                     (string-equal directory file :end2 (length directory))))
+      (error "Canonical source file is outside the configured native root"))
+    (with-open-file (in file)
+      (loop for ch = (read-char in nil nil) while ch
+            for native = (char-code ch)
+            for code = (char-to-ascii ch)
+            do (when (> (incf raw) 16777216) (error "Source exceeds 16 MiB"))
+               (unless (and (or (< native 128) (member native '(137 138 141)))
+                            (or (<= 32 code 126) (member code '(9 10 13))))
+                 (error "Source requires unsupported character conversion"))
+               (unless (and cr (= code 10))
+                 (incf size)
+                 (setf a (mod (+ a (if (= code 13) 10 code)) 65521) b (mod (+ b a) 65521)))
+               (setf cr (= code 13))))
+    (list directory file size (+ (ash b 16) a))))
+
 (defun mcp-v1-eval (request service &optional job)
   "Read, evaluate, and print one authorized form with bounded retained output."
   (when (mcp-v1-present-p request :timeout-ms)
@@ -955,6 +980,7 @@ does not recognize."
 ;; them. Native process/lock machinery must not depend on interpreter frames.
 (mapc #'compile
       '(mcp-call-with-state-lock mcp-call-with-lifecycle-lock
+        mcp-probe-source
         mcp-admit-client mcp-ensure-ledger mcp-submit-eval mcp-finish-job mcp-v1-dispatch
         mcp-request-interrupt mcp-interrupt-target-p mcp-deliver-interrupt mcp-schedule-interrupt
         mcp-stop-service mcp-initialize-boot mcp-start-service

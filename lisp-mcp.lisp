@@ -41,6 +41,7 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 (defvar *genera-enabled* nil)
 (defvar *genera-token* nil)
 (defvar *genera-expected-world* nil)
+(defvar *genera-source-mapping* nil)
 
 (defvar *swank-host* "127.0.0.1")
 (defvar *swank-port* 4005)
@@ -165,6 +166,7 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
       (configuration-error (if token "GENERA_TOKEN" "GENERA_EXPECTED_WORLD")
                            "requires the genera profile and protocol v1"))
     (setf *genera-runtime* (genera-configured-runtime profile protocol genera-host genera-port)
+          *genera-source-mapping* (genera-source-configuration profile protocol)
           *profile* profile
           *genera-protocol* protocol
           *genera-host* genera-host
@@ -352,6 +354,7 @@ Prevents comment-induced EOF errors on the Genera reader."
   (format nil "~D-~D" (get-universal-time) (random (expt 2 64) (make-random-state t))))
 
 (load (merge-pathnames "genera-session.lisp" *load-truename*))
+(load (merge-pathnames "source-paths.lisp" *load-truename*))
 
 (defun genera-eval-envelope (form &key (host *genera-host* host-supplied-p)
                                      (port *genera-port* port-supplied-p)

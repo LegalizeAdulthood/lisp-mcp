@@ -401,6 +401,57 @@ Successful recovery records `acknowledged: true` while preserving the
 outcome as `unknown`. It never retries or cancels work. Another client's
 later admission can still cause a subsequent eval to receive busy.
 
+### Explicit source mappings
+
+Source directories are configured independently of `GENERA_VLM_ROOT`:
+
+| Variable | Meaning |
+|---|---|
+| `GENERA_SOURCE_ROOT` | Absolute Unix/WSL source directory; no default. |
+| `GENERA_SOURCE_WINDOWS_ROOT` | Optional drive-qualified alias for that directory. |
+| `GENERA_SOURCE_GENERA_ROOT` | Explicit Genera directory, such as `SYS:PROJECT;`, `HOST:>project>`, or `HOST:/srv/project/`. |
+
+Source settings require profile `genera` and protocol `v1`. A host root
+requires a Genera root; a Windows alias also requires a host root. A
+Genera root alone supports native files. Configuration validates syntax
+without touching files or connecting during discovery. No source root
+defaults to the VLM directory, process directory, or Windows drive mount.
+
+The internal `genera-resolve-source` API accepts a persistent session,
+`path_kind` (`genera`, `host`, or `relative`), and a path. It supplies the
+mapping layer for subsequent file tools; this change adds no MCP tool.
+`host` accepts absolute Unix paths or the configured Windows drive alias.
+`relative` uses forward slashes beneath the host source root. `genera`
+accepts a literal host-qualified logical or native pathname; Genera
+translates aliases and checks canonical containment beneath its root.
+
+Host files must exist as regular files. Canonical resolution rejects
+symlinks outside the source root. Traversal, empty path components,
+wildcards, UNC paths, drive-relative paths, and unsupported quoting or
+filename syntax are rejected. Supported components contain ASCII letters,
+digits, spaces, underscore, hyphen, period, and plus; trailing spaces or
+periods are rejected. Errors retain the original path and attempted host
+and Genera paths. A local map alone is explicitly unverified.
+
+The resolver submits the bounded native `mcp-probe-source` through the
+ordinary eval worker, with generation checks and a five-second host wait.
+It returns the actual versioned native file, canonical root, generation,
+and probe request ID only after verification. Busy or uncertain execution
+blocks the probe; a lost reply retains ordinary execution tracking and
+is never automatically replayed. Load matching listener definitions first.
+File access uses the image's existing filesystem credentials; the bridge
+does not log in or prompt on behalf of a file operation.
+
+Mappings require a working Genera file service or an explicitly maintained
+mirror. Windows-to-WSL translation alone provides neither. For host and
+relative files, both sides must have matching ASCII text fingerprints,
+with CR, LF, and CRLF normalized to LF. The 16 MiB limit bounds each file;
+Adler-32 detects stale copies and is not an authenticity check. Native
+files need canonical containment and readable supported text. The resolver
+does not copy files, start file servers, install mappings in Genera, or
+fall back to transfer. Revalidate immediately before later file execution;
+a path proof does not freeze a file or survive a generation change.
+
 ### Listener context reset
 
 `genera_reset_listener_context` requires the current `boot_id` and
@@ -910,6 +961,7 @@ python3 tests/detached.py
 python3 tests/startup.py
 python3 tests/interrupt.py
 python3 tests/context.py
+python3 tests/paths.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -1073,6 +1125,17 @@ This runner verifies configured defaults, preserved definitions and values,
 retained results, and refusal during active or uncertain work. It restores
 the original default and current package after its native checks, without
 restarting Genera or saving a world.
+
+After configuring filesystem access, provide a matching `genera-boot.lisp`
+in the host and Genera source directories. The native mapping check creates
+a stale host fixture temporarily and verifies rejection without modifying
+Genera files. Set all three mapping variables explicitly:
+
+```sh
+GENERA_HOST=genera.example GENERA_SOURCE_ROOT=/srv/source \
+  GENERA_SOURCE_WINDOWS_ROOT='C:\source' \
+  GENERA_SOURCE_GENERA_ROOT='SYS:PROJECT;' python3 tests/paths.py --live-v1
+```
 
 To check structured evaluation and recovery on a running legacy listener:
 
