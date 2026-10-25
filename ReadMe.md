@@ -99,11 +99,17 @@ does not expose host or Swank tools. Tool discovery advertises the five
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
-`genera_session_status` takes no arguments and returns local state, phase,
-connection, pending request count, known generation, error data, and
-bounded local history. Its `remote_status_stale` field is true: cached
-remote metadata is not a live worker-idle check. Status never opens,
-refreshes, or restarts a connection.
+`genera_session_status` returns local state, phase, connection, pending
+request count, known generation, error data, and bounded local history.
+Its default snapshot does no network work. Optional `refresh: true`
+performs a bounded status request through the control worker; failure
+returns a tool error with stale cached session data.
+
+`remote_status_stale` is true after connection loss, during local work,
+after a completed eval, or when the observation ages past the health
+interval. `remote_observed_at` is the host observation time in Unix
+seconds; `remote_observation_age_ms` reports its age. Cached idle status
+cannot prove an unresolved request's outcome.
 
 `genera_eval` requires `form` and accepts optional `package`, `timeout_ms`,
 `print_level`, and `print_length`. Print limits are nonnegative integers
@@ -123,13 +129,34 @@ result releases that block without a second MCP completion. Execution
 is never automatically replayed.
 
 `genera_request_status` requires those three identifiers and never
-executes the request. It can explicitly retry a failed control connection,
-repeating authentication, expected-world, and generation checks. There is
-no background reconnect. A new MCP process can retrieve a retained result
+executes the request. It can join or retry a failed control connection,
+repeating authentication, expected-world, and generation checks.
+A new MCP process can retrieve a retained result
 using the original identifiers. `running` and `unknown` outcomes remain
 blocked; missing or evicted history does not prove non-delivery.
 Terminal responses appear under `result`. `source` is `ledger` or `host`;
 a retained host result survives remote cache eviction.
+
+The Genera profile reconnects automatically after transport or framing
+failure. Delays grow from 0.25 seconds to a cap of 5 seconds; each TCP
+connect and hello has a separate 5-second bound. A validated status or
+eval response resets the failure count. Authentication rejection or an
+expected-world mismatch stops automatic retries. Socket failure never
+launches or restarts a VLM, and execution is never resent.
+
+After reconnecting to the same generation, the bridge queries unresolved
+work and observes a running ledger entry at bounded intervals. Terminal
+results release the block; unknown history retains it for explicit
+recovery. `reconnect_attempts` and `reconnect_failures` report progress.
+`generation_change` retains previous/current boot and service IDs.
+`world_state_lost` identifies a boot change; `history_lost` identifies
+boot or service replacement. Old unresolved work remains blocked.
+
+Idle health requests run every 30 seconds, with a 5-second host deadline.
+A silent or partial reply causes connection recovery. Periodic health
+requests pause during local work and while the last fresh observation
+says the worker is busy. Explicit status refresh and request lookup
+remain available. MCP EOF stops maintenance, backoff, and socket work.
 
 `genera_recover_session` requires the same unknown identity, the expected
 current `expected_boot_id` and `expected_service_id`, and
@@ -400,17 +427,26 @@ for a temporary helper call. A failed session accepts no new requests.
 `genera-lookup-request` takes the session, request ID, boot ID, and service
 ID; it explicitly retries the control connection when needed and
 reconciles a retained result. `genera-recover-request` additionally takes
-the expected current boot/service IDs and an acknowledgement. There is no
-automatic reconnect or execution replay. `:host-timeout` on submit/call
+the expected current boot/service IDs and an acknowledgement. Execution
+is never replayed. `:host-timeout` on submit/call
 overrides the host wait in seconds; eval defaults to `GENERA_TIMEOUT`,
 controls to the session I/O timeout. It is never encoded on the wire.
 
 `genera-close-session` stops its owner without waiting for remote eval.
-The optional `:io-timeout` on open defaults to 5 seconds and bounds
-connect, hello, and frame writes; it does not limit remote execution.
+The optional `:connect-timeout` defaults to 5 seconds for each TCP connect
+and hello. `:io-timeout` defaults to 5 seconds for frame writes and
+control waits. These bounds do not limit remote execution.
 Cached status is the last validated snapshot, not live evidence after a
 session fails. Direct API callers own and close their sessions. The
 Genera MCP profile owns its session from initialized notification to EOF.
+
+Direct session callers opt into maintenance with `:reconnect t` on
+`genera-begin-session` or `genera-open-session`. Without it, only explicit
+control calls retry a failed connection. The asynchronous begin function
+allows initial connection failures to retry; open reports its initial
+failure to the caller. Optional `:retry-min`, `:retry-max`,
+`:health-interval`, and `:observe-interval` take positive seconds, with
+defaults 0.25, 5, 30, and 0.5. The retry minimum must not exceed its cap.
 
 ### Request history
 
@@ -500,6 +536,7 @@ python3 tests/ledger.py
 python3 tests/session.py
 python3 tests/stdio.py
 python3 tests/deadlines.py
+python3 tests/reconnect.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -638,3 +675,17 @@ fresh-idle recovery. The native check retrieves a result from a new MCP
 client after a timeout and lost reply, verifies the side effect ran once,
 and rejects recovery while another client occupies the worker. It
 restores legacy mode and leaves Genera running.
+
+To check reconnect behavior against a running legacy listener:
+
+```sh
+GENERA_HOST=genera.example GENERA_PORT=8888 \
+  python3 tests/reconnect.py --live-genera
+```
+
+Scripted peers check idle loss, repeated hello checks, capped backoff,
+separate handshake deadlines, generation replacement, unknown history,
+silent health replies, busy suppression, and EOF during backoff. The
+native check uses a local proxy to drop a real terminal reply, reconnects
+to the same world, and verifies retained lookup and a single side effect.
+It restores legacy mode and leaves Genera running.

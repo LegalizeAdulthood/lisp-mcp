@@ -196,9 +196,12 @@ class DeadlineChecks(unittest.TestCase):
                 work = receive_request(stream)
                 evaluations.append(work)
             with accept(listener) as stream:
-                lookup_reply(stream, ":running")
-                lookup_reply(stream, ":completed", response(work))
-                self.assertEqual(stream.recv(1), b"")
+                count = 0
+                while stream.recv(1, socket.MSG_PEEK):
+                    # Automatic reconciliation may race the explicit lookup.
+                    lookup_reply(stream, ":running" if count == 0 else ":completed",
+                                 None if count == 0 else response(work))
+                    count += 1
 
         with connections(serve) as address, bridge(genera_settings(address)) as mcp:
             mcp.initialize()
@@ -208,9 +211,13 @@ class DeadlineChecks(unittest.TestCase):
             self.assertEqual(failure["error"]["code"], "transport")
             self.assertEqual(failure["request_state"], "unresolved")
             target = identity(failure)
-            for call_id, state in [("running", "running"), ("done", "completed")]:
+            for call_id in range(4):
                 mcp.call("genera_request_status", call_id, **target)
-                self.assertEqual(structured(mcp.receive())["request_state"], state)
+                state = structured(mcp.receive())["request_state"]
+                self.assertIn(state, ["running", "completed"])
+                if state == "completed":
+                    break
+            self.assertEqual(state, "completed")
             mcp.ready()
         self.assertEqual(len(evaluations), 1)
 
@@ -299,6 +306,11 @@ class DeadlineChecks(unittest.TestCase):
             target = identity(structured(mcp.receive()))
             mcp.call("genera_request_status", "old-generation", **target)
             self.assertEqual(structured(mcp.receive())["error"]["code"], "generation-changed")
+            mcp.call("genera_session_status", "replacement")
+            change = structured(mcp.receive())["generation_change"]
+            self.assertTrue(change["history_lost"])
+            self.assertFalse(change["world_state_lost"])
+            self.assertEqual(change["previous_service_id"], target["service_id"])
             mcp.call("genera_eval", "blocked", form="cannot-yet-run")
             self.assertEqual(structured(mcp.receive())["error"]["code"], "busy")
             recover(mcp, "recover", target, expected_service_id="replacement")

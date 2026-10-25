@@ -23,7 +23,8 @@
   (let ((object (jso)))
     (loop for (key value) on envelope by #'cddr
           do (setf (gethash (rpc-key key) object)
-                   (cond ((member key '(:ok :busy :truncated :replaced)) (rpc-boolean value))
+                   (cond ((member key '(:ok :busy :truncated :replaced :world-state-lost :history-lost))
+                          (rpc-boolean value))
                          ((member key '(:values :warnings)) (coerce value 'vector))
                          ((eq key :features) (map 'vector #'rpc-name value))
                          ((member key '(:error :result)) (rpc-bridge-json value))
@@ -61,8 +62,14 @@
                                              (work "executing") (t "ready"))
                               "phase" (rpc-name (genera-session-phase session))
                               "connected" (rpc-boolean connected)
-                              "busy" (rpc-boolean (or work (getf hello :busy)))
-                              "remote_status_stale" 'yason:true
+                              "busy" (rpc-boolean (or work (getf (genera-session-cached-status session) :busy)))
+                              "remote_status_stale"
+                              (rpc-boolean (or (not connected) work (genera-session-status-stale session)
+                                               (null (genera-session-cached-at session))
+                                               (>= (- (genera-now) (or (genera-session-cached-at session) 0))
+                                                   (genera-session-health-interval session))))
+                              "reconnect_attempts" (genera-session-reconnects session)
+                              "reconnect_failures" (genera-session-failures session)
                               "pending_requests" (hash-table-count (genera-session-pending session))
                               "history_limit" +genera-history-limit+
                               "history_evicted" (genera-session-history-evicted session)
@@ -75,6 +82,13 @@
                                   entry)) (genera-session-history session)))))
             (dolist (key '(:boot-id :service-id :world :package))
               (when (getf hello key) (setf (gethash (rpc-key key) status) (getf hello key))))
+            (when (genera-session-cached-at session)
+              (setf (gethash "remote_observed_at" status) (genera-session-observed-at session)
+                    (gethash "remote_observation_age_ms" status)
+                    (floor (* 1000 (- (genera-now) (genera-session-cached-at session))))))
+            (when (genera-session-generation-change session)
+              (setf (gethash "generation_change" status)
+                    (rpc-bridge-json (genera-session-generation-change session))))
             (when work
               (setf (gethash "active_request_id" status)
                     (getf (genera-request-envelope work) :id)
@@ -137,6 +151,12 @@
   (destructuring-bind (id name expression request) task
     (handler-case
         (cond
+          ((string= name "genera_session_status")
+           (let ((session (rpc-runtime-session *rpc-runtime*)))
+             (genera-control-connection session)
+             (let ((response (genera-call session :status)))
+               (if (getf response :ok) (rpc-structured-result id (rpc-session-status))
+                   (rpc-structured-result id (rpc-bridge-json response) t)))))
           ((member name '("genera_request_status" "genera_recover_session") :test #'equal)
            (let* ((session (rpc-runtime-session *rpc-runtime*))
                   (arguments expression)
@@ -230,8 +250,8 @@
 
 (defun rpc-tools ()
   (if (string= *profile* "generic") (generic-tools)
-      (list (rpc-versioned-tool "genera_session_status" "Return a local Genera session snapshot."
-                                 (jso) #() t)
+      (list (rpc-versioned-tool "genera_session_status" "Return cached Genera status, with optional bounded live refresh."
+                                 (jso "refresh" (jso "type" "boolean")) #() t)
             (rpc-versioned-tool "genera_eval" "Evaluate one form in the attached Genera session."
               (jso "form" (jso "type" "string") "package" (jso "type" "string" "minLength" 1)
                    "timeout_ms" (jso "type" "integer" "minimum" 1)
@@ -265,7 +285,7 @@
   (when (and (string= *profile* "genera") (null (rpc-runtime-session *rpc-runtime*)))
     (setf (rpc-runtime-session *rpc-runtime*)
           (genera-begin-session :host *genera-host* :port *genera-port*
-                                :token *genera-token* :expected-world *genera-expected-world*))))
+                                :token *genera-token* :expected-world *genera-expected-world* :reconnect t))))
 
 (defun rpc-validate-arguments (name arguments)
   (unless (hash-table-p arguments) (rpc-invalid "Tool arguments must be an object"))
@@ -276,12 +296,15 @@
          (allowed (cond ((or lookup recover)
                          (append '("request_id" "boot_id" "service_id")
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
-                        (status nil) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
+                        (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
          (form-key (if structured "form" "expression")))
     (maphash (lambda (key value)
                (declare (ignore value))
                (unless (member key allowed :test #'equal) (rpc-invalid "Unknown tool argument"))) arguments)
+    (multiple-value-bind (refresh present) (gethash "refresh" arguments)
+      (when (and present (not (member refresh '(yason:true yason:false))))
+        (rpc-invalid "refresh must be a boolean")))
     (when (or lookup recover)
       (dolist (key (if recover '("request_id" "boot_id" "service_id" "expected_boot_id" "expected_service_id")
                               '("request_id" "boot_id" "service_id")))
@@ -309,7 +332,8 @@
                                                                :test #'string=))
       (rpc-invalid "Unknown or disabled tool"))
     (rpc-validate-arguments name arguments)
-    (when (string= name "genera_session_status")
+    (when (and (string= name "genera_session_status")
+               (not (eq (gethash "refresh" arguments) 'yason:true)))
       (return-from handle-tools-call (rpc-structured-result id (rpc-session-status))))
     (sb-thread:with-mutex ((rpc-runtime-lock *rpc-runtime*))
       (when (>= (hash-table-count (rpc-runtime-calls *rpc-runtime*)) +rpc-work-limit+)
@@ -317,7 +341,7 @@
     (if (string= *profile* "generic")
         (rpc-queue-work id name (gethash "expression" arguments) nil)
         (let ((session (rpc-runtime-session *rpc-runtime*)))
-          (when (member name '("genera_request_status" "genera_recover_session") :test #'equal)
+          (when (member name '("genera_request_status" "genera_recover_session" "genera_session_status") :test #'equal)
             (return-from handle-tools-call
               (if session (rpc-queue-work id name arguments nil :control t)
                   (rpc-tool-failure id "not-ready" "Genera session has not started"))))
