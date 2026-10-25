@@ -42,6 +42,28 @@
 (defun rpc-structured-result (id object &optional failed)
   (rpc-tool-result id (with-output-to-string (out) (yason:encode object out)) failed object))
 
+(defun rpc-startup-status (cycle)
+  (let* ((report (genera-startup-cycle-launch-info cycle))
+         (process (getf report :process))
+         (status (jso "cycle" (genera-startup-cycle-id cycle)
+                      "active" (rpc-boolean (not (genera-startup-cycle-done cycle)))
+                      "phase" (rpc-name (genera-startup-cycle-phase cycle))
+                      "remaining_ms" (if (genera-startup-cycle-done cycle) 0
+                                         (max 0 (ceiling (* 1000 (- (genera-startup-cycle-deadline cycle) (genera-now))))))
+                      "launch_attempted" (rpc-boolean (genera-startup-cycle-launch-attempted cycle)))))
+    (dolist (key '(:code :log :root :launcher-pid :exit-code))
+      (when (getf report key)
+        (setf (gethash (rpc-key key) status) (if (keywordp (getf report key))
+                                               (rpc-name (getf report key)) (getf report key)))))
+    (when process
+      (setf (gethash "process" status)
+            (jso "pid" (getf process :pid) "uid" (getf process :uid)
+                 "start_time" (getf process :start-time) "linux_boot" (getf process :linux-boot)
+                 "executable" (getf (getf process :executable) :path)
+                 "world" (getf (getf process :world) :path)
+                 "partition" (getf (getf process :partition) :path))))
+    status))
+
 (defun rpc-session-status ()
   "Local facts only; this function never opens or refreshes a connection."
   (let ((session (rpc-runtime-session *rpc-runtime*)))
@@ -50,6 +72,8 @@
              "busy" 'yason:false "remote_status_stale" 'yason:true "pending_requests" 0)
         (sb-thread:with-mutex ((genera-session-lock session))
           (let* ((hello (genera-session-hello session))
+                 (cycle (genera-session-startup session))
+                 (starting (and cycle (not (genera-startup-cycle-done cycle))))
                  (work (genera-session-execution session))
                  (failure (genera-session-failure session))
                  (connected (and (eq (genera-session-state session) :ready)
@@ -57,10 +81,13 @@
                  (status (jso "state" (cond ((and work (or failure (genera-request-failure work)
                                                           (eq (genera-request-state work) :unresolved)))
                                               "outcome-unknown")
+                                             (starting "starting")
+                                             ((and cycle (genera-startup-cycle-failure cycle)) "failed")
                                              (failure "disconnected")
                                              ((not connected) "connecting")
                                              (work "executing") (t "ready"))
-                              "phase" (rpc-name (genera-session-phase session))
+                              "phase" (rpc-name (if starting (genera-startup-cycle-phase cycle)
+                                                     (genera-session-phase session)))
                               "connected" (rpc-boolean connected)
                               "busy" (rpc-boolean (or work (getf (genera-session-cached-status session) :busy)))
                               "remote_status_stale"
@@ -82,6 +109,7 @@
                                   entry)) (genera-session-history session)))))
             (dolist (key '(:boot-id :service-id :world :package))
               (when (getf hello key) (setf (gethash (rpc-key key) status) (getf hello key))))
+            (when cycle (setf (gethash "startup" status) (rpc-startup-status cycle)))
             (when (genera-session-cached-at session)
               (setf (gethash "remote_observed_at" status) (genera-session-observed-at session)
                     (gethash "remote_observation_age_ms" status)
@@ -151,6 +179,11 @@
   (destructuring-bind (id name expression request) task
     (handler-case
         (cond
+          ((string= name "genera_ensure_session")
+           (genera-await-startup (rpc-runtime-session *rpc-runtime*) expression)
+           (let ((status (rpc-session-status)))
+             (setf (gethash "joined_cycle" status) (genera-startup-cycle-id expression))
+             (rpc-structured-result id status)))
           ((string= name "genera_session_status")
            (let ((session (rpc-runtime-session *rpc-runtime*)))
              (genera-control-connection session)
@@ -193,7 +226,8 @@
                       (t (eval-genera expression)))
               (rpc-tool-result id text failed))))
       (genera-session-error (condition)
-        (rpc-tool-failure id (rpc-name (genera-session-error-kind condition))
+        (rpc-tool-failure id (rpc-name (or (getf (getf (genera-session-error-response condition) :error) :code)
+                                          (genera-session-error-kind condition)))
                           (princ-to-string condition) request))
       (error () (rpc-tool-failure id "internal-error" "Tool execution failed" request)))))
 
@@ -252,6 +286,8 @@
   (if (string= *profile* "generic") (generic-tools)
       (list (rpc-versioned-tool "genera_session_status" "Return cached Genera status, with optional bounded live refresh."
                                  (jso "refresh" (jso "type" "boolean")) #() t)
+            (rpc-versioned-tool "genera_ensure_session" "Join startup or retry one bounded start-or-attach cycle."
+                                 (jso) #())
             (rpc-versioned-tool "genera_eval" "Evaluate one form in the attached Genera session."
               (jso "form" (jso "type" "string") "package" (jso "type" "string" "minLength" 1)
                    "timeout_ms" (jso "type" "integer" "minimum" 1)
@@ -285,18 +321,23 @@
   (when (and (string= *profile* "genera") (null (rpc-runtime-session *rpc-runtime*)))
     (setf (rpc-runtime-session *rpc-runtime*)
           (genera-begin-session :host *genera-host* :port *genera-port*
-                                :token *genera-token* :expected-world *genera-expected-world* :reconnect t))))
+                                :token *genera-token*
+                                :expected-world *genera-expected-world*
+                                :connect-timeout *genera-connect-timeout* :boot-timeout *genera-boot-timeout*
+                                :runtime *genera-runtime* :startup-managed (genera-local-autostart-p *genera-runtime*)
+                                :reconnect t))))
 
 (defun rpc-validate-arguments (name arguments)
   (unless (hash-table-p arguments) (rpc-invalid "Tool arguments must be an object"))
   (let* ((structured (and (string= *profile* "genera") (string= name "genera_eval")))
          (status (string= name "genera_session_status"))
+         (ensure (string= name "genera_ensure_session"))
          (lookup (string= name "genera_request_status"))
          (recover (string= name "genera_recover_session"))
          (allowed (cond ((or lookup recover)
                          (append '("request_id" "boot_id" "service_id")
                                  (when recover '("expected_boot_id" "expected_service_id" "acknowledge_unknown"))))
-                        (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
+                        (ensure nil) (status '("refresh")) (structured '("form" "package" "print_level" "print_length" "timeout_ms"))
                         (t '("expression"))))
          (form-key (if structured "form" "expression")))
     (maphash (lambda (key value)
@@ -313,7 +354,7 @@
             (rpc-invalid "Request and generation identities must be nonempty text"))))
       (when (and recover (not (eq (gethash "acknowledge_unknown" arguments) 'yason:true)))
         (rpc-invalid "acknowledge_unknown must be true")))
-    (unless (or status lookup recover)
+    (unless (or status lookup recover ensure)
       (unless (stringp (gethash form-key arguments)) (rpc-invalid "Form/expression must be text")))
     (multiple-value-bind (package present) (gethash "package" arguments)
       (when (and present (not (and (stringp package) (plusp (length package)))))
@@ -341,6 +382,11 @@
     (if (string= *profile* "generic")
         (rpc-queue-work id name (gethash "expression" arguments) nil)
         (let ((session (rpc-runtime-session *rpc-runtime*)))
+          (when (string= name "genera_ensure_session")
+            (return-from handle-tools-call
+              (if session
+                  (rpc-queue-work id name (genera-start-cycle session) nil)
+                  (rpc-tool-failure id "not-ready" "Send notifications/initialized before ensuring Genera"))))
           (when (member name '("genera_request_status" "genera_recover_session" "genera_session_status") :test #'equal)
             (return-from handle-tools-call
               (if session (rpc-queue-work id name arguments nil :control t)

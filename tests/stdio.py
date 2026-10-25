@@ -28,11 +28,11 @@ peer = partial(session_peer, accept_timeout=15)
 
 
 class Bridge:
-    def __init__(self, settings):
+    def __init__(self, settings, command=None):
         env = {k: v for k, v in os.environ.items() if k not in SETTINGS}
         env.update(settings)
         self.process = subprocess.Popen(
-            sbcl_command() + ["--load", str(ROOT / "lisp-mcp.lisp"), "--eval", "(lisp-mcp:main)"],
+            command or sbcl_command() + ["--load", str(ROOT / "lisp-mcp.lisp"), "--eval", "(lisp-mcp:main)"],
             cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         self.output = queue.Queue()
@@ -141,7 +141,7 @@ class StdioChecks(unittest.TestCase):
                 tools = mcp.receive()["result"]["tools"]
                 self.assertEqual({t["name"] for t in tools},
                                  {"genera_eval", "eval_genera", "genera_session_status",
-                                  "genera_request_status", "genera_recover_session"})
+                                  "genera_request_status", "genera_recover_session", "genera_ensure_session"})
                 self.assertTrue(tools[0]["annotations"]["readOnlyHint"])
                 mcp.call("genera_session_status", "status")
                 self.assertEqual(structured(mcp.receive())["phase"], "not-started")

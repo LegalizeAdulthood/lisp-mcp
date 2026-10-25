@@ -8,7 +8,8 @@ The default `generic` profile provides up to three tools:
 - **eval_genera** -- bridges to a Symbolics Genera machine over TCP
 
 The explicit `genera` profile provides `genera_session_status`,
-`genera_request_status`, `genera_recover_session`, `genera_eval`, and the
+`genera_ensure_session`, `genera_request_status`,
+`genera_recover_session`, `genera_eval`, and the
 `eval_genera(expression)` compatibility alias.
 
 ## Prerequisites
@@ -68,16 +69,17 @@ never falls back to legacy. The Genera profile requires `GENERA_HOST`
 and explicit `GENERA_PROTOCOL=v1`. Token and expected-world settings
 require that profile and contain at most 4,096 printable ASCII characters
 without surrounding whitespace. Initialization, discovery, and local
-status do not contact Genera. The Genera profile starts one asynchronous
-attach after `notifications/initialized`. Run the target Lisp first; the
-bridge does not start a VLM.
+status do not contact Genera. The Genera profile starts asynchronous
+connection management after `notifications/initialized`. Default attach
+mode requires a running target Lisp. Explicit local autostart can launch
+the configured VLM as described below.
 
 ### Local runtime preflight
 
 `genera-launch.lisp` provides read-only host diagnostics for an explicitly
 configured local WSL runtime. Remote endpoints use attach-only mode.
 Configuration is validated before MCP dispatch; filesystem inspection is
-performed only when `genera-preflight` is called.
+deferred to explicit preflight or managed local startup.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -205,6 +207,45 @@ explicit VLM termination still ends the live world. Verify client
 close/reopen in the installed WSL environment; systemd unit existence
 alone does not establish that lifetime behavior.
 
+### Bounded start-or-attach
+
+With local mode and `GENERA_AUTOSTART=true`, startup begins after the MCP
+`notifications/initialized` notification. Initialization and tool discovery
+do no runtime inspection or launch. Startup first tries a versioned hello,
+using `GENERA_EXPECTED_WORLD` or the canonical local world's basename.
+A valid hello attaches immediately. Protocol, token, world, or stalled
+hello failures stop startup without launching a replacement.
+
+When the endpoint is unreachable, startup checks prerequisites, acquires
+the launch locks, and repeats discovery and the authenticated hello under
+those locks. One matching VLM is observed through the boot deadline;
+it is preserved even when its listener never becomes ready. Lock contention
+joins the other client's work. Each cycle permits one launch attempt.
+Launch failure or boot timeout stops that cycle without a respawn loop.
+
+`GENERA_CONNECT_TIMEOUT` bounds each connection/hello operation, default
+5 seconds. `GENERA_BOOT_TIMEOUT` bounds a complete startup cycle, default
+300 seconds. Both accept positive decimal integers in seconds. Connection
+and child-identity waits are clipped to the remaining boot budget.
+`GENERA_TIMEOUT` remains the separate evaluation wait deadline.
+
+Call `genera_ensure_session` with an empty arguments object to join active
+startup or explicitly retry a failed cycle. A ready session returns
+immediately. Concurrent ensure calls share their cycle ticket. The tool
+does not retry evaluations or acknowledge unresolved outcomes. Remote
+and attach-only configurations can reconnect through a bounded ensure
+cycle and never launch a local process.
+
+Cached status remains immediate and never launches a VLM. During managed
+startup it reports state `starting`, a phase such as `attach-first`,
+`preflight`, `lock`, `launch`, or `boot`, and a `startup` object with cycle
+number, remaining milliseconds, launch attempt, log, and process identity
+when known. A stopped cycle reports `failed` with an actionable error.
+Status refresh during startup returns not-ready; it does not start another
+cycle. After readiness, ordinary connection maintenance continues without
+permission to launch or replace a VLM. MCP EOF stops host startup and I/O
+workers while preserving any launched VLM and unresolved execution.
+
 ### Genera profile
 
 For a listener explicitly configured for version 1, use:
@@ -228,7 +269,7 @@ For a listener explicitly configured for version 1, use:
 
 Set `GENERA_TOKEN` when the listener requires a shared token. Repeated
 evaluations and the alias use the same authenticated session. The profile
-does not expose host or Swank tools. Tool discovery advertises the five
+does not expose host or Swank tools. Tool discovery advertises the six
 implemented tools even before the connection is ready; an eval then
 returns a structured not-ready tool failure instead of waiting in a queue.
 
@@ -735,6 +776,7 @@ python3 tests/boot.py
 python3 tests/preflight.py
 python3 tests/launch.py
 python3 tests/detached.py
+python3 tests/startup.py
 ```
 
 If Quicklisp is installed outside the usual home directory, set
@@ -836,6 +878,15 @@ executable. It checks literal argv, cwd, WSLg settings, null stdin,
 descriptor isolation, private append logging after parent exit, duplicate
 launch prevention, and early/later exit reporting without respawn. It
 never starts Genera or writes its runtime files.
+
+The startup runner requires non-root Linux and `cc`. It uses an explicit
+test-only display/TAP snapshot with
+real preflight file checks, launch locks, detached processes, and MCP
+stdio. Its compiled fake VLM exposes a small framed TCP peer without a
+Lisp evaluator. Checks cover cold/warm startup, concurrent clients,
+joined ensure calls, boot deadlines, handshake rejection, failed boot,
+explicit retry, EOF, and preservation of unresolved execution. Real
+Genera cold-boot and stream behavior require the separate native checks.
 
 To check structured evaluation and recovery on a running legacy listener:
 

@@ -590,7 +590,7 @@ record the child's verified identity before returning. Never launch here."
               (sb-sys:make-fd-stream fd :output t :element-type '(unsigned-byte 8) :auto-close t))
           (error (e) (sb-posix:close fd) (error e))))))
 
-  (defun genera-spawn-vlm (preflight context)
+  (defun genera-spawn-vlm (preflight context &optional boot-deadline)
     "One structured setsid --wait launch, under the existing launch locks."
     (unless (and context (eq context *genera-launch-context*))
       (error "VLM launch requires held launch locks"))
@@ -607,7 +607,9 @@ record the child's verified identity before returning. Never launch here."
                      :target (getf context :target) :root (getf preflight :root) :log (getf preflight :log))))
             ;; setsid can fork when SBCL makes its child a process-group leader.
             ;; --wait retains an exit-status observer; identify the actual VLM.
-            (loop with deadline = (+ (get-internal-real-time) (* 2 internal-time-units-per-second))
+            (loop with deadline = (min (+ (get-internal-real-time) (* 2 internal-time-units-per-second))
+                                       (if boot-deadline (* boot-deadline internal-time-units-per-second)
+                                           most-positive-fixnum))
                   for observation = (genera-launch-observation attempt)
                   do (when (eq (getf observation :state) :exited) (return))
                      (let* ((snapshot (genera-discover-processes (getf context :target)))
@@ -623,7 +625,10 @@ record the child's verified identity before returning. Never launch here."
                          (return)))
                      (when (>= (get-internal-real-time) deadline) (return))
                      (sleep 0.01))
-            (when (genera-launch-attempt-identity attempt) (sleep 0.2))
+            (when (genera-launch-attempt-identity attempt)
+              (let ((remaining (and boot-deadline
+                                    (- boot-deadline (/ (get-internal-real-time) internal-time-units-per-second)))))
+                (sleep (if remaining (max 0 (min .2 remaining)) .2))))
             (let ((observation (genera-launch-observation attempt)))
               (values (append (list :action (if (eq (getf observation :state) :running) :launched :failed))
                               observation) attempt)))
@@ -641,15 +646,17 @@ record the child's verified identity before returning. Never launch here."
              attempt))))))
 
   (defun genera-launch-vlm (runtime &key (preflight (genera-launch-preflight runtime))
-                                        (endpoint-observer #'genera-probe-launch-endpoint))
+                                        (endpoint-observer #'genera-probe-launch-endpoint) before-launch deadline)
     "Discover first; launch at most once. Return report and observation handle."
     (let ((attempt nil))
       (values
        (genera-call-with-launch-decision runtime
          (lambda (decision context)
            (if (eq (getf decision :action) :launch)
-               (multiple-value-bind (report handle) (genera-spawn-vlm preflight context)
-                 (setf attempt handle) report)
+               (progn
+                 (when before-launch (funcall before-launch))
+                 (multiple-value-bind (report handle) (genera-spawn-vlm preflight context deadline)
+                   (setf attempt handle) report))
                decision))
          :preflight preflight :endpoint-observer endpoint-observer)
        attempt))))

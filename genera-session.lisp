@@ -18,8 +18,12 @@
   envelope payload execution-p deadline (state :queued) response failure
   remote-state acknowledged delivered)
 
+(defstruct genera-startup-cycle id deadline (phase :attach-first) done failure
+  launch-decided launch-attempted launch-info launch-handle)
+
 (defstruct (genera-session (:constructor %make-genera-session))
   host port token expected-world (io-timeout 5) (connect-timeout 5) owner socket hello
+  runtime startup-managed startup startup-thread (startup-counter 0) (boot-timeout 300)
   reconnect supervisor (retry-min .25) (retry-max 5) (health-interval 30)
   (observe-interval .5) (failures 0) (reconnects 0) retry-at health-at observe-at
   reconcile-needed generation-change cached-at observed-at connection-error (status-stale t)
@@ -93,6 +97,9 @@
 
 (defun genera-session-fail (session condition)
   (sb-thread:with-mutex ((genera-session-lock session))
+    (let ((cycle (genera-session-startup session)))
+      (when (and cycle (genera-startup-cycle-done cycle) (genera-startup-cycle-failure cycle))
+        (setf condition (genera-startup-cycle-failure cycle))))
     (setf (slot-value condition 'session) session)
     (setf (genera-session-failure session) condition
           (genera-session-state session) (if (genera-session-stop session) :closed :failed)
@@ -230,16 +237,21 @@
             (list :expected-world (genera-session-expected-world session)))))
 
 (defun genera-run-session (session)
-  (let ((socket nil))
+  (let* ((socket nil) (validated nil)
+         (cycle (genera-session-startup session))
+         (connect-bound (if (and cycle (not (genera-startup-cycle-done cycle)))
+                            (max .001 (min (genera-session-connect-timeout session)
+                                           (- (genera-startup-cycle-deadline cycle) (genera-now))))
+                            (genera-session-connect-timeout session))))
     (handler-case
         (unwind-protect
             (progn
               (genera-with-io session
-               (sb-ext:with-timeout (genera-session-connect-timeout session)
+               (sb-ext:with-timeout connect-bound
                (setf socket (usocket:socket-connect
                             (genera-session-host session) (genera-session-port session)
                             :element-type '(unsigned-byte 8)
-                            :timeout (genera-session-connect-timeout session)))))
+                            :timeout connect-bound))))
               (sb-thread:with-mutex ((genera-session-lock session))
                 (setf (genera-session-phase session) :hello)
                 (when (genera-session-stop session)
@@ -248,7 +260,10 @@
                      (hello (genera-session-hello-envelope session))
                      (greeting
                        (genera-with-io session
-                        (sb-ext:with-timeout (genera-session-connect-timeout session)
+                        (sb-ext:with-timeout
+                            (if (and cycle (not (genera-startup-cycle-done cycle)))
+                                (max .001 (min connect-bound (- (genera-startup-cycle-deadline cycle) (genera-now))))
+                                connect-bound)
                          (genera-write-envelope stream hello)
                          (let* ((size (read-frame-length stream))
                                 (data (read-exactly stream
@@ -265,6 +280,11 @@
                 (unless (getf greeting :ok)
                   (genera-session-error :handshake "Genera rejected hello" greeting))
                 (sb-thread:with-mutex ((genera-session-lock session))
+                  (let ((current (genera-session-startup session)))
+                    (when (and current (or (genera-startup-cycle-failure current)
+                                           (and (not (genera-startup-cycle-done current))
+                                                (>= (genera-now) (genera-startup-cycle-deadline current)))))
+                      (genera-session-error :boot-timeout "Genera hello arrived after the startup deadline")))
                   (let ((previous (genera-session-hello session)))
                     (when (and previous
                                (not (every (lambda (key) (equal (getf previous key) (getf greeting key)))
@@ -280,7 +300,7 @@
                                       '(:boot-id :service-id))
                                (not (equal (getf previous :world) (getf greeting :world))))
                       (genera-session-error :protocol "World changed without a generation change")))
-                  (setf (genera-session-socket session) socket
+                  (setf validated t (genera-session-socket session) socket
                         (genera-session-hello session) greeting
                         (genera-session-cached-status session) greeting
                         (genera-session-cached-at session) (genera-now)
@@ -332,11 +352,15 @@
                           :format-arguments (list (princ-to-string condition)))))
       (sb-ext:timeout ()
         (genera-session-fail session
-          (make-condition 'genera-session-error :kind :transport
+          (make-condition 'genera-session-error
+                          :kind (if (and socket (not validated) (genera-session-startup-managed session))
+                                    :handshake :transport)
                           :format-control "Genera socket I/O timed out")))
       (error ()
         (genera-session-fail session
-          (make-condition 'genera-session-error :kind :transport
+          (make-condition 'genera-session-error
+                          :kind (if (and socket (not validated) (genera-session-startup-managed session))
+                                    :handshake :transport)
                           :format-control "Genera socket I/O failed"))))
     (unless (genera-session-failure session)
       (genera-session-fail session
@@ -349,39 +373,47 @@
     (setf (genera-session-stop session) t)
     (sb-thread:condition-broadcast (genera-session-changed session)))
   (when interrupt-io
-    (ignore-errors
+    (when (genera-session-owner session) (ignore-errors
       (sb-thread:interrupt-thread (genera-session-owner session)
         (lambda ()
           (when (genera-session-blocking session)
-            (genera-session-error :closed "Genera host I/O closed"))))))
-  (sb-thread:join-thread (genera-session-owner session)
+            (genera-session-error :closed "Genera host I/O closed")))))))
+  (when (genera-session-startup-thread session)
+    (sb-thread:join-thread (genera-session-startup-thread session)
+                           :timeout (+ (genera-session-connect-timeout session) 3) :default nil))
+  (when (genera-session-owner session)
+    (sb-thread:join-thread (genera-session-owner session)
                          :timeout (+ (max (genera-session-io-timeout session)
-                                          (genera-session-connect-timeout session)) .5) :default nil)
+                                          (genera-session-connect-timeout session)) .5) :default nil))
   (when (genera-session-supervisor session)
     (sb-thread:join-thread (genera-session-supervisor session)
                           :timeout (+ (max (genera-session-io-timeout session)
                                            (genera-session-connect-timeout session)) .5) :default nil)
     (when (sb-thread:thread-alive-p (genera-session-supervisor session))
       (genera-session-error :shutdown "Genera maintenance did not stop within its I/O bound")))
-  (when (sb-thread:thread-alive-p (genera-session-owner session))
+  (when (and (genera-session-owner session) (sb-thread:thread-alive-p (genera-session-owner session)))
     (genera-session-error :shutdown "Genera I/O owner did not stop within its I/O bound"))
   nil)
 
 (defun genera-begin-session (&key (host *genera-host*) (port *genera-port*) token
                                 expected-world (io-timeout 5) (connect-timeout 5) reconnect
+                                runtime startup-managed (boot-timeout 300)
                                 (retry-min .25) (retry-max 5) (health-interval 30) (observe-interval .5))
   "Start the I/O owner without waiting for connection or hello."
-  (dolist (value (list io-timeout connect-timeout retry-min retry-max health-interval observe-interval))
+  (dolist (value (list io-timeout connect-timeout boot-timeout retry-min retry-max health-interval observe-interval))
     (unless (and (realp value) (> value 0)) (error "Session timing bounds must be positive")))
   (unless (<= retry-min retry-max) (error "Reconnect delay minimum exceeds maximum"))
   (let ((session (%make-genera-session :host host :port port :token token
                                      :expected-world expected-world :io-timeout io-timeout
                                      :connect-timeout connect-timeout :reconnect reconnect
+                                     :runtime runtime :startup-managed startup-managed :boot-timeout boot-timeout
                                      :retry-min retry-min :retry-max retry-max
                                      :health-interval health-interval :observe-interval observe-interval)))
     (mcp-v1-encode (genera-session-hello-envelope session) :request)
-    (setf (genera-session-owner session)
-          (sb-thread:make-thread (lambda () (genera-run-session session)) :name "Genera I/O"))
+    (if startup-managed
+        (progn (setf (genera-session-state session) :disconnected) (genera-start-cycle session))
+        (setf (genera-session-owner session)
+              (sb-thread:make-thread (lambda () (genera-run-session session)) :name "Genera I/O")))
     (when reconnect
       (setf (genera-session-supervisor session)
             (sb-thread:make-thread (lambda () (genera-maintain-session session)) :name "Genera maintenance")))
@@ -462,21 +494,36 @@
 (defun genera-call (session operation &rest fields)
   (genera-await-request session (apply #'genera-submit-request session operation fields)))
 
+(defun genera-wait-for-connection (session)
+  (loop
+    (sb-thread:with-mutex ((genera-session-lock session))
+      (unless (eq (genera-session-state session) :connecting) (return))
+      (when (genera-session-stop session) (genera-session-error :closed "Genera host is closing"))
+      (let ((cycle (genera-session-startup session)))
+        (when (and cycle (not (genera-startup-cycle-done cycle))
+                   (>= (genera-now) (genera-startup-cycle-deadline cycle)))
+          (genera-session-error :boot-timeout "Genera startup exceeded its boot deadline")))
+      (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session) :timeout .05))))
+
 (defun genera-control-connection (session)
   "Serialize control retries with maintenance; never replay execution."
-  (sb-thread:with-mutex ((genera-session-maintenance-lock session))
   (sb-thread:with-mutex ((genera-session-lock session))
-    (loop while (eq (genera-session-state session) :connecting)
-          do (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session))))
+    (let ((cycle (genera-session-startup session)))
+      (when (and cycle (not (genera-startup-cycle-done cycle))
+                 (not (eq sb-thread:*current-thread* (genera-session-startup-thread session))))
+        (genera-session-error :not-ready "Genera startup is in progress; join it with genera_ensure_session"))))
+  (sb-thread:with-mutex ((genera-session-maintenance-lock session))
+  (genera-wait-for-connection session)
   (unless (eq (genera-session-state session) :ready)
-    (sb-thread:join-thread (genera-session-owner session)
-                          :timeout (+ .5 (genera-session-io-timeout session)) :default nil)
+    (when (genera-session-owner session)
+      (sb-thread:join-thread (genera-session-owner session)
+                            :timeout (+ .5 (genera-session-io-timeout session)) :default nil))
     (sb-thread:with-mutex ((genera-session-lock session))
       (when (or (genera-session-stop session)
-                (sb-thread:thread-alive-p (genera-session-owner session)))
+                (and (genera-session-owner session) (sb-thread:thread-alive-p (genera-session-owner session))))
         (genera-session-error :closed "Genera control connection is unavailable"))
       (clrhash (genera-session-pending session))
-      (incf (genera-session-reconnects session))
+      (when (genera-session-owner session) (incf (genera-session-reconnects session)))
       (setf (genera-session-controls session) 0 (genera-session-queue session) nil
             (genera-session-connection-error session) nil
             (genera-session-failure session) nil (genera-session-state session) :connecting
@@ -485,9 +532,8 @@
             (genera-session-length session) 0 (genera-session-position session) 0
             (genera-session-owner session)
             (sb-thread:make-thread (lambda () (genera-run-session session)) :name "Genera I/O"))))
+  (genera-wait-for-connection session)
   (sb-thread:with-mutex ((genera-session-lock session))
-    (loop while (eq (genera-session-state session) :connecting)
-          do (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session)))
     (when (genera-session-failure session) (error (genera-session-failure session))))
   session))
 
@@ -503,6 +549,10 @@
           (setf owner (genera-session-owner session))
           (cond
             ((and (not ready) failure
+                  (or (not (genera-session-startup-managed session))
+                      (let ((cycle (genera-session-startup session)))
+                        (and cycle (genera-startup-cycle-done cycle)
+                             (not (genera-startup-cycle-failure cycle)))))
                   (member (genera-session-error-kind failure) '(:transport :protocol)))
              (setf (genera-session-phase session) :backoff)
              (when (>= now (or (genera-session-retry-at session) now)) (setf action :connect)))
@@ -549,6 +599,123 @@
         (unless (genera-session-stop session)
           (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session)
                                    :timeout .05))))))
+
+(defun genera-startup-check (session cycle)
+  (when (genera-session-stop session) (genera-session-error :closed "Genera host is closing"))
+  (when (>= (genera-now) (genera-startup-cycle-deadline cycle))
+    (genera-session-error :boot-timeout "Genera startup timed out; preserve the VLM and inspect its listener/log")))
+
+(defun genera-startup-phase (session cycle phase)
+  (sb-thread:with-mutex ((genera-session-lock session))
+    (setf (genera-startup-cycle-phase cycle) phase)
+    (sb-thread:condition-broadcast (genera-session-changed session))))
+
+(defun genera-finish-startup (session cycle &optional failure)
+  ;; Publish failure before making the ticket retryable. Capture only its owner.
+  (when failure (genera-session-fail session failure))
+  (let ((owner nil))
+    (sb-thread:with-mutex ((genera-session-lock session))
+      (setf owner (genera-session-owner session)
+            (genera-startup-cycle-failure cycle) failure
+            (genera-startup-cycle-phase cycle) (if failure :failed :ready)
+            (genera-startup-cycle-done cycle) t)
+      (sb-thread:condition-broadcast (genera-session-changed session)))
+    (when (and failure owner (sb-thread:thread-alive-p owner) (genera-session-blocking session))
+      (ignore-errors (sb-thread:interrupt-thread owner (lambda () (error failure)))))))
+
+(defun genera-startup-report-error (report)
+  (let* ((check (find-if-not (lambda (row) (getf row :ok))
+                             (getf (getf report :preflight) :checks)))
+         (code (or (getf check :code) (getf report :code) :launch-failed))
+         (message (or (getf check :message) (getf report :message)
+                      (format nil "Genera startup stopped: ~A; inspect runtime identity and VLM log" code))))
+    (genera-session-error code message)))
+
+(defun genera-run-startup (session cycle)
+  "One bounded attach/discover/launch cycle. Never replay execution."
+  (handler-case
+      (progn
+        (when (and (null (genera-session-expected-world session))
+                   (genera-local-autostart-p (genera-session-runtime session)))
+          (setf (genera-session-expected-world session)
+                (genera-runtime-world-name (genera-session-runtime session) t)))
+      (loop
+        (genera-startup-check session cycle)
+        (when (genera-startup-cycle-launch-handle cycle)
+          (let ((observation (funcall (symbol-function 'genera-launch-observation)
+                                     (genera-startup-cycle-launch-handle cycle))))
+            (when (member (getf observation :state) '(:exited :unknown))
+              (genera-startup-report-error observation))))
+        (genera-startup-phase session cycle (if (genera-startup-cycle-launch-decided cycle) :boot :attach-first))
+        (handler-case
+            (progn (genera-control-connection session)
+                   (genera-finish-startup session cycle) (return))
+          (genera-session-error (condition)
+            (unless (eq (genera-session-error-kind condition) :transport) (error condition))))
+        (genera-startup-check session cycle)
+        (when (and (genera-local-autostart-p (genera-session-runtime session))
+                   (not (genera-startup-cycle-launch-decided cycle)))
+          (genera-startup-phase session cycle :preflight)
+          (multiple-value-bind (report handle)
+              (funcall (symbol-function 'genera-launch-vlm) (genera-session-runtime session)
+                :deadline (genera-startup-cycle-deadline cycle)
+                :before-launch (lambda ()
+                                 (genera-startup-check session cycle)
+                                 (genera-startup-phase session cycle :launch))
+                :endpoint-observer
+                (lambda (runtime)
+                  (declare (ignore runtime))
+                  (genera-startup-check session cycle)
+                  (genera-startup-phase session cycle :lock)
+                  (handler-case (progn (genera-control-connection session) :present)
+                    (genera-session-error (condition)
+                      (if (eq (genera-session-error-kind condition) :transport) :absent (error condition))))))
+            (sb-thread:with-mutex ((genera-session-lock session))
+              (setf (genera-startup-cycle-launch-info cycle) report
+                    (genera-startup-cycle-launch-handle cycle) handle
+                    (genera-startup-cycle-launch-attempted cycle) (getf report :attempted)))
+            (case (getf report :action)
+              ((:launched :observe)
+               (setf (genera-startup-cycle-launch-decided cycle) t))
+              (:blocked (unless (eq (getf report :code) :lock-busy) (genera-startup-report-error report)))
+              (otherwise (genera-startup-report-error report)))))
+        (genera-startup-phase session cycle (if (genera-startup-cycle-launch-decided cycle) :boot :backoff))
+        (sb-thread:with-mutex ((genera-session-lock session))
+          (unless (genera-session-stop session)
+            (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session)
+                                     :timeout (min .1 (max .001 (- (genera-startup-cycle-deadline cycle) (genera-now)))))))))
+    (genera-session-error (condition) (genera-finish-startup session cycle condition))
+    (error ()
+      (genera-finish-startup session cycle
+        (make-condition 'genera-session-error :kind :startup-failed
+                        :format-control "Genera startup failed; inspect runtime permissions and VLM log")))))
+
+(defun genera-start-cycle (session)
+  "Join the active ticket, return ready, or start one explicit retry."
+  (sb-thread:with-mutex ((genera-session-lock session))
+    (when (genera-session-stop session) (genera-session-error :closed "Genera host is closing"))
+    (let ((previous (genera-session-startup session)))
+      (when (and previous (not (genera-startup-cycle-done previous)))
+        (return-from genera-start-cycle previous))
+      (when (eq (genera-session-state session) :ready)
+        (return-from genera-start-cycle
+          (or previous (make-genera-startup-cycle :id 0 :done t :phase :ready :deadline (genera-now)))))
+      (let ((cycle (make-genera-startup-cycle :id (incf (genera-session-startup-counter session))
+                                             :deadline (+ (genera-now) (genera-session-boot-timeout session)))))
+        (setf (genera-session-startup-managed session) t (genera-session-startup session) cycle
+              (genera-session-startup-thread session)
+              (sb-thread:make-thread (lambda () (genera-run-startup session cycle)) :name "Genera startup"))
+        cycle))))
+
+(defun genera-await-startup (session cycle)
+  (loop
+    (sb-thread:with-mutex ((genera-session-lock session))
+      (when (genera-startup-cycle-done cycle)
+        (when (genera-startup-cycle-failure cycle) (error (genera-startup-cycle-failure cycle)))
+        (return))
+      (when (genera-session-stop session) (genera-session-error :closed "Genera host is closing"))
+      (sb-thread:condition-wait (genera-session-changed session) (genera-session-lock session) :timeout .05)))
+  cycle)
 
 (defun genera-identity-p (request id boot service)
   (let ((envelope (genera-request-envelope request)))

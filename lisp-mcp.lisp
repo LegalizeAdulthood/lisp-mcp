@@ -36,6 +36,8 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
 (defvar *genera-host* nil)
 (defvar *genera-port* 8888)
 (defvar *genera-timeout* 300)
+(defvar *genera-connect-timeout* 5)
+(defvar *genera-boot-timeout* 300)
 (defvar *genera-enabled* nil)
 (defvar *genera-token* nil)
 (defvar *genera-expected-world* nil)
@@ -120,6 +122,20 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
                (funcall (symbol-function 'genera-runtime-configuration)
                         *profile* *genera-protocol* *genera-host* *genera-port*))))
 
+(defun genera-local-autostart-p (runtime)
+  (and runtime
+       (eq (funcall (symbol-function 'genera-runtime-mode) runtime) :local)
+       (funcall (symbol-function 'genera-runtime-autostart) runtime)))
+
+(defun genera-runtime-world-name (runtime &optional canonical)
+  (when runtime
+    (let ((world (funcall (symbol-function 'genera-runtime-world) runtime))
+          (root (funcall (symbol-function 'genera-runtime-root) runtime)))
+      (when world
+        (file-namestring (or (when (and canonical root)
+                              (ignore-errors (truename (merge-pathnames world (uiop:ensure-directory-pathname root)))))
+                            world))))))
+
 (defun configure ()
   "Validate all consumed settings before entering the MCP loop or doing I/O."
   (let ((profile (configuration-choice "LISP_MCP_PROFILE" "generic" '("generic" "genera")))
@@ -127,6 +143,8 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
         (genera-host (configuration-host "GENERA_HOST"))
         (genera-port (configuration-integer "GENERA_PORT" 8888 1 65535))
         (timeout (configuration-integer "GENERA_TIMEOUT" 300 1))
+        (connect-timeout (configuration-integer "GENERA_CONNECT_TIMEOUT" 5 1))
+        (boot-timeout (configuration-integer "GENERA_BOOT_TIMEOUT" 300 1))
         (swank-host (configuration-host "SWANK_HOST" "127.0.0.1"))
         (swank-port (configuration-integer "SWANK_PORT" 4005 1 65535))
         (swank-package (configuration-text "SWANK_PACKAGE" "COMMON-LISP-USER"))
@@ -152,6 +170,7 @@ Example: (jso \"jsonrpc\" \"2.0\" \"id\" id \"result\" result)"
           *genera-host* genera-host
           *genera-port* genera-port
           *genera-timeout* timeout
+          *genera-connect-timeout* connect-timeout *genera-boot-timeout* boot-timeout
           *genera-enabled* (not (null genera-host))
           *genera-token* token *genera-expected-world* world
           *swank-host* swank-host
